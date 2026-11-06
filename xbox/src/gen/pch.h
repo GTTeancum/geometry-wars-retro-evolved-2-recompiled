@@ -50,7 +50,11 @@ extern PPCFuncMapping PPCFuncMappings[];
 //=============================================================================
 
 #define REX_PHYS_HOST_OFFSET(addr) 0u
-#define REX_HOST(x) (base + (u32)(x))
+// The base is the fixed GW_MEMBASE (0xA2000000; the 'base' argument every
+// function receives always holds it), as a constant: constant guest addresses
+// fold to absolute host ones and no register is spent on it. Integer
+// arithmetic, so the 32-bit wraparound is defined.
+#define REX_HOST(x) ((u8*)(uintptr_t)(0xA2000000u + (u32)(x)))
 
 #define REX_RAW_ADDR(x) REX_HOST(x)
 
