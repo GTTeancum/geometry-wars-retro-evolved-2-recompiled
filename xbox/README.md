@@ -13,6 +13,11 @@ directory replaces the ReXGlue PC runtime with a small Xbox runtime:
 | `src/kernel_memory.cpp`, `kernel_io.cpp`, `kernel_misc.cpp`, `xam.cpp` | The other kernel/XAM imports (153 in all) |
 | `src/gpu.cpp` | Xenos stand-in: PM4 command processor for fences, writebacks, swaps and interrupts; 60 Hz vblank. Draws are counted, not rendered |
 | `src/status.cpp` | On-screen status page, log ring read by `tools/read_log.py` |
+| `src/nv2a.cpp`, `xenos_vp.cpp`, `xenos_vs.cpp`, `dxt.cpp` | NV2A renderer (pbkit): game vertex shaders translated to NV2A vertex programs, textures converted (DXT5, mipmaps), our own glow |
+| `src/input.cpp` | Controllers (SDL), plus a test-only remote pad for `tools/xemu_pad.py` |
+| `src/*_native.cpp`, `particle_buffers.cpp` | Native rewrites of the game's hottest routines (grid, particles, starfield, sine), each checked against the recompiled original by `tools/native_check.cmd`; memory-saving buffer sharing |
+| `src/wait_stats.cpp` | Wait times by thread and call site, logged every 10 s |
+| `installer/` | Windows installer: prepares the game from the player's own LIVE package |
 
 ## Goal
 
@@ -80,29 +85,31 @@ resolve vertex shaders are inline copies of one program).
 
 ### Progress (2026-11-06)
 
-`src/nv2a.cpp` draws with pbkit. Vertex shaders are translated to NV2A vertex
-programs (`src/xenos_vp.cpp`, checked against the interpreter on the PC by
-`tools\vp_check.cmd`); any that do not translate run on the CPU through a
-small Xenos interpreter (`src/xenos_vs.cpp`). The menu runs at about 16 frames
-a second in XEMU (7 with every shader on the CPU).
+Deadline is playable in XEMU at 64 MB at about 30 frames a second (the game is
+a 60 Hz game, so it plays in slow motion), and a level ran 6900 frames without
+running out of memory. What got it there:
 
-Controllers work (`src/input.cpp`), and Deadline is playable in XEMU at about
-17 frames a second (11.6 before the registers moved into C++ locals). At 64 MB
-a level still runs out of memory after a minute or two: the game's particle
-buffers fill in as play goes on (36 MB of guest memory at the start, 49 MB
-later on a development kit). Pixel shaders are only analysed
-for which interpolator feeds the texture. Draws into the main 1280×720 scene
-are drawn: the starfield and the warped vector effects show in XEMU. The
-title logo area is masked black by the game (a min-blend pass) and filled by
-the glow/composite passes, which are not drawn yet.
+- Vertex shaders become NV2A vertex programs (`src/xenos_vp.cpp`; any that
+  do not translate run on the CPU through `src/xenos_vs.cpp`).
+- The Xbox codegen (`codegen.toml`) keeps the PowerPC registers in C++
+  locals, and `tools/prepare_generated.py` swaps SIMDe's byte-loop vector
+  loads and the x87 rounding-mode switches for cheap equivalents: 11.6 to
+  17 fps, and the XBE from 17.2 to 9.2 MB.
+- The grid physics, particles, starfield and sine are native C++
+  (`src/*_native.cpp`), checked against the recompiled originals.
+- Memory: copies of buffers nothing draws yet share one buffer
+  (`src/particle_buffers.cpp`, `src/kernel_memory.cpp`).
 
-Still missing: the background grid (its own small target), render targets and
-resolves (the glow chain and composite, which bring the logo and colours),
-float texture formats, point sprites, and an efficient vertex path (per-vertex
-immediate data exceeds the push buffer on busy frames).
+Built since that test and not yet run in XEMU: our own glow, the in-level
+grid lines, mipmapped full-resolution textures (readable text), the GPU
+drawing one frame while the game builds the next, and the native starfield
+and particles. `TODO.md` lists what is left (60 fps at 720p, the game's own
+glow chain, sound).
 
 Fixed on the way: the CP's read-pointer writeback was little-endian (hang at
-frame 453); the 256-buffer vertex pool now cycles through 32 buffers.
+frame 453); the 256-buffer vertex pool cycles through 32 buffers; guest
+addresses were computed with an overflowing pointer sum that clang folded to
+0 in one place.
 
 Plan for the NV2A renderer (pbkit):
 
