@@ -31,9 +31,11 @@ volatile u32 gw_nv2a_stage = 0;
 namespace {
 bool g_in_frame = false;
 // Per-frame vertex arena, 20 bytes a vertex.
-constexpr u32 kArenaVertices = 768 * 1024 / 20;
-u32* g_arena;
-u32 g_arena_used;
+constexpr u32 kArenaBytes = 768 * 1024;
+u8* g_arena;
+u32 g_arena_used;  // bytes
+// Draw with translated NV2A vertex programs (else the CPU interpreter).
+bool g_use_gpu_vertex = true;
 float g_scale_x, g_scale_y;
 u32 g_frames;
 
@@ -190,22 +192,6 @@ void begin_frame() {
   p = pb_push1(p, NV097_SET_CULL_FACE_ENABLE, 0);
   p = pb_push1(p, NV097_SET_BLEND_ENABLE, 1);
   pb_end(p);
-  // Vertex arrays in the arena: position (2 floats), diffuse (D3DCOLOR),
-  // texcoord 0 (2 floats), 20 bytes a vertex; every other attribute off.
-  u32 arena = (u32)g_arena & 0x03FFFFFF;
-  for (u32 attr = 0; attr < 16; attr += 4) {
-    p = pb_begin();
-    for (u32 a = attr; a < attr + 4; ++a) {
-      u32 format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F;
-      u32 offset = 0;
-      if (a == 0) format |= (2 << 4) | (20 << 8), offset = 0;
-      if (a == 3) format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D | (4 << 4) | (20 << 8), offset = 8;
-      if (a == 9) format |= (2 << 4) | (20 << 8), offset = 12;
-      p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_FORMAT + a * 4, format);
-      if (a == 0 || a == 3 || a == 9) p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + a * 4, arena + offset);
-    }
-    pb_end(p);
-  }
   g_arena_used = 0;
   g_in_frame = true;
 }
@@ -263,7 +249,7 @@ void gw_nv2a_init() {
 #include "nv2a_ps.inl"
   pb_end(p);
 
-  g_arena = (u32*)MmAllocateContiguousMemoryEx(kArenaVertices * 20, 0, 0x03FFAFFF, 0,
+  g_arena = (u8*)MmAllocateContiguousMemoryEx(kArenaBytes, 0, 0x03FFAFFF, 0,
                                                PAGE_READWRITE | PAGE_WRITECOMBINE);
   if (!g_arena) {
     gw_log("nv2a: no memory for the vertex arena\n");
@@ -289,6 +275,146 @@ struct CensusEntry {
   u32 hash, draws, prim, vertices;
 };
 CensusEntry g_census[32];
+}  // namespace
+
+namespace {
+
+// Vertex array setup: formats[a] / offsets[a] for the 16 attributes (format
+// 0 = off). pbkit blocks are limited to 128 dwords.
+void set_arrays(const u32* formats, const u32* offsets) {
+  for (u32 attr = 0; attr < 16; attr += 4) {
+    u32* p = pb_begin();
+    for (u32 a = attr; a < attr + 4; ++a) {
+      u32 format = formats[a] ? formats[a] : NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F;
+      p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_FORMAT + a * 4, format);
+      if (formats[a]) p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + a * 4, offsets[a]);
+    }
+    pb_end(p);
+  }
+}
+
+void draw_arrays(u32 nv_prim, u32 count) {
+  // DRAW_ARRAYS takes at most 256 vertices; 252 keeps quads and triangles
+  // whole.
+  for (u32 start = 0; start < count;) {
+    u32 n = count - start > 252 ? 252 : count - start;
+    u32* p = pb_begin();
+    p = pb_push1(p, NV097_SET_BEGIN_END, nv_prim);
+    p = pb_push1(p, 0x40000000 | NV097_DRAW_ARRAYS, ((n - 1) << 24) | start);
+    p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
+    pb_end(p);
+    start += n;
+  }
+}
+
+u32 g_program_start = 0xFFFFFFFF;  // transform program start slot in use
+u32 g_loaded_key = 0;              // translated program loaded at slot 8
+
+void set_program_start(u32 start) {
+  if (g_program_start == start) return;
+  u32* p = pb_begin();
+  p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_START, start);
+  pb_end(p);
+  g_program_start = start;
+}
+
+// Uploads constants (4 floats each) from slot first.
+void upload_constants(u32 first, const u32* values, u32 count) {
+  for (u32 done = 0; done < count;) {
+    u32 n = count - done > 8 ? 8 : count - done;
+    u32* p = pb_begin();
+    p = pb_push1(p, NV097_SET_TRANSFORM_CONSTANT_LOAD, 96 + first + done);
+    pb_push(p++, NV097_SET_TRANSFORM_CONSTANT, n * 4);
+    memcpy(p, values + done * 4, n * 16);
+    p += n * 4;
+    pb_end(p);
+    done += n;
+  }
+}
+
+u32 float_bits(float f) {
+  u32 u;
+  memcpy(&u, &f, 4);
+  return u;
+}
+
+// Draws with the shader translated to an NV2A vertex program: the game's
+// vertices are copied (byte-swapped) into the arena and read by the GPU.
+bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, u32 source, u32 index_base,
+                 u32 index_endian, bool index32, u32 vte) {
+  u32 bytes = count * gp->stride;
+  if (g_arena_used + bytes > kArenaBytes) return false;
+  if (g_loaded_key != gp->key) {
+    u32* p = pb_begin();
+    p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_LOAD, 8);
+    pb_end(p);
+    for (u32 i = 0; i < gp->instructions; i += 16) {
+      u32 n = gp->instructions - i > 16 ? 16 : gp->instructions - i;
+      p = pb_begin();
+      for (u32 k = 0; k < n; ++k) {
+        pb_push(p++, NV097_SET_TRANSFORM_PROGRAM, 4);
+        memcpy(p, &gp->words[(i + k) * 4], 16);
+        p += 4;
+      }
+      pb_end(p);
+    }
+    g_loaded_key = gp->key;
+  }
+  set_program_start(8);
+
+  // Constants: 0-2 fixed, 3 viewport, 4+ the shader's.
+  static const float kFixed[12] = {0, 1, 0, 0,
+                                   0.15915494f, 0.5f, 6.2831853f, 3.1415927f,
+                                   1.2732395f, -0.40528473f, 0.225f, 1.5707963f};
+  u32 c[64 * 4];
+  memcpy(c, kFixed, sizeof(kFixed));
+  float vx_scale = as_float(regs[0x210F]), vx_off = as_float(regs[0x2110]);
+  float vy_scale = as_float(regs[0x2111]), vy_off = as_float(regs[0x2112]);
+  c[12] = float_bits((vte & 1 ? vx_scale : 1.0f) * g_scale_x);
+  c[13] = float_bits((vte & 4 ? vy_scale : 1.0f) * g_scale_y);
+  c[14] = float_bits((vte & 2 ? vx_off : 0.0f) * g_scale_x);
+  c[15] = float_bits((vte & 8 ? vy_off : 0.0f) * g_scale_y);
+  for (u32 i = 0; i < gp->const_count; ++i) memcpy(&c[(4 + i) * 4], &regs[0x4000 + gp->const_xenos[i] * 4], 16);
+  upload_constants(0, c, 4 + gp->const_count);
+
+  // Vertices: the shader's stream, in draw order, words swapped to host order.
+  u32 f0 = regs[0x4800 + gp->fetch_slot * 2], f1 = regs[0x4800 + gp->fetch_slot * 2 + 1];
+  u32 stream = gw_gpu_to_guest(f0 & ~3u), endian = f1 & 3;
+  u32 words = gp->stride / 4;
+  u32* out = (u32*)(g_arena + g_arena_used);
+  for (u32 i = 0; i < count; ++i) {
+    u32 index = i;
+    if (source == 0) {
+      if (index32) {
+        u32 raw;
+        memcpy(&raw, gw_host(index_base + i * 4), 4);
+        index = swap_endian(raw, index_endian);
+      } else {
+        u16 h;
+        memcpy(&h, gw_host(index_base + i * 2), 2);
+        index = index_endian ? (u16)((h << 8) | (h >> 8)) : h;
+      }
+    }
+    const u32* in = (const u32*)gw_host(stream + index * gp->stride);
+    for (u32 k = 0; k < words; ++k) out[k] = swap_endian(in[k], endian);
+    out += words;
+  }
+
+  u32 formats[16] = {}, offsets[16] = {};
+  u32 base = ((u32)g_arena & 0x03FFFFFF) + g_arena_used;
+  for (u32 a = 0; a < gp->attr_count; ++a) {
+    const XvpProgram::Attribute& at = gp->attrs[a];
+    formats[a] = at.format == 6
+                     ? NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL | (4 << 4) | (gp->stride << 8)
+                     : NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | ((u32)at.components << 4) | (gp->stride << 8);
+    offsets[a] = base + at.offset;
+  }
+  set_arrays(formats, offsets);
+  g_arena_used += (bytes + 15) & ~15u;
+  draw_arrays(nv_prim, count);
+  return true;
+}
+
 }  // namespace
 
 void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_hash, const XvsProgram* vs,
@@ -318,6 +444,7 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
               : prim == 13 ? NV097_SET_BEGIN_END_OP_QUADS
               : 0;
   if (!nv_prim) return;
+  if ((prim == 3 || prim == 5 || prim == 6) && count > 252) return;  // strips/fans aren't split
   // Index source: 0 = index buffer (DRAW_INDX: viz, initiator, base, size),
   // 2 = auto (0..count-1).
   u32 index_base = 0, index_endian = 0;
@@ -330,16 +457,6 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     return;
   }
   if (!g_in_frame) begin_frame();
-  // Vertices go to this frame's arena (read by the NV2A); it is reused each
-  // frame because the swap waits for the GPU to finish.
-  if (g_arena_used + count > kArenaVertices) {
-    static u32 reported = 0;
-    if (reported++ < 4) {
-      gw_log("nv2a: frame %u vertex arena full, skipping %u vertices (shader %08X)\n", g_frames, count, vs_hash);
-    }
-    return;
-  }
-  if ((prim == 3 || prim == 5 || prim == 6) && count > 256) return;  // strips/fans aren't split
 
   float vx_scale = as_float(regs[0x210F]), vx_off = as_float(regs[0x2110]);
   float vy_scale = as_float(regs[0x2111]), vy_off = as_float(regs[0x2112]);
@@ -374,8 +491,23 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   p = pb_push1(p, NV097_SET_BLEND_EQUATION, op < 5 ? kEquations[op] : 0x8006);
   if (prim == 1) p = pb_push1(p, NV097_SET_POINT_SIZE, 16);  // 2 px (units of 1/8)
   pb_end(p);
-  u32 first = g_arena_used;
 
+  // Preferred: the shader as an NV2A vertex program.
+  if (g_use_gpu_vertex) {
+    const XvpProgram* gp = xvp_get(vs, uv_i, color_i, !(vte & 0x100));
+    if (gp && draw_on_gpu(gp, regs, nv_prim, count, source, index_base, index_endian, index32, vte)) return;
+  }
+
+  // Fallback: interpret the shader on the CPU, draw pre-transformed vertices.
+  if (g_arena_used + count * 20 > kArenaBytes) {
+    static u32 reported = 0;
+    if (reported++ < 4) {
+      gw_log("nv2a: frame %u vertex arena full, skipping %u vertices (shader %08X)\n", g_frames, count, vs_hash);
+    }
+    return;
+  }
+  set_program_start(0);
+  u32* out = (u32*)(g_arena + g_arena_used);
   for (u32 i = 0; i < count; ++i) {
     u32 index = i;
     if (source == 0) {
@@ -405,46 +537,26 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     if (vte & 8) y += vy_off;
     float sx = x * g_scale_x, sy = y * g_scale_y;
     const float* c = interp[color_i];
-    {
-      static u32 logged_hashes[16];
-      static u32 logged_count;
-      bool seen = false;
-      for (u32 k = 0; k < logged_count; ++k) seen |= logged_hashes[k] == vs_hash;
-      // Each shader's first vertex is logged once; every 600 frames the
-      // first two vertices of every draw are logged again.
-      bool periodic = g_frames % 600 == 599 && i < 2;
-      if (periodic || (!seen && logged_count < 16 && i == 0)) {
-        if (!seen && logged_count < 16) logged_hashes[logged_count++] = vs_hash;
-        gw_log("nv2a: vs %08X ps %08X blend %08X colorcontrol %08X prim %u count %u\n", vs_hash, ps_hash,
-               regs[0x2201], regs[0x2202], prim, count);
-        gw_log("nv2a: vs %08X v%u clip %d %d %d %d -> %d,%d i0 %d %d %d %d i1 %d %d %d %d (x1000) uv%d\n", vs_hash,
-               index, (int)(clip[0] * 1000), (int)(clip[1] * 1000), (int)(clip[2] * 1000), (int)(clip[3] * 1000),
-               (int)sx, (int)sy, (int)(interp[0][0] * 1000), (int)(interp[0][1] * 1000), (int)(interp[0][2] * 1000),
-               (int)(interp[0][3] * 1000), (int)(interp[1][0] * 1000), (int)(interp[1][1] * 1000),
-               (int)(interp[1][2] * 1000), (int)(interp[1][3] * 1000), uv_i);
-      }
-    }
     float u = uv_i >= 0 ? interp[uv_i][0] : 0, t = uv_i >= 0 ? interp[uv_i][1] : 0;
-    // Packed vertex: x, y, D3DCOLOR, u, v (layout set in begin_frame).
-    u32* out = &g_arena[(first + i) * 5];
+    // Packed vertex: x, y, D3DCOLOR, u, v.
     memcpy(&out[0], &sx, 4);
     memcpy(&out[1], &sy, 4);
     out[2] = pack_color(c);
     memcpy(&out[3], &u, 4);
     memcpy(&out[4], &t, 4);
+    out += 5;
   }
-  g_arena_used += count;
-  // DRAW_ARRAYS takes at most 256 vertices; 252 keeps quads and triangles
-  // whole. pbkit blocks stay well under its 128-dword limit.
-  for (u32 start = 0; start < count;) {
-    u32 n = count - start > 252 ? 252 : count - start;
-    p = pb_begin();
-    p = pb_push1(p, NV097_SET_BEGIN_END, nv_prim);
-    p = pb_push1(p, 0x40000000 | NV097_DRAW_ARRAYS, ((n - 1) << 24) | (first + start));
-    p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
-    pb_end(p);
-    start += n;
-  }
+  u32 base = ((u32)g_arena & 0x03FFFFFF) + g_arena_used;
+  u32 formats[16] = {}, offsets[16] = {};
+  formats[0] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (2 << 4) | (20 << 8);
+  formats[3] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D | (4 << 4) | (20 << 8);
+  formats[9] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (2 << 4) | (20 << 8);
+  offsets[0] = base;
+  offsets[3] = base + 8;
+  offsets[9] = base + 12;
+  set_arrays(formats, offsets);
+  g_arena_used += count * 20;
+  draw_arrays(nv_prim, count);
 }
 
 // Called on each guest swap: shows the frame drawn since the last one.
