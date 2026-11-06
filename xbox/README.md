@@ -138,8 +138,8 @@ one-off image dump).
    the running emulator. Every 10 s without a frame the log lists what each
    game thread last called.
 
-For players: `powershell -ExecutionPolicy Bypass -File xbox	ools\make_installer.ps1`
-assembles `xboxuild\installer` (and `gw2-xbox-installer.zip`); in it,
+For players: `powershell -ExecutionPolicy Bypass -File xbox\tools\make_installer.ps1`
+assembles `xbox\build\installer` (and `gw2-xbox-installer.zip`); in it,
 `install.cmd <LIVE package> <new folder>` prepares the game from the
 player's own package next to `default.xbe`.
 

@@ -77,7 +77,7 @@ order. Measurements are from XEMU at 64 MB unless noted.
 
 ## 7. Windows installer
 
-- [x] `xbox	ools\make_installer.ps1` builds `xboxuild\installer` (and a
+- [x] `xbox\tools\make_installer.ps1` builds `xbox\build\installer` (and a
       zip): `install.cmd <LIVE package> <new folder>` checks the title,
       extracts the package, writes and checks the game image, and fills the
       folder next to `default.xbe`. Its output matches the staged test disc.
