@@ -564,10 +564,13 @@ void rect_to_quad(const u32* v[3], const XvpProgram* gp, u32* out) {
 
 // Draws with the shader translated to an NV2A vertex program: the game's
 // vertices are copied (byte-swapped) into the arena and read by the GPU.
-// 'rects': a rectangle list, drawn as quads. tex_w, tex_h scale the texture
-// coordinates (a linear texture is addressed in texels).
-bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, u32 source, u32 index_base,
-                 u32 index_endian, bool index32, u32 vte, bool rects = false, float tex_w = 1, float tex_h = 1) {
+// Vertices first .. first + count - 1 of the draw. 'rects': a rectangle
+// list, drawn as quads. tex_w, tex_h scale the texture coordinates (a linear
+// texture is addressed in texels). line_colour: constant 1 for a grid line
+// program (xvp_get's line_i).
+bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, u32 count, u32 source,
+                 u32 index_base, u32 index_endian, bool index32, u32 vte, bool rects = false, float tex_w = 1,
+                 float tex_h = 1, const float* line_colour = nullptr) {
   if (rects && (count % 3 || !gp->attr_count || gp->stride > 64)) return false;
   const u32 out_count = rects ? count / 3 * 4 : count;
   u32 bytes = out_count * gp->stride;
@@ -599,6 +602,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, 
   memcpy(c, kFixed, sizeof(kFixed));
   c[2] = float_bits(tex_w);
   c[3] = float_bits(tex_h);
+  if (line_colour) memcpy(&c[4], line_colour, 16);  // in place of the sine constants
   float vx_scale = as_float(regs[0x210F]), vx_off = as_float(regs[0x2110]);
   float vy_scale = as_float(regs[0x2111]), vy_off = as_float(regs[0x2112]);
   c[12] = float_bits((vte & 1 ? vx_scale : 1.0f) * g_scale_x);
@@ -615,15 +619,15 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, 
   u32* out = (u32*)(g_arena + g_arena_used);
   u32 corners[3][16];  // a rectangle's three corners, host order
   for (u32 i = 0; i < count; ++i) {
-    u32 index = i;
+    u32 index = first + i;
     if (source == 0) {
       if (index32) {
         u32 raw;
-        memcpy(&raw, gw_host(index_base + i * 4), 4);
+        memcpy(&raw, gw_host(index_base + index * 4), 4);
         index = swap_endian(raw, index_endian);
       } else {
         u16 h;
-        memcpy(&h, gw_host(index_base + i * 2), 2);
+        memcpy(&h, gw_host(index_base + index * 2), 2);
         index = index_endian ? (u16)((h << 8) | (h >> 8)) : h;
       }
     }
@@ -735,11 +739,94 @@ void use_sum_combiner() {
   blk_end(p);
 }
 
+// Which combiner setup is loaded, so draws switch only when it changes.
+enum Combiner { kTextureTimesColour, kGridLine, kOther };
+Combiner g_combiner = kTextureTimesColour;
+
 void use_default_combiner() {
+  if (g_combiner == kTextureTimesColour) return;
   u32* p = blk_begin();
 #include "nv2a_ps.inl"
   for (u32 unit = 1; unit < 4; ++unit) p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0 + unit * 64, 0);
   blk_end(p);
+  g_combiner = kTextureTimesColour;
+}
+
+// The grid's line colour: the game reads it per screen region from an 18x12
+// colour map it renders on the GPU (not reproduced yet), so one colour
+// stands in for all of it, with 0.5 for the edge mapping in xenos_vp.cpp.
+// Squared by the brightness (1.5 for every eighth line, down to 0.075).
+const float kGridLineColour[4] = {0.30f, 0.28f, 0.85f, 0.5f};
+
+// The grid lines' pixel shader (B16AAC17) is
+//   colour = min((map * brightness)^2, 1) * (1 - |edge|)^3
+// with edge running from -1 to 1 across the thin quad of each line. The
+// vertex program (xvp_get's line_i) puts the first factor in the diffuse
+// colour and edge / 2 + 1/2 in its alpha (a); the combiners do the rest:
+//   stage 0: spare0.a = a
+//   stage 1: spare0.a = 2 * (spare0.a >= 1/2 ? 1 - a : a) = 1 - |edge|
+//            (the mux picks CD when spare0's alpha is at least 1/2)
+//   stage 2: spare1.a = spare0.a^2
+//   stage 3: spare0.a = spare1.a * spare0.a = (1 - |edge|)^3
+//   stage 4: spare0.rgb = diffuse.rgb * spare0.a
+// and the final combiner outputs spare0 (alpha too, for blends that use it).
+void use_line_combiner() {
+  if (g_combiner == kGridLine) return;
+  // Combiner registers: 0 zero, 4 diffuse, 0xC spare0, 0xD spare1. Input
+  // mappings: 0 as is, 1 inverted (1 - x); 1 is zero inverted.
+  constexpr u32 kZero = 0, kDiffuse = 4, kSpare0 = 0xC, kSpare1 = 0xD, kInvert = 1;
+  auto alpha_in = [](u32 a, u32 a_map, u32 b, u32 b_map, u32 c, u32 c_map, u32 d, u32 d_map) {
+    return MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, a) | MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) |
+           MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, a_map) | MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, b) |
+           MASK(NV097_SET_COMBINER_ALPHA_ICW_B_ALPHA, 1) | MASK(NV097_SET_COMBINER_ALPHA_ICW_B_MAP, b_map) |
+           MASK(NV097_SET_COMBINER_ALPHA_ICW_C_SOURCE, c) | MASK(NV097_SET_COMBINER_ALPHA_ICW_C_ALPHA, 1) |
+           MASK(NV097_SET_COMBINER_ALPHA_ICW_C_MAP, c_map) | MASK(NV097_SET_COMBINER_ALPHA_ICW_D_SOURCE, d) |
+           MASK(NV097_SET_COMBINER_ALPHA_ICW_D_ALPHA, 1) | MASK(NV097_SET_COMBINER_ALPHA_ICW_D_MAP, d_map);
+  };
+  auto alpha_out = [](u32 ab, u32 sum, bool mux, u32 op) {
+    return MASK(NV097_SET_COMBINER_ALPHA_OCW_AB_DST, ab) | MASK(NV097_SET_COMBINER_ALPHA_OCW_SUM_DST, sum) |
+           MASK(NV097_SET_COMBINER_ALPHA_OCW_MUX_ENABLE, mux ? 1 : 0) | MASK(NV097_SET_COMBINER_ALPHA_OCW_OP, op);
+  };
+  u32* p = blk_begin();
+  p = pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT, 0);
+  p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM, 0);  // no texture stages
+  blk_end(p);
+  // Alpha parts of stages 0-3; their colour parts discard (all outputs 0).
+  const u32 alpha[4][2] = {
+      {alpha_in(kDiffuse, 0, kZero, kInvert, kZero, 0, kZero, 0), alpha_out(kSpare0, 0, false, 0)},
+      {alpha_in(kDiffuse, 0, kZero, kInvert, kDiffuse, kInvert, kZero, kInvert),
+       alpha_out(0, kSpare0, true, NV097_SET_COMBINER_ALPHA_OCW_OP_SHIFTLEFTBY1)},
+      {alpha_in(kSpare0, 0, kSpare0, 0, kZero, 0, kZero, 0), alpha_out(kSpare1, 0, false, 0)},
+      {alpha_in(kSpare1, 0, kSpare0, 0, kZero, 0, kZero, 0), alpha_out(kSpare0, 0, false, 0)},
+  };
+  for (u32 stage = 0; stage < 4; ++stage) {
+    p = blk_begin();
+    p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + stage * 4, 0);
+    p = pb_push1(p, NV097_SET_COMBINER_COLOR_OCW + stage * 4, 0);
+    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + stage * 4, alpha[stage][0]);
+    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_OCW + stage * 4, alpha[stage][1]);
+    blk_end(p);
+  }
+  // Stage 4: spare0.rgb = diffuse.rgb * spare0.a; its alpha part discards.
+  p = blk_begin();
+  p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + 4 * 4,
+               MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, kDiffuse) |
+                   MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, kSpare0) |
+                   MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, 1));
+  p = pb_push1(p, NV097_SET_COMBINER_COLOR_OCW + 4 * 4, MASK(NV097_SET_COMBINER_COLOR_OCW_AB_DST, kSpare0));
+  p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + 4 * 4, 0);
+  p = pb_push1(p, NV097_SET_COMBINER_ALPHA_OCW + 4 * 4, 0);
+  p = pb_push1(p, NV097_SET_COMBINER_CONTROL,
+               MASK(NV097_SET_COMBINER_CONTROL_ITERATION_COUNT, 5) |
+                   MASK(NV097_SET_COMBINER_CONTROL_MUX_SELECT, NV097_SET_COMBINER_CONTROL_MUX_SELECT_MSB));
+  // Final combiner: A * B + (1 - A) * C + D with A = B = C = 0, D = spare0;
+  // alpha (G) = spare0's.
+  p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW0, MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_D_SOURCE, kSpare0));
+  p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW1,
+               MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_SOURCE, kSpare0) |
+                   MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_ALPHA, 1));
+  blk_end(p);
+  g_combiner = kGridLine;
 }
 
 // One screen-aligned quad from (x0, y0) to (x1, y1); unit k's texture
@@ -800,6 +887,7 @@ void apply_glow() {
   const void* blurred = pb_extra_buffer(1);
   set_program_start(kGlowProgramSlot);
   use_sum_combiner();
+  g_combiner = kOther;
   u32* p = blk_begin();
   p = pb_push1(p, NV097_SET_BLEND_ENABLE, 0);
   blk_end(p);
@@ -885,31 +973,33 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   float vy_scale = as_float(regs[0x2111]), vy_off = as_float(regs[0x2112]);
   u32 vte = regs[0x2206];
 
+  // The in-level grid's lines (vertex shader 8E1A294A, pixel shader
+  // B16AAC17): their own program and combiner (see use_line_combiner).
+  const bool grid_lines = vs_hash == 0x8E1A294A;
   // Pixel shader: which interpolator is the texture coordinate.
   int uv_i = -1, tex_const = 0;
   xps_info(ps_hash, &uv_i, &tex_const);
   const Texture* texture = &g_white;
-  if (prim != 1) {
+  if (prim != 1 && !grid_lines) {
     // A draw whose texture can't be reproduced yet (render targets, float
     // formats, computed coordinates) is skipped: many use replace blending
     // and would paint flat shapes over the scene.
     if (uv_i == -2) return note_skip(kComputedUv, 0);
     if (uv_i >= 0) {
       const Texture* t = texture_from_fetch(&regs[0x4800 + tex_const * 6]);
-      // The in-level grid's lines (vertex shader 8E1A294A) are never drawn;
-      // the likely reason (to be confirmed by the census's skip reasons) is
-      // that they sample one of the game's float render targets (formats 26,
-      // 54), which are not reproduced yet. With a white texel instead they
-      // keep their own colours: the grid without its glow.
       const u32 texture_format = regs[0x4800 + tex_const * 6 + 1] & 0x3F;
-      if (!t && vs_hash == 0x8E1A294A && (texture_format == 26 || texture_format == 54)) t = &g_white;
       if (!t) return note_skip(kTextureFormat, texture_format);
       texture = t;
     }
   }
-  if (uv_i < 0) uv_i = -1;
-  int color_i = uv_i == 0 ? 1 : 0;
+  if (uv_i < 0 || grid_lines) uv_i = -1;
+  int color_i = grid_lines ? -1 : uv_i == 0 ? 1 : 0;
   bind_texture(texture);
+  if (grid_lines) {
+    use_line_combiner();
+  } else {
+    use_default_combiner();
+  }
 
   u32 blend = regs[0x2201];
   u32* p = blk_begin();
@@ -922,14 +1012,27 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   if (prim == 1) p = pb_push1(p, NV097_SET_POINT_SIZE, 16);  // 2 px (units of 1/8)
   blk_end(p);
 
-  // Preferred: the shader as an NV2A vertex program.
+  // Preferred: the shader as an NV2A vertex program. Draws larger than half
+  // the vertex arena go in pieces (whole primitives: a multiple of 12 is
+  // whole quads, triangles, lines and rectangles); the grid's lines are a
+  // 65528-vertex draw.
   if (g_use_gpu_vertex) {
-    const XvpProgram* gp = xvp_get(vs, uv_i, color_i, !(vte & 0x100));
-    if (gp && draw_on_gpu(gp, regs, nv_prim, count, source, index_base, index_endian, index32, vte)) {
-      if (g_census_entry) g_census_entry->gpu += count;
-      return;
+    const XvpProgram* gp = xvp_get(vs, uv_i, color_i, !(vte & 0x100), grid_lines ? 0 : -1);
+    if (gp) {
+      const u32 piece = gp->stride ? (kArenaBytes / 2 / gp->stride) / 12 * 12 : count;
+      bool drawn = true;
+      for (u32 first = 0; first < count && drawn; first += piece) {
+        const u32 n = count - first < piece ? count - first : piece;
+        drawn = draw_on_gpu(gp, regs, nv_prim, first, n, source, index_base, index_endian, index32, vte, false, 1,
+                            1, grid_lines ? kGridLineColour : nullptr);
+      }
+      if (drawn) {
+        if (g_census_entry) g_census_entry->gpu += count;
+        return;
+      }
     }
   }
+  if (grid_lines) return;  // no CPU path for the line combiner's colours
 
   // Fallback: interpret the shader on the CPU, draw pre-transformed vertices.
   if (!arena_room(count * 20)) {

@@ -220,6 +220,9 @@ int main(int argc, char** argv) {
     }
     const XvpProgram* a = xvp_get(program, 0, 1, true);
     const XvpProgram* b = xvp_get(program, -1, 0, true);
+    if (const XvpProgram* line = xvp_get(program, -1, -1, true, 0)) {
+      printf("  as grid lines: %u instructions\n", line->instructions);
+    }
     if (!a || !b) continue;
     ++translated;
     // Random constants, stream at GPU address 0 (fetch constant type 3,

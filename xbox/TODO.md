@@ -105,6 +105,15 @@ order. Measurements are from XEMU at 64 MB unless noted.
 
 - [ ] Background grid: drawn into its own small target and distorted
       (vertex shader 8518CDFB, 46464 vertices); not drawn yet.
+- [ ] Grid lines (vertex shader 8E1A294A, pixel shader B16AAC17): they were
+      drawn but invisible (the stand-in combiner read a colour the program
+      never wrote) and the 65528-vertex half was dropped (too big for the
+      vertex arena). Now their own translation (`line_i` in xvp_get) and
+      combiner (`use_line_combiner`): colour = (line colour x brightness)^2,
+      faded as (1 - |edge|)^3 across each line, as the game's shader. The
+      game's 18x12 colour map (a GPU render target) is one fixed colour for
+      now. Big draws go to the GPU in pieces. Not yet seen; watch the frame
+      rate (2.5 MB of line vertices a frame).
 - [ ] Vertex arena overflows on some menu frames ("vertex arena full").
 
 ## 6. Sound

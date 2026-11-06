@@ -33,7 +33,11 @@ struct XvpProgram {
   u32 stride;  // bytes
   u16 fetch_slot;
 };
-const XvpProgram* xvp_get(const XvsProgram* program, int uv_i, int color_i, bool divide);
+// uv_i, color_i: the interpolators that become texture coordinate 0 and the
+// diffuse colour (-1: none). line_i: an interpolator holding a grid line's
+// (u, v, brightness, edge), turned into the diffuse colour for the line
+// combiner (see the export in xenos_vp.cpp); constant 1 is the line colour.
+const XvpProgram* xvp_get(const XvsProgram* program, int uv_i, int color_i, bool divide, int line_i = -1);
 
 // Records which interpolator feeds the pixel shader's first texture fetch.
 void xps_analyse(u32 hash, u32 guest_words, u32 dwords);

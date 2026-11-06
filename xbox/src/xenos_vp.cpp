@@ -224,9 +224,9 @@ Variant g_variants[48];
 
 }  // namespace
 
-const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool divide) {
+const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool divide, int line_i) {
   const Program& p = *(const Program*)xvs;
-  u32 key = p.hash ^ (u32)(uv_i + 2) << 4 ^ (u32)(color_i + 2) << 8 ^ (u32)divide << 12;
+  u32 key = p.hash ^ (u32)(uv_i + 2) << 4 ^ (u32)(color_i + 2) << 8 ^ (u32)divide << 12 ^ (u32)(line_i + 2) << 16;
   for (Variant& v : g_variants) {
     if (v.used && v.program.key == key) return v.program.ok ? &v.program : nullptr;
   }
@@ -260,6 +260,9 @@ const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool div
     if (dst == 62) {
       d.temp = kPos;
       d.temp_mask = mask;
+    } else if (dst == line_i) {
+      d.output = kOutD0;  // written by store() below
+      d.out_mask = mask;
     } else if (dst == uv_i) {
       d.output = kOutT0;
       d.out_mask = mask;
@@ -431,6 +434,26 @@ const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool div
       } else {
         if (dst > 3) return b.fail();
         d = b.to_temp(dst, mask);
+      }
+      if (dst == line_i && in.export_data) {
+        // A grid line's (u, v, brightness, edge): colour 1 holds the line
+        // colour (rgb) and 0.5. Diffuse rgb = min((colour * brightness)^2,
+        // 1), the game's pixel shader with its colour map held constant;
+        // diffuse alpha = edge / 2 + 1/2 (edge runs -1 to 1 across the
+        // line), turned into the soft line profile per pixel by the line
+        // combiner in src/nv2a.cpp. Needs brightness and edge in one write.
+        if ((mask & 0xC) != 0xC) return;
+        b.mac(MUL, replicate(value, 2), cnst(1, "xyzw"), Op(), b.to_temp(kS0));
+        b.mac(MUL, temp(kS0), temp(kS0), Op(), b.to_temp(kS0));
+        Builder::Dest rgb;
+        rgb.output = kOutD0;
+        rgb.out_mask = 7;
+        b.mac(MIN, temp(kS0), cnst(0, "yyyy"), Op(), rgb);
+        Builder::Dest alpha;
+        alpha.output = kOutD0;
+        alpha.out_mask = 8;
+        b.mac(MAD, replicate(value, 3), cnst(1, "wwww"), cnst(1, "wwww"), alpha);
+        return;
       }
       if (d.output == kOutT0) {
         // Texture coordinates: scaled by constant 0's z, w (1 for ordinary
