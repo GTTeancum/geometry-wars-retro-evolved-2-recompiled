@@ -11,6 +11,7 @@
 #include <windows.h>
 
 GwStats gw_stats;
+volatile u64 gw_part_cycles[kPartCount];
 
 extern "C" {
 // Read by xbox/tools/read_log.py: write position, then the text.
@@ -85,7 +86,27 @@ DWORD WINAPI status_thread(LPVOID) {
     if (swaps != last_swaps) stalled_seconds = 0;
     last_swaps = swaps;
     last_tick = now;
-    if (++seconds % 5 == 0) write_log_file(fps);
+    if (++seconds % 5 == 0) {
+      // ms of CPU per frame for each timed part, at 733 MHz.
+      static u64 last_cycles[kPartCount];
+      static u32 last_frames;
+      const u32 frames = swaps - last_frames;
+      if (frames) {
+        char text[160];
+        int n = snprintf(text, sizeof(text), "cpu ms/frame over %u frames:", frames);
+        static const char* const kNames[kPartCount] = {"grid", "particles", "stars", "commands"};
+        for (int i = 0; i < kPartCount && n < (int)sizeof(text) - 24; ++i) {
+          const u64 c = gw_part_cycles[i];
+          // tenths of a ms (this printf has no %f)
+          const u32 tenths = (u32)((c - last_cycles[i]) / 73300 / frames);
+          n += snprintf(text + n, sizeof(text) - n, " %s %u.%u", kNames[i], tenths / 10, tenths % 10);
+          last_cycles[i] = c;
+        }
+        gw_log("%s\n", text);
+      }
+      last_frames = swaps;
+      write_log_file(fps);
+    }
     EnterCriticalSection(&g_log_lock);
     tail_lines(tail, sizeof(tail), 10);
     // Clip each line to the screen width so wrapping never scrolls the

@@ -20,6 +20,15 @@
 // precision (the game rounds every result to single anyway), with SSE's
 // reciprocal square root estimate standing in for frsqrte.
 //
+// The points live in host floats (HostGrid below), loaded from the guest
+// grid when the game creates or resets it: nothing else reads or writes them
+// (the creator sub_8205D118, the reset sub_8205B000 and this job are the only
+// code that touches the points), and converting every value from and to
+// big-endian on the Xbox's Pentium III cost more than the physics (an
+// integer byte swap feeding an SSE register goes through memory). The guest
+// copy keeps the positions of the last load. GW_GRID_GUEST_SYNC (the PC check,
+// GRID_CHECK) loads from and stores back to the guest on every update.
+//
 // GW_GRID_CHECK (make GRID_CHECK=y): once every 600 calls, run the original
 // and the native code on the same input and log how far they differ.
 #include "runtime.h"
@@ -28,6 +37,10 @@
 #include <xmmintrin.h>
 
 extern "C" void __imp__sub_8205B880(PPCContext& ctx, uint8_t* base);
+#ifndef GW_GRID_GUEST_SYNC
+extern "C" void __imp__sub_8205D118(PPCContext& ctx, uint8_t* base);
+extern "C" void __imp__sub_8205B000(PPCContext& ctx, uint8_t* base);
+#endif
 
 namespace {
 
@@ -123,22 +136,9 @@ Constants load_constants() {
   return k;
 }
 
-// A line vertex: x, y, z, u, v, colour, edge (z on are guest words). Into
-// the buffer's host mirror when there is one (src/kernel_memory.cpp), in
-// host order, for the GPU to read in place; else into the guest buffer.
+// A line vertex in the guest buffer: x, y, z, u, v, colour, edge (z on are
+// guest words). Only without the host mirror (update_row's segment).
 inline void vertex(u32 out, float x, float y, u32 z, u32 u, u32 v, u32 colour, u32 edge) {
-  if (u8* host = gw_grid_line_host(out)) {
-    u32 words[7];
-    memcpy(&words[0], &x, 4);
-    memcpy(&words[1], &y, 4);
-    words[2] = __builtin_bswap32(z);
-    words[3] = __builtin_bswap32(u);
-    words[4] = __builtin_bswap32(v);
-    words[5] = __builtin_bswap32(colour);
-    words[6] = __builtin_bswap32(edge);
-    memcpy(host, words, sizeof(words));
-    return;
-  }
   sf(out + 0, x);
   sf(out + 4, y);
   sraw(out + 8, z);
@@ -148,25 +148,89 @@ inline void vertex(u32 out, float x, float y, u32 z, u32 u, u32 v, u32 colour, u
   sraw(out + 24, edge);
 }
 
-// One grid row in host floats.
-struct RowCache {
-  float x[kCols], y[kCols];            // position (read slot)
-  float rest_x[kCols], rest_y[kCols];  // rest position
-  float dx[kCols], dy[kCols];          // position - rest
-  void load(u32 row, u32 read) {
-    for (u32 i = 0; i < kCols; ++i) {
-      const u32 p = row + i * kPoint;
-      x[i] = lf(p + 8 + read);
-      y[i] = lf(p + 12 + read);
-      rest_x[i] = lf(p + 24);
-      rest_y[i] = lf(p + 28);
-      dx[i] = x[i] - rest_x[i];
-      dy[i] = y[i] - rest_y[i];
+// The grid points in host floats, both position slots. The game updates
+// rows 1 to 87 (rows 0 and 88, and the first and last column, are the fixed
+// border); the PC check also runs row 0, which reads row -1 (before the
+// grid). Array row r holds grid row r - 1: rows -1 to 89, the outer two
+// loaded only with GW_GRID_GUEST_SYNC.
+constexpr u32 kGridRows = kRows + 3;
+#ifdef GW_GRID_GUEST_SYNC
+constexpr int kFirstRow = -1, kLastRow = kRows + 1;
+#else
+constexpr int kFirstRow = 0, kLastRow = kRows;
+#endif
+struct HostGrid {
+  u32 guest;  // the guest grid loaded, 0 = load before the next update
+  float pos_x[2][kGridRows][kCols], pos_y[2][kGridRows][kCols];
+  float vel_x[kGridRows][kCols], vel_y[kGridRows][kCols];
+  float rest_x[kGridRows][kCols], rest_y[kGridRows][kCols];
+
+  void load(u32 grid) {
+    for (int r = kFirstRow; r <= kLastRow; ++r) {
+      const u32 j = (u32)(r + 1);
+      for (u32 i = 0; i < kCols; ++i) {
+        const u32 p = grid + (u32)r * kRow + i * kPoint;
+        vel_x[j][i] = lf(p + 0);
+        vel_y[j][i] = lf(p + 4);
+        pos_x[0][j][i] = lf(p + 8);
+        pos_y[0][j][i] = lf(p + 12);
+        pos_x[1][j][i] = lf(p + 16);
+        pos_y[1][j][i] = lf(p + 20);
+        rest_x[j][i] = lf(p + 24);
+        rest_y[j][i] = lf(p + 28);
+      }
+    }
+    guest = grid;
+  }
+  void store(u32 grid) const {
+    for (int r = kFirstRow; r <= kLastRow; ++r) {
+      const u32 j = (u32)(r + 1);
+      for (u32 i = 0; i < kCols; ++i) {
+        const u32 p = grid + (u32)r * kRow + i * kPoint;
+        sf(p + 0, vel_x[j][i]);
+        sf(p + 4, vel_y[j][i]);
+        sf(p + 8, pos_x[0][j][i]);
+        sf(p + 12, pos_y[0][j][i]);
+        sf(p + 16, pos_x[1][j][i]);
+        sf(p + 20, pos_y[1][j][i]);
+      }
+    }
+  }
+};
+HostGrid g_host;  // 390 KB
+
+// The job's pushers (16 bytes each at args + 32: x, y, strength, scale),
+// loaded once per job in host floats. A pusher moves a point only where
+// its s is not zero: r >= radius_k with r = 1 / sqrt(d^2 + bias), so
+// d^2 + bias <= 1 / radius_k^2. update_row skips, per row, the pushers too
+// far above or below the whole row for that (2% margin for the estimated
+// square root): they would add exactly zero. On the Xbox the pusher loop
+// was most of the grid's time (bullets and explosions are pushers).
+constexpr int kMaxPushers = 256;
+
+// Logged every 600 grid updates: the pushers' and objects' work, and the
+// time of the physics and of the lines per frame.
+struct GridStats {
+  u32 updates, pushers, active, pushes, objects, rows;
+  u64 physics_cycles, line_cycles;
+} g_stats;
+struct Pushers {
+  int count;
+  float x[kMaxPushers], y[kMaxPushers], strength[kMaxPushers], scale[kMaxPushers];
+  void load(u32 args) {
+    count = (int)lw(args + 0);
+    if (count > kMaxPushers) count = -1;  // too many: the rows read them in place
+    for (int n = 0; n < count; ++n) {
+      const u32 q = args + 32 + (u32)n * 16;
+      x[n] = lf(q);
+      y[n] = lf(q + 4);
+      strength[n] = lf(q + 8);
+      scale[n] = lf(q + 12);
     }
   }
 };
 
-void update_row(u32 args, u32 j, const Constants& k) {
+void update_row(u32 args, u32 j, const Constants& k, const Pushers& all) {
   const u32 grid = lw(K + 5896);
   const int pushers = (int)lw(args + 0);
   const bool push_b = gw_load8(args + 4) != 0, push_c = gw_load8(args + 5) != 0;
@@ -177,33 +241,81 @@ void update_row(u32 args, u32 j, const Constants& k) {
   const u32 cells_w = lw(K + 1556), cells_h = lw(K + 1560);
   const float cell_ox = lf(K + 1540), cell_oy = lf(K + 1544), cell_sx = lf(D + 9640), cell_sy = lf(D + 9644);
   const u32 row = grid + j * kRow;
+  const u32 rs = read / 8, ws = write / 8;  // position slots
+  HostGrid& g = g_host;
+  const u32 h = j + 1;  // this row in the host arrays
+  // This row and its neighbours: positions in the read slot (which no row
+  // writes this frame), rest positions.
+  const float* hx = g.pos_x[rs][h];
+  const float* hy = g.pos_y[rs][h];
+  // When the game reads and writes the same slot, each point still sees its
+  // left neighbour's position from before this row (the original read the
+  // row before writing any of it).
+  float here_x[kCols], here_y[kCols];
+  if (rs == ws) {
+    memcpy(here_x, hx, sizeof(here_x));
+    memcpy(here_y, hy, sizeof(here_y));
+    hx = here_x;
+    hy = here_y;
+  }
+  const float* ax = g.pos_x[rs][h - 1];
+  const float* ay = g.pos_y[rs][h - 1];
+  const float* bx = g.pos_x[rs][h + 1];
+  const float* by = g.pos_y[rs][h + 1];
+  const float* hrx = g.rest_x[h];
+  const float* hry = g.rest_y[h];
+  const float* arx = g.rest_x[h - 1];
+  const float* ary = g.rest_y[h - 1];
+  const float* brx = g.rest_x[h + 1];
+  const float* bry = g.rest_y[h + 1];
 
-  // This row and its neighbours, unpacked once: positions (the read slot,
-  // which no job writes this frame) and displacements from rest.
-  RowCache above, here, below;
-  above.load(row - kRow, read);
-  here.load(row, read);
-  below.load(row + kRow, read);
+  // The pushers that can reach this row, in their original order.
+  float ymin = hy[1], ymax = hy[1];
+  for (u32 i = 2; i <= 131; ++i) {
+    ymin = hy[i] < ymin ? hy[i] : ymin;
+    ymax = hy[i] > ymax ? hy[i] : ymax;
+  }
+  const float reach2 = k.radius_k > 0 ? 1.02f / (k.radius_k * k.radius_k) : 3.0e38f;
+  int active[kMaxPushers];
+  int active_count = 0;
+  for (int n = 0; n < all.count; ++n) {
+    const float py = all.y[n];
+    const float dy = py < ymin ? ymin - py : py > ymax ? py - ymax : 0.0f;
+    if (dy * dy + k.bias <= reach2) active[active_count++] = n;
+  }
+  g_stats.active += (u32)active_count;
 
+  const u64 t1 = __builtin_ia32_rdtsc();
   // 1. Physics of the inner points.
   for (u32 i = 1; i <= 131; ++i) {
-    const u32 p = row + i * kPoint;
-    const float px = here.x[i], py = here.y[i];
+    const float px = hx[i], py = hy[i];
     float fx = k.initial, fy = k.initial;
     const int cx = (int)((cell_ox + px) * cell_sx), cy = (int)((cell_oy + py) * cell_sy);
 
-    u32 q = args + 32;
-    for (int n = 0; n < pushers; ++n, q += 16) {
-      const float dx = lf(q) - px, dy = lf(q + 4) - py;
-      const float r = rsq(dx * dx + dy * dy + k.bias);
+    auto push = [&](float qx, float qy, float strength, float scale) {
+      const float dx = qx - px, dy = qy - py;
+      const float d2 = dx * dx + dy * dy + k.bias;
+      if (d2 > reach2) return;  // s would be 0 (see Pushers)
+      ++g_stats.pushes;
+      const float r = rsq(d2);
       const float a = r * k.falloff;
-      float s = lf(q + 8);
-      s = sel(s - a, a, s) * lf(q + 12) * r;
+      float s = sel(strength - a, a, strength) * scale * r;
       s = sel(r - k.radius_k, s, k.zero);
       const float nx = dx * s + fx, ny = dy * s + fy;
       const float gate = r - k.reach;
       fx = sel(gate, fx, nx);
       fy = sel(gate, fy, ny);
+    };
+    if (all.count >= 0) {
+      for (int m = 0; m < active_count; ++m) {
+        const int n = active[m];
+        push(all.x[n], all.y[n], all.strength[n], all.scale[n]);
+      }
+    } else {
+      for (int n = 0; n < pushers; ++n) {
+        const u32 q = args + 32 + (u32)n * 16;
+        push(lf(q), lf(q + 4), lf(q + 8), lf(q + 12));
+      }
     }
 
     if ((u32)cx < cells_w && (u32)cy < cells_h) {
@@ -212,9 +324,11 @@ void update_row(u32 args, u32 j, const Constants& k) {
       for (int n = first; n < last; ++n) {
         const u32 o = objects + (u32)n * 20 + 4;
         const float dx = px - lf(o), dy = py - lf(o + 4);
-        const float kx = fx * k.object_keep, ky = fy * k.object_keep;
         const float d2 = dx * dx + dy * dy;
         const float inside = d2 - lf(o + 8);
+        ++g_stats.objects;
+        if (inside >= 0) continue;  // outside the object's radius: no change
+        const float kx = fx * k.object_keep, ky = fy * k.object_keep;
         const float s = rsq(sel(d2 - k.reach, d2, k.reach)) * lf(o + 12);
         const float nx = dx * s + kx, ny = dy * s + ky;
         fx = sel(inside, fx, nx);
@@ -239,33 +353,65 @@ void update_row(u32 args, u32 j, const Constants& k) {
 
     // Springs: the neighbours' displacements from rest (above + below, then
     // left, then right, the PowerPC order).
-    float sx = (above.dx[i] + below.dx[i]) + here.dx[i - 1] + here.dx[i + 1];
-    float sy = (above.dy[i] + below.dy[i]) + here.dy[i - 1] + here.dy[i + 1];
+    float sx = ((ax[i] - arx[i]) + (bx[i] - brx[i])) + (hx[i - 1] - hrx[i - 1]) + (hx[i + 1] - hrx[i + 1]);
+    float sy = ((ay[i] - ary[i]) + (by[i] - bry[i])) + (hy[i - 1] - hry[i - 1]) + (hy[i + 1] - hry[i + 1]);
     sx *= k.neighbour;
     sy *= k.neighbour;
-    float vx = (here.rest_x[i] + sx - px) * k.stiffness + lf(p + 0);
-    float vy = (here.rest_y[i] + sy - py) * k.stiffness + lf(p + 4);
+    float vx = (hrx[i] + sx - px) * k.stiffness + g.vel_x[h][i];
+    float vy = (hry[i] + sy - py) * k.stiffness + g.vel_y[h][i];
     vx = (vx + fx) * k.damping;
     vy = (vy + fy) * k.damping;
     vx = sel(__builtin_fabsf(vx) - k.tiny, vx, k.zero);
     vy = sel(__builtin_fabsf(vy) - k.tiny, vy, k.zero);
-    sf(p + 0, vx);
-    sf(p + 4, vy);
+    g.vel_x[h][i] = vx;
+    g.vel_y[h][i] = vy;
     float x = vx * k.step + px, y = vy * k.step + py;
     x = sel(-max_x - x, -max_x, x);
     x = sel(x - max_x, max_x, x);
     y = sel(-max_y - y, -max_y, y);
     y = sel(y - max_y, max_y, y);
-    sf(p + 8 + write, x);
-    sf(p + 12 + write, y);
+    g.pos_x[ws][h][i] = x;
+    g.pos_y[ws][h][i] = y;
   }
+  ++g_stats.rows;
+  const u64 t2 = __builtin_ia32_rdtsc();
+  g_stats.physics_cycles += t2 - t1;
+  struct LineTimer {
+    u64 start;
+    ~LineTimer() { g_stats.line_cycles += __builtin_ia32_rdtsc() - start; }
+  } line_timer{t2};
 
-  // 2. The row's lines: thin quads along each segment.
+  // 2. The row's lines. With the line buffer's host mirror (see
+  // gw_grid_line_host), each segment is a line of two vertices there
+  // (x, y, z, brightness, edge 0), the NV2A draws it; else, as the game
+  // does, a thin quad of four vertices in the guest buffer.
   const float thickness = lf(K + 6964) * lf(K + 5900);
   const u32 z = raw(K + 7016);
   const u32 edge_a = raw(C + 10092), edge_b = raw(C + 10088);
   const u32 row_colour = raw(K + 5852 + (j & 7) * 4);
+  const u32 lines = lw(K + 5888);
+  // The buffer starts at 'lines' (row 1's uprights); row j's segments at
+  // lines + j * 29456 - 14784, rows numbered from 1.
+  u8* const mirror = gw_grid_line_host(lines);
+  const u32 mirror_base = lines;
+  const u32 hz = __builtin_bswap32(z);
+  // a, b: the points' guest addresses (their texture u, v at +32, +36).
   auto segment = [&](u32 out, float x0, float y0, u32 a, float x1, float y1, u32 b, u32 colour) {
+    if (mirror) {
+      u32 w[10];
+      memcpy(&w[0], &x0, 4);
+      memcpy(&w[1], &y0, 4);
+      w[2] = hz;
+      w[3] = __builtin_bswap32(colour);
+      w[4] = 0;
+      memcpy(&w[5], &x1, 4);
+      memcpy(&w[6], &y1, 4);
+      w[7] = hz;
+      w[8] = w[3];
+      w[9] = 0;
+      memcpy(mirror + (out - mirror_base) / (4 * kVertex) * 40, w, sizeof(w));
+      return;
+    }
     const float dx = x1 - x0, dy = y1 - y0;
     const float s = rsq(dx * dx + dy * dy + k.thickness_bias) * thickness;
     const float nx = s * dy, ny = s * dx;
@@ -274,17 +420,14 @@ void update_row(u32 args, u32 j, const Constants& k) {
     vertex(out + 2 * kVertex, x1 + nx, y1 - ny, z, raw(b + 32), raw(b + 36), colour, edge_a);
     vertex(out + 3 * kVertex, x1 - nx, y1 + ny, z, raw(b + 32), raw(b + 36), colour, edge_b);
   };
-  auto pos_x = [&](u32 p) { return lf(p + 8 + read); };
-  auto pos_y = [&](u32 p) { return lf(p + 12 + read); };
-  const u32 lines = lw(K + 5888);
   u32 out = lines + j * kLineVertices * kVertex - 14784;
-  segment(out, here.x[0], here.y[0], row, here.x[1], here.y[1], row + kPoint, row_colour);
+  segment(out, hx[0], hy[0], row, hx[1], hy[1], row + kPoint, row_colour);
   out += 4 * kVertex;
   for (u32 i = 1; i <= 131; ++i) {
     const u32 p = row + i * kPoint;
     const u32 column_colour = raw(K + 5852 + (i & 7) * 4);
-    segment(out, here.x[i], here.y[i], p, here.x[i + 1], here.y[i + 1], p + kPoint, row_colour);
-    segment(out + 4 * kVertex, here.x[i], here.y[i], p, below.x[i], below.y[i], p + kRow, column_colour);
+    segment(out, hx[i], hy[i], p, hx[i + 1], hy[i + 1], p + kPoint, row_colour);
+    segment(out + 4 * kVertex, hx[i], hy[i], p, bx[i], by[i], p + kRow, column_colour);
     out += 8 * kVertex;
   }
   // Row 1's job also draws the uprights between rows 0 and 1, at the start
@@ -293,7 +436,7 @@ void update_row(u32 args, u32 j, const Constants& k) {
     u32 o = lines;
     for (u32 i = 1; i <= 131; ++i) {
       const u32 p = grid + i * kPoint, below = p + kRow;
-      segment(o, pos_x(p), pos_y(p), p, pos_x(below), pos_y(below), below, raw(K + 5852 + (i & 7) * 4));
+      segment(o, ax[i], ay[i], p, hx[i], hy[i], below, raw(K + 5852 + (i & 7) * 4));
       o += 4 * kVertex;
     }
   }
@@ -302,10 +445,12 @@ void update_row(u32 args, u32 j, const Constants& k) {
   if (!kWriteDisplacements) return;
   const u32 displacement = lw(K + 5884);
   const u32 zero_word = raw(C + 1740);
-  auto displacements = [&](u32 out, u32 from) {
+  // Row r's points (r = 0 or 88: the border rows).
+  auto displacements = [&](u32 out, u32 r) {
+    u32 from = grid + r * kRow;
     for (u32 i = 0; i < kCols; ++i, from += kPoint, out += kVertex) {
-      sf(out + 0, pos_x(from) - lf(from + 24));
-      sf(out + 4, pos_y(from) - lf(from + 28));
+      sf(out + 0, g.pos_x[rs][r + 1][i] - g.rest_x[r + 1][i]);
+      sf(out + 4, g.pos_y[rs][r + 1][i] - g.rest_y[r + 1][i]);
       sraw(out + 8, z);
       sraw(out + 12, raw(from + 32));
       sraw(out + 16, raw(from + 36));
@@ -313,24 +458,56 @@ void update_row(u32 args, u32 j, const Constants& k) {
       sraw(out + 24, zero_word);
     }
   };
-  if (j == 1) displacements(displacement, grid);
+  if (j == 1) displacements(displacement, 0);
   out = displacement + j * kCols * kVertex;
   for (u32 i = 0; i < kCols; ++i, out += kVertex) {
     const u32 p = row + i * kPoint;
-    sf(out + 0, here.dx[i]);
-    sf(out + 4, here.dy[i]);
+    sf(out + 0, hx[i] - hrx[i]);
+    sf(out + 4, hy[i] - hry[i]);
     sraw(out + 8, z);
     sraw(out + 12, raw(p + 32));
     sraw(out + 16, raw(p + 36));
     sraw(out + 20, zero_word);
     sraw(out + 24, zero_word);
   }
-  if (j == 87) displacements(displacement + 88 * kCols * kVertex, row + kRow);
+  if (j == 87) displacements(displacement + 88 * kCols * kVertex, 88);
 }
 
+// The game runs the grid job on all six of its job threads, which take rows
+// from a shared counter: on the 360's six hardware threads, in parallel. The
+// Xbox has one core, so the threads only take turns (each switch costing
+// the cache). The first thread in does every row; the others find it busy
+// and return at once (the job system waits for all of them, so the frame
+// still waits for the grid). Each row is still done exactly once.
+volatile long g_grid_busy = 0;
+
 void update_grid(u32 args) {
+  if (InterlockedCompareExchange(&g_grid_busy, 1, 0) != 0) return;
+  GwPartTimer timer(kPartGrid);
   const Constants k = load_constants();
-  for (u32 j; (j = next_row()) < kRows;) update_row(args, j, k);
+  Pushers pushers;  // 4 KB on the job thread's stack
+  pushers.load(args);
+  g_stats.pushers += (u32)(pushers.count > 0 ? pushers.count : 0);
+  if (++g_stats.updates % 600 == 0) {
+    // Times per frame (87 rows), in microseconds at 733 MHz.
+    const u64 frames_x733 = (u64)(g_stats.rows + 1) * 733 / 87;
+    gw_log("grid: per update %u pushers, %u pusher-rows, %u pushes in reach, %u object tests; per frame "
+           "physics %u us, lines %u us\n",
+           g_stats.pushers / 600, g_stats.active / 600, g_stats.pushes / 600, g_stats.objects / 600,
+           (u32)(g_stats.physics_cycles / frames_x733), (u32)(g_stats.line_cycles / frames_x733));
+    g_stats = {g_stats.updates};
+  }
+  const u32 grid = lw(K + 5896);
+#ifdef GW_GRID_GUEST_SYNC
+  g_host.load(grid);
+#else
+  if (g_host.guest != grid) g_host.load(grid);
+#endif
+  for (u32 j; (j = next_row()) < kRows;) update_row(args, j, k, pushers);
+#ifdef GW_GRID_GUEST_SYNC
+  g_host.store(grid);
+#endif
+  InterlockedExchange(&g_grid_busy, 0);
 }
 
 #ifdef GW_GRID_CHECK
@@ -408,6 +585,19 @@ bool check(PPCContext& ctx, uint8_t* base) {
 #endif
 
 }  // namespace
+
+#ifndef GW_GRID_GUEST_SYNC
+// The grid's creator and its reset at the start of a level write the points:
+// the host copy is loaded again before the next update.
+extern "C" void sub_8205D118(PPCContext& ctx, uint8_t* base) {
+  __imp__sub_8205D118(ctx, base);
+  g_host.guest = 0;
+}
+extern "C" void sub_8205B000(PPCContext& ctx, uint8_t* base) {
+  __imp__sub_8205B000(ctx, base);
+  g_host.guest = 0;
+}
+#endif
 
 // The game's grid job (guest 0x8205B880, run by each job thread): r3 is the
 // job argument (pushers, extra pushers). The name is what the recompiled

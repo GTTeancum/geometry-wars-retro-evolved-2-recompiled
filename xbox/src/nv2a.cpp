@@ -650,14 +650,30 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
     set_arrays(formats, offsets);
   };
 
-  // The grid's lines are already in the NV2A's order in contiguous memory
-  // (gw_grid_line_host): drawn where they are.
-  if (source == 2 && !rects) {
+  // The grid's lines are in contiguous memory as NV2A lines, one for each
+  // 4-vertex segment of the game's quads (gw_grid_line_host): drawn where
+  // they are, smoothed. Their vertices are x, y, z, brightness, edge; the
+  // program's second input (u, v, brightness, edge in the game's layout, of
+  // which it uses the last two) reads from y on.
+  if (source == 2 && !rects && gp->attr_count == 2 && gp->stride == 28 && (first % 4) == 0 && (count % 4) == 0) {
     const u32 start = stream + first * gp->stride;
     u8* host = gw_grid_line_host(start);
     if (host && count && gw_grid_line_host(start + count * gp->stride - 1)) {
-      set_formats((u32)MmGetPhysicalAddress(host));
-      draw_arrays(nv_prim, count);
+      const u32 base = (u32)MmGetPhysicalAddress(host);
+      formats[0] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (3 << 4) | (20 << 8);
+      formats[1] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (4 << 4) | (20 << 8);
+      offsets[0] = base;
+      offsets[1] = base + 4;
+      set_arrays(formats, offsets);
+      u32* p = blk_begin();
+      p = pb_push1(p, NV097_SET_LINE_WIDTH, 12);  // 1.5 pixels, in eighths
+      p = pb_push1(p, NV097_SET_LINE_SMOOTH_ENABLE, 1);
+      p = pb_push1(p, NV097_SET_BLEND_FUNC_SFACTOR, 0x0302);  // source alpha: the smoothing's coverage
+      blk_end(p);
+      draw_arrays(NV097_SET_BEGIN_END_OP_LINES, count / 2);
+      p = blk_begin();
+      p = pb_push1(p, NV097_SET_LINE_SMOOTH_ENABLE, 0);
+      blk_end(p);
       return true;
     }
   }
@@ -813,7 +829,10 @@ void use_default_combiner() {
 // colour of before (0.3, 0.28, 0.85) / kFieldScale. The field comes out
 // dimmer than the game's (smaller blurs, no movement with the distortion),
 // and without it the grid went dark away from explosions.
-const float kLineConstant1[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+// rgb 0.4 rather than 0.5: the smoothed 1.5-pixel lines (gw_grid_line_host)
+// carry more light than the game's soft-edged quads did, so the brightness
+// is taken down by a fifth (the squared result by about a third).
+const float kLineConstant1[4] = {0.4f, 0.4f, 0.4f, 0.5f};
 constexpr u32 kGridFloor = 0x00131236;  // A8R8G8B8
 
 void use_line_combiner() {

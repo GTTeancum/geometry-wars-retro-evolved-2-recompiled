@@ -82,7 +82,9 @@ void gw_virtual_free(u32 guest);
 u32 gw_virtual_size(u32 guest);              // size of the allocation containing guest
 u32 gw_physical_alloc(u32 size, u32 align);  // committed, zeroed; 0 on failure
 // The host mirror of the grid's line vertex buffer for a guest address in it
-// (src/kernel_memory.cpp), or null: NV2A-order vertices the GPU reads in place.
+// (src/kernel_memory.cpp), or null: each 4-vertex segment of the guest buffer
+// is one NV2A line there (2 vertices of x, y, z, brightness, edge), which the
+// GPU reads in place. The address is rounded down to its segment.
 u8* gw_grid_line_host(u32 guest);
 void gw_physical_free(u32 guest);
 u32 gw_system_alloc(u32 size, u32 align = 16);
@@ -113,6 +115,18 @@ struct GwStats {
   volatile u32 gpu_draws;
 };
 extern GwStats gw_stats;
+
+// CPU time of the largest parts (timestamp-counter cycles), logged in ms
+// per frame every 5 s by src/status.cpp. A part's time includes any time
+// its thread was switched out inside it.
+enum GwPart { kPartGrid, kPartParticles, kPartStars, kPartCommands, kPartCount };
+extern volatile u64 gw_part_cycles[kPartCount];
+struct GwPartTimer {
+  GwPart part;
+  u64 start;
+  explicit GwPartTimer(GwPart p) : part(p), start(__builtin_ia32_rdtsc()) {}
+  ~GwPartTimer() { __atomic_fetch_add(&gw_part_cycles[part], __builtin_ia32_rdtsc() - start, __ATOMIC_RELAXED); }
+};
 
 // The Xbox kernel's current thread (KPCR Prcb.CurrentThread, fs:[0x28]), to
 // match profiler samples to threads.

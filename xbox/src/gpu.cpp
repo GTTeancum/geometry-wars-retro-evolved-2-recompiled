@@ -383,6 +383,7 @@ DWORD WINAPI command_thread(LPVOID) {
     if (write == g_read_index) continue;
     Reader r{gw_gpu_to_guest(g_ring_base), dwords, g_read_index, true};
     u32 end = write >= g_read_index ? write : write + dwords;
+    GwPartTimer timer(kPartCommands);
     __try {
       execute(r, end, ctx);
     } __except (gw_fault_filter(GetExceptionInformation())) {

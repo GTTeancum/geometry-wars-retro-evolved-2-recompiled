@@ -59,6 +59,7 @@ float sine(PPCContext& ctx, uint8_t* base, float x) {
 }  // namespace
 
 extern "C" void sub_82075548(PPCContext& ctx, uint8_t* base) {
+  GwPartTimer timer(kPartStars);
   const float one = lf(C + 1732);
 
   // The fade-in (clamped to 1 and kept) and the next of the three buffers.

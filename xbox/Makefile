@@ -46,7 +46,7 @@ endif
 
 # Compare the native grid update with the original now and then: make GRID_CHECK=y
 ifeq ($(GRID_CHECK),y)
-src/grid_native.obj: NXDK_CXXFLAGS += -DGW_GRID_CHECK
+src/grid_native.obj: NXDK_CXXFLAGS += -DGW_GRID_CHECK -DGW_GRID_GUEST_SYNC
 endif
 
 # One-frame GPU capture buffer (xbox/tools/gpu_capture.py): make CAPTURE=y

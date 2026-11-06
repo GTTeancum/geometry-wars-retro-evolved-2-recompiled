@@ -80,15 +80,19 @@ GW_EXPORT(NtQueryVirtualMemory) {
 // written by the grid job in src/grid_native.cpp, drawn by vertex shader
 // 8E1A294A into the glow layer) are triple-buffered and rewritten in full
 // every frame: 7.5 MB that does not fit in 64 MB with the rest of a level.
-// All three share one buffer. The grid job does not write it either: it
-// writes the vertices in the NV2A's own order (little-endian) into a host
-// mirror in contiguous memory, which src/nv2a.cpp draws from in place (no
-// copy into its vertex arena: 2.5 MB a frame cost the frame rate more than
-// half). The guest buffer is committed on touch, so untouched it costs
+// All three share one buffer. The grid job does not write it either: each
+// segment of the grid (a thin quad of four 28-byte vertices in the game's
+// buffer) becomes one line of two 20-byte vertices (x, y, z, brightness,
+// edge 0) in a host mirror in contiguous memory, which src/nv2a.cpp draws in
+// place as smoothed NV2A lines: 40 bytes a segment instead of 112, and no
+// thin-quad geometry on the CPU (the grid was the largest CPU cost on the
+// Xbox). The guest buffer is committed on touch, so untouched it costs
 // nothing. One mirror for the frames in flight: a frame's lines may be drawn
 // partly updated by the next one (one frame's movement of the grid).
 namespace {
 constexpr u32 kGridLineBufferSize = 0x2753C0;
+constexpr u32 kGuestSegment = 4 * 28, kHostSegment = 2 * 20;
+constexpr u32 kMirrorSize = kGridLineBufferSize / kGuestSegment * kHostSegment;
 struct SharedBuffer {
   u32 address, users;
   u8* host;  // the mirror
@@ -98,7 +102,7 @@ SharedBuffer g_grid_lines;
 u32 alloc_grid_line_buffer(u32 alignment) {
   if (!g_grid_lines.address) {
     g_grid_lines.address = gw_physical_alloc(kGridLineBufferSize, alignment);
-    g_grid_lines.host = (u8*)MmAllocateContiguousMemoryEx(kGridLineBufferSize, 0, 0x03FFAFFF, 0,
+    g_grid_lines.host = (u8*)MmAllocateContiguousMemoryEx(kMirrorSize, 0, 0x03FFAFFF, 0,
                                                           PAGE_READWRITE | PAGE_WRITECOMBINE);
     if (!g_grid_lines.host) gw_log("grid lines: no contiguous memory for the mirror\n");
   }
@@ -121,7 +125,7 @@ bool free_grid_line_buffer(u32 address) {
 u8* gw_grid_line_host(u32 guest) {
   const SharedBuffer& b = g_grid_lines;
   if (!b.host || guest < b.address || guest - b.address >= kGridLineBufferSize) return nullptr;
-  return b.host + (guest - b.address);
+  return b.host + (guest - b.address) / kGuestSegment * kHostSegment;
 }
 
 GW_EXPORT(MmAllocatePhysicalMemoryEx) {

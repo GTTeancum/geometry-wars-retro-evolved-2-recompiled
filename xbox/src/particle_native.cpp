@@ -94,6 +94,7 @@ inline void glow_vertex(u32 out, float x, float y, float z, float u, float r, fl
 // same one), r6 main-picture quad, r7 glow quad.
 extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base) {
   (void)base;
+  GwPartTimer timer(kPartParticles);
   const u32 system = ctx.r3.u32 + 40, in = ctx.r4.u32, out = ctx.r5.u32;
   const u32 streak = ctx.r6.u32, glow = ctx.r7.u32;
 
