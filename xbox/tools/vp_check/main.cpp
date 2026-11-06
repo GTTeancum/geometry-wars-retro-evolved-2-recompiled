@@ -193,6 +193,20 @@ int main(int argc, char** argv) {
     u32 bytes = (u32)fread(gw_host(kShaderGuest), 1, 0x8000, f);
     fclose(f);
     u32 dwords = bytes / 4;
+    if (strstr(argv[i], "_ps_")) {
+      // Pixel shader: print it as a weighted sum of texture samples.
+      static u32 words[1024];
+      for (u32 k = 0; k < dwords && k < 1024; ++k) words[k] = gw_load32(kShaderGuest + k * 4);
+      const XpsSum sum = xps_sum_of(words, dwords);
+      printf("%s: %d terms:", argv[i], sum.count);
+      for (int t = 0; t < sum.count; ++t) {
+        const XpsSum::Term& term = sum.terms[t];
+        printf(" %s%ux tf%u", t ? "+ " : "", term.repeat + 1, term.texture);
+        for (int k = 0; k < term.weight_count; ++k) printf(" * c%u.%c", term.weight[k] / 4, "xyzw"[term.weight[k] % 4]);
+      }
+      printf("\n");
+      continue;
+    }
     u32 hash = 0x811C9DC5;
     for (u32 k = 0; k < dwords; ++k) hash = (hash ^ gw_load32(kShaderGuest + k * 4)) * 0x01000193;
     printf("%s: hash %08X, %u dwords\n", argv[i], hash, dwords);

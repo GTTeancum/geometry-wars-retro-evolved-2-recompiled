@@ -29,6 +29,7 @@ struct PixelInfo {
   u32 hash;
   int uv_interpolator;  // -1: no texture fetch
   int texture_const;
+  XpsSum sum;           // the shader as a weighted sum of texture samples
 };
 PixelInfo g_pixel[48];
 int g_pixel_count;
@@ -193,7 +194,7 @@ void xps_analyse(u32 hash, u32 guest_words, u32 dwords) {
   if (g_pixel_count >= 48 || dwords > 1024) return;
   static u32 words[1024];
   for (u32 i = 0; i < dwords; ++i) words[i] = gw_load32(guest_words + i * 4);
-  PixelInfo info{hash, -1, 0};
+  PixelInfo info{hash, -1, 0, {}};
   walk(words, dwords, [&](bool fetch, const u32* w) {
     if (fetch && bits(w[0], 0, 5) == 1 && info.uv_interpolator < 0) {
       // Texture fetch from an input register: interpolator n arrives in rn.
@@ -204,7 +205,135 @@ void xps_analyse(u32 hash, u32 guest_words, u32 dwords) {
       info.texture_const = (int)bits(w[0], 20, 5);
     }
   });
+  info.sum = xps_sum_of(words, dwords);
   g_pixel[g_pixel_count++] = info;
+}
+
+// The shader as sum of texture * weight terms (see XpsSum in xenos_vs.h).
+// Each temporary is followed as such a sum: a fetch makes one term, add joins
+// two sums, mul and mad by a constant multiply a sum's weights. Operations
+// that are not linear (max, products of two textures, the scalar unit's
+// log/exp) keep each texture that feeds them once: the glow chain's final
+// tone curve becomes a plain weighted sum.
+XpsSum xps_sum_of(const u32* words, u32 dwords) {
+  constexpr int kTemps = 32;
+  XpsSum temps[kTemps] = {};
+  XpsSum out{};
+  auto add_term = [](XpsSum& to, const XpsSum::Term& t) {
+    for (int i = 0; i < to.count; ++i) {
+      XpsSum::Term& e = to.terms[i];
+      if (e.texture == t.texture && e.weight_count == t.weight_count &&
+          (t.weight_count < 1 || e.weight[0] == t.weight[0]) && (t.weight_count < 2 || e.weight[1] == t.weight[1])) {
+        ++e.repeat;  // the same sample with the same weight again (a blur's taps)
+        return;
+      }
+    }
+    if (to.count < XpsSum::kMaxTerms) to.terms[to.count++] = t;
+  };
+  auto join = [&](XpsSum a, const XpsSum& b) {
+    for (int i = 0; i < b.count; ++i) {
+      for (int r = 0; r <= b.terms[i].repeat; ++r) {
+        XpsSum::Term t = b.terms[i];
+        t.repeat = 0;
+        add_term(a, t);
+      }
+    }
+    return a;
+  };
+  auto scaled = [](XpsSum a, u16 weight) {
+    for (int i = 0; i < a.count; ++i) {
+      if (a.terms[i].weight_count < 2) a.terms[i].weight[a.terms[i].weight_count++] = weight;
+    }
+    return a;
+  };
+  walk(words, dwords, [&](bool fetch, const u32* w) {
+    if (fetch) {
+      if (bits(w[0], 0, 5) != 1) return;  // not a texture fetch
+      const u32 dst = bits(w[0], 12, 6);
+      if (dst >= kTemps) return;
+      XpsSum s{};
+      s.count = 1;
+      s.terms[0].texture = (u8)bits(w[0], 20, 5);
+      temps[dst] = s;
+      return;
+    }
+    Instruction in;
+    decode(in, false, w);
+    auto source = [&](int k) -> XpsSum {
+      const Source& s = in.s[k];
+      if (s.temp && s.index < kTemps) return temps[s.index];
+      return XpsSum{};
+    };
+    auto constant = [&](int k) -> int {  // weight code of a constant source, or -1
+      const Source& s = in.s[k];
+      return s.temp ? -1 : s.index * 4 + s.swizzle[0];
+    };
+    // Every texture feeding the instruction, each once (for operations that
+    // are not a sum of constant multiples).
+    auto all_inputs = [&]() {
+      XpsSum r{};
+      for (int k = 0; k < 3; ++k) {
+        if (!in.s[k].temp) continue;
+        const XpsSum s = source(k);
+        for (int i = 0; i < s.count; ++i) {
+          bool seen = false;
+          for (int j = 0; j < r.count; ++j) seen |= r.terms[j].texture == s.terms[i].texture;
+          if (!seen && r.count < XpsSum::kMaxTerms) r.terms[r.count++] = s.terms[i];
+        }
+      }
+      return r;
+    };
+    XpsSum result{};
+    bool writes = in.vmask != 0;
+    switch (in.vop) {
+      case 0:  // add
+        result = join(source(0), source(1));
+        break;
+      case 1:  // mul
+        if (source(0).log_domain && constant(1) >= 0) result = source(0);  // a power: keep the weights
+        else if (constant(1) >= 0) result = scaled(source(0), (u16)constant(1));
+        else if (constant(0) >= 0) result = scaled(source(1), (u16)constant(0));
+        else result = all_inputs();
+        break;
+      case 11:  // mad: a * b + c
+        if (constant(1) >= 0) result = join(scaled(source(0), (u16)constant(1)), source(2));
+        else if (constant(0) >= 0) result = join(scaled(source(1), (u16)constant(0)), source(2));
+        else result = all_inputs();
+        break;
+      default:  // not linear: keep what feeds it
+        result = all_inputs();
+        break;
+    }
+    if (writes) {
+      if (in.export_data) {
+        if (in.vdst == 0) out = result;
+      } else if (in.vdst < kTemps) {
+        temps[in.vdst] = result;
+      }
+    }
+    // log into a temporary: what follows until exp is a power, not a sum.
+    if ((in.sop == 15 || in.sop == 16) && in.smask && !in.export_data && in.sdst < kTemps && in.s[2].temp &&
+        in.s[2].index < kTemps) {
+      XpsSum l = temps[in.s[2].index];
+      l.log_domain = true;
+      temps[in.sdst] = l;
+    }
+    // Scalar exports (exp oC0.x, r0) pass the scalar source's sum to the output.
+    if (in.sop != 50 && in.smask && in.export_data && in.sdst == 0 && in.s[2].temp && in.s[2].index < kTemps) {
+      if (!out.count) {
+        out = temps[in.s[2].index];
+        out.log_domain = false;
+      }
+    }
+  });
+  return out;
+}
+
+const XpsSum* xps_sum(u32 hash) {
+  for (int i = 0; i < g_pixel_count; ++i) {
+    if (g_pixel[i].hash == hash) return &g_pixel[i].sum;
+  }
+  return nullptr;
 }
 
 bool xps_info(u32 hash, int* uv_interpolator, int* texture_const) {

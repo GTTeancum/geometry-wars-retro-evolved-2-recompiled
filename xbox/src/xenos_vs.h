@@ -38,3 +38,24 @@ const XvpProgram* xvp_get(const XvsProgram* program, int uv_i, int color_i, bool
 // Records which interpolator feeds the pixel shader's first texture fetch.
 void xps_analyse(u32 hash, u32 guest_words, u32 dwords);
 bool xps_info(u32 hash, int* uv_interpolator, int* texture_const);
+
+// A pixel shader read as a weighted sum of texture samples: sum over terms
+// of (repeat + 1) * texture(fetch constant) * product of the weights, where a
+// weight is a pixel shader constant component (index * 4 + component). The
+// glow chain's shaders are this shape: 5-tap averages, 15-tap blurs, the sum
+// of pyramid levels, the final composite. Offsets of the taps are not kept,
+// so a blur becomes one bilinear sample with the blur's total weight.
+struct XpsSum {
+  static constexpr int kMaxTerms = 8;
+  struct Term {
+    u8 texture;
+    u8 repeat;        // extra identical taps
+    u8 weight_count;  // 0..2
+    u16 weight[2];
+  };
+  int count;
+  bool log_domain;  // inside a log .. exp pair: constant factors are exponents
+  Term terms[kMaxTerms];
+};
+XpsSum xps_sum_of(const u32* words, u32 dwords);
+const XpsSum* xps_sum(u32 hash);
