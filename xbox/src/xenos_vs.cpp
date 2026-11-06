@@ -170,8 +170,11 @@ bool xps_info(u32 hash, int* uv_interpolator, int* texture_const) {
 
 bool xvs_run(const XvsProgram* program, const u32* regs, u32 vertex_index, float pos[4], float interp[8][4]) {
   const Program& p = *(const Program*)program;
-  float r[64][4] = {};
+  // Shaders write a temporary before reading it; only r0 (the vertex index)
+  // needs a value. Clearing all 64 per vertex cost a quarter of the frame.
+  float r[64][4];
   r[0][0] = (float)vertex_index;
+  r[0][1] = r[0][2] = r[0][3] = 0;
   float prev_scalar = 0;
   bool predicate = false;
   u32 last_fetch_address = 0, last_fetch_stride = 0, last_fetch_endian = 0;

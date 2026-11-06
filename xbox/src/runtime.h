@@ -28,6 +28,12 @@
 
 #include "gen/pch.h"
 
+// nxdk compiles freestanding, so even 4-byte memcpy/memset become calls (a
+// third of the frame went to them). The builtins inline small fixed sizes
+// and still call the library for the rest.
+#define memcpy(d, s, n) __builtin_memcpy((d), (s), (n))
+#define memset(d, v, n) __builtin_memset((d), (v), (n))
+
 #define GW_MEMBASE ((u8*)0xA2000000u)
 
 constexpr u32 kGuestVirtualBase = 0x60000000;

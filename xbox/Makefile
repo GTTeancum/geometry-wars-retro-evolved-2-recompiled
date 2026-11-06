@@ -13,6 +13,7 @@ SRCS = $(RUNTIME_SRCS) $(GEN_SRCS)
 
 PROJECT_OBJS = $(addsuffix .obj,$(basename $(SRCS)))
 GEN_OBJS = $(addsuffix .obj,$(basename $(GEN_SRCS)))
+RUNTIME_OBJS = $(addsuffix .obj,$(basename $(RUNTIME_SRCS)))
 
 # SIMDe comes from the pinned ReXGlue SDK; -isystem keeps the SDK's own rex/
 # headers behind the Xbox stand-ins in include/.
@@ -21,6 +22,10 @@ $(PROJECT_OBJS): NXDK_CXXFLAGS += -std=c++20 -O2 -Iinclude -Isrc -isystem $(REXG
 	-Wno-pass-failed -Wno-unused-but-set-variable -Wno-deprecated-volatile
 # Size over speed for the generated code: memory is the tighter limit.
 $(GEN_OBJS): NXDK_CXXFLAGS += -Ibuild/gen -Os
+
+# nxdk passes -fno-builtin, which turns every small memcpy (gw_load32, the
+# shader interpreter) into a call; the runtime gets the builtins back.
+$(RUNTIME_OBJS): NXDK_CXXFLAGS += -fbuiltin
 
 # One-frame GPU capture buffer (xbox/tools/gpu_capture.py): make CAPTURE=y
 ifeq ($(CAPTURE),y)
