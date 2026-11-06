@@ -35,6 +35,33 @@ bool g_in_frame = false;
 constexpr u32 kArenaBytes = 768 * 1024;
 u8* g_arena;
 u32 g_arena_used;  // bytes
+// Push buffer blocks are batched: every pb_end makes pbkit flush the CPU's
+// write-combining buffer and wait for it through a GPU register, and the
+// renderer used to close a block for each small state change (thousands a
+// frame). blk_begin/blk_end keep one block open across them and close it
+// once it holds 32 words (the largest single write here, a 16-instruction
+// vertex program upload, is 80, so a block stays within pbkit's 128);
+// blk_flush closes it before any pbkit call
+// that opens its own (targets, resets, text, the flip).
+u32* g_block;
+u32* g_block_start;
+
+u32* blk_begin() {
+  if (!g_block) g_block = g_block_start = pb_begin();
+  return g_block;
+}
+
+void blk_flush() {
+  if (!g_block) return;
+  pb_end(g_block);
+  g_block = nullptr;
+}
+
+void blk_end(u32* p) {
+  g_block = p;
+  if (p - g_block_start >= 32) blk_flush();
+}
+
 // Draw with translated NV2A vertex programs (else the CPU interpreter).
 bool g_use_gpu_vertex = true;
 float g_scale_x, g_scale_y;
@@ -265,32 +292,34 @@ float as_float(u32 bits) {
 }
 
 void begin_frame() {
+  blk_flush();
   gw_nv2a_stage = 1;
   const u64 start = gw_wait_begin();
   pb_reset();  // waits for the GPU to finish the previous frame
   gw_wait_end(start, 0, "renderer: GPU finishing the previous frame");
   gw_nv2a_stage = 2;
+  blk_flush();
   pb_target_back_buffer();
   pb_erase_depth_stencil_buffer(0, 0, pb_back_buffer_width(), pb_back_buffer_height());
   pb_fill(0, 0, pb_back_buffer_width(), pb_back_buffer_height(), 0);
-  u32* p = pb_begin();
+  u32* p = blk_begin();
   p = pb_push1(p, NV097_SET_DEPTH_TEST_ENABLE, 0);
   p = pb_push1(p, NV097_SET_DEPTH_MASK, 0);
   p = pb_push1(p, NV097_SET_ALPHA_TEST_ENABLE, 0);
   p = pb_push1(p, NV097_SET_CULL_FACE_ENABLE, 0);
   p = pb_push1(p, NV097_SET_BLEND_ENABLE, 1);
-  pb_end(p);
+  blk_end(p);
   g_arena_used = 0;
   g_in_frame = true;
 }
 
 void bind_texture(const Texture* t) {
-  u32* p = pb_begin();
+  u32* p = blk_begin();
   p = pb_push2(p, NV097_SET_TEXTURE_OFFSET, (u32)t->pixels & 0x03FFFFFF, t->format);
   p = pb_push1(p, NV097_SET_TEXTURE_ADDRESS, 0x00030303);  // clamp
   p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0, 0x4003FFC0);
   p = pb_push1(p, NV097_SET_TEXTURE_FILTER, t->filter);
-  pb_end(p);
+  blk_end(p);
 }
 
 // RB_BLENDCONTROL0 blend factors (Xenos BlendFactor) -> NV2A (GL) factors.
@@ -318,7 +347,7 @@ void gw_nv2a_init() {
     gw_log("nv2a: pb_init failed\n");
     return;
   }
-  u32* p = pb_begin();
+  u32* p = blk_begin();
   p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_START, 0);
   p = pb_push1(p, NV097_SET_TRANSFORM_EXECUTION_MODE,
                MASK(NV097_SET_TRANSFORM_EXECUTION_MODE_MODE, NV097_SET_TRANSFORM_EXECUTION_MODE_MODE_PROGRAM) |
@@ -326,30 +355,30 @@ void gw_nv2a_init() {
                         NV097_SET_TRANSFORM_EXECUTION_MODE_RANGE_MODE_PRIV));
   p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_CXT_WRITE_EN, 0);
   p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_LOAD, 0);
-  pb_end(p);
+  blk_end(p);
   for (u32 i = 0; i < sizeof(vs) / 4; i += 4) {
-    p = pb_begin();
+    p = blk_begin();
     pb_push(p++, NV097_SET_TRANSFORM_PROGRAM, 4);
     memcpy(p, vs + i, 16);
     p += 4;
-    pb_end(p);
+    blk_end(p);
   }
-  p = pb_begin();
+  p = blk_begin();
 #include "nv2a_ps.inl"
-  pb_end(p);
+  blk_end(p);
   if (kGlow) {
     u32 glow_vs[] = {
 #include "nv2a_glow_vs.inl"
     };
-    p = pb_begin();
+    p = blk_begin();
     p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_LOAD, kGlowProgramSlot);
-    pb_end(p);
+    blk_end(p);
     for (u32 i = 0; i < sizeof(glow_vs) / 4; i += 4) {
-      p = pb_begin();
+      p = blk_begin();
       pb_push(p++, NV097_SET_TRANSFORM_PROGRAM, 4);
       memcpy(p, glow_vs + i, 16);
       p += 4;
-      pb_end(p);
+      blk_end(p);
     }
   }
 
@@ -366,6 +395,7 @@ void gw_nv2a_init() {
 
   g_scale_x = (float)pb_back_buffer_width() / 1280.0f;
   g_scale_y = (float)pb_back_buffer_height() / 720.0f;
+  blk_flush();
   pb_show_front_screen();
   g_ready = true;
   gw_nv2a_active = true;
@@ -400,13 +430,13 @@ namespace {
 // 0 = off). pbkit blocks are limited to 128 dwords.
 void set_arrays(const u32* formats, const u32* offsets) {
   for (u32 attr = 0; attr < 16; attr += 4) {
-    u32* p = pb_begin();
+    u32* p = blk_begin();
     for (u32 a = attr; a < attr + 4; ++a) {
       u32 format = formats[a] ? formats[a] : NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F;
       p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_FORMAT + a * 4, format);
       if (formats[a]) p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + a * 4, offsets[a]);
     }
-    pb_end(p);
+    blk_end(p);
   }
 }
 
@@ -415,11 +445,11 @@ void draw_arrays(u32 nv_prim, u32 count) {
   // whole.
   for (u32 start = 0; start < count;) {
     u32 n = count - start > 252 ? 252 : count - start;
-    u32* p = pb_begin();
+    u32* p = blk_begin();
     p = pb_push1(p, NV097_SET_BEGIN_END, nv_prim);
     p = pb_push1(p, 0x40000000 | NV097_DRAW_ARRAYS, ((n - 1) << 24) | start);
     p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
-    pb_end(p);
+    blk_end(p);
     start += n;
   }
 }
@@ -429,9 +459,9 @@ u32 g_loaded_key = 0;              // translated program loaded at slot 8
 
 void set_program_start(u32 start) {
   if (g_program_start == start) return;
-  u32* p = pb_begin();
+  u32* p = blk_begin();
   p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_START, start);
-  pb_end(p);
+  blk_end(p);
   g_program_start = start;
 }
 
@@ -439,12 +469,12 @@ void set_program_start(u32 start) {
 void upload_constants(u32 first, const u32* values, u32 count) {
   for (u32 done = 0; done < count;) {
     u32 n = count - done > 8 ? 8 : count - done;
-    u32* p = pb_begin();
+    u32* p = blk_begin();
     p = pb_push1(p, NV097_SET_TRANSFORM_CONSTANT_LOAD, 96 + first + done);
     pb_push(p++, NV097_SET_TRANSFORM_CONSTANT, n * 4);
     memcpy(p, values + done * 4, n * 16);
     p += n * 4;
-    pb_end(p);
+    blk_end(p);
     done += n;
   }
 }
@@ -464,6 +494,7 @@ bool arena_room(u32 bytes) {
   if (bytes > kArenaBytes) return false;
   static u32 reported = 0;
   if (reported++ < 4) gw_log("nv2a: frame %u filled the vertex arena, waiting for the GPU\n", g_frames);
+  blk_flush();
   const u64 start = gw_wait_begin();
   pb_reset();
   gw_wait_end(start, 0, "renderer: vertex arena full mid-frame");
@@ -513,18 +544,18 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, 
   u32 bytes = out_count * gp->stride;
   if (!arena_room(bytes)) return false;
   if (g_loaded_key != gp->key) {
-    u32* p = pb_begin();
+    u32* p = blk_begin();
     p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_LOAD, 8);
-    pb_end(p);
+    blk_end(p);
     for (u32 i = 0; i < gp->instructions; i += 16) {
       u32 n = gp->instructions - i > 16 ? 16 : gp->instructions - i;
-      p = pb_begin();
+      p = blk_begin();
       for (u32 k = 0; k < n; ++k) {
         pb_push(p++, NV097_SET_TRANSFORM_PROGRAM, 4);
         memcpy(p, &gp->words[(i + k) * 4], 16);
         p += 4;
       }
-      pb_end(p);
+      blk_end(p);
     }
     g_loaded_key = gp->key;
   }
@@ -607,7 +638,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, 
 // A linear R5G6B5 surface as the texture of a unit, addressed in texels.
 void bind_linear(u32 unit, const void* pixels, u32 width, u32 height, u32 pitch) {
   const u32 o = unit * 64;
-  u32* p = pb_begin();
+  u32* p = blk_begin();
   p = pb_push2(p, NV097_SET_TEXTURE_OFFSET + o, (u32)pixels & 0x03FFFFFF,
                1 | (2 << 4) | NV097_SET_TEXTURE_FORMAT_BORDER_SOURCE |
                    (NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R5G6B5 << 8) | (1 << 16));
@@ -616,7 +647,7 @@ void bind_linear(u32 unit, const void* pixels, u32 width, u32 height, u32 pitch)
   p = pb_push1(p, NV097_SET_TEXTURE_CONTROL1 + o, pitch << 16);
   p = pb_push1(p, NV097_SET_TEXTURE_FILTER + o, 0x02022000);  // bilinear
   p = pb_push1(p, NV097_SET_TEXTURE_IMAGE_RECT + o, (width << 16) | height);
-  pb_end(p);
+  blk_end(p);
 }
 
 // Combiner constants for the four-texture sum: stage 0's factors weigh units
@@ -627,29 +658,29 @@ void set_sum_weights(const float w[4]) {
     const u32 b = v <= 0 ? 0 : v >= 1 ? 255 : (u32)(v * 255.0f + 0.5f);
     return b << 24 | b << 16 | b << 8 | b;
   };
-  u32* p = pb_begin();
+  u32* p = blk_begin();
   p = pb_push1(p, NV097_SET_COMBINER_FACTOR0 + 0 * 4, colour(w[0]));
   p = pb_push1(p, NV097_SET_COMBINER_FACTOR1 + 0 * 4, colour(w[1]));
   p = pb_push1(p, NV097_SET_COMBINER_FACTOR1 + 1 * 4, colour(w[2]));
   p = pb_push1(p, NV097_SET_COMBINER_FACTOR1 + 2 * 4, colour(w[3]));
-  pb_end(p);
+  blk_end(p);
 }
 
 void use_sum_combiner() {
-  u32* p = pb_begin();
+  u32* p = blk_begin();
 #include "nv2a_sum_ps.inl"
   p = pb_push1(p, NV097_SET_COMBINER_CONTROL,
                MASK(NV097_SET_COMBINER_CONTROL_FACTOR0, NV097_SET_COMBINER_CONTROL_FACTOR0_EACH_STAGE) |
                    MASK(NV097_SET_COMBINER_CONTROL_FACTOR1, NV097_SET_COMBINER_CONTROL_FACTOR1_EACH_STAGE) |
                    MASK(NV097_SET_COMBINER_CONTROL_ITERATION_COUNT, 3));
-  pb_end(p);
+  blk_end(p);
 }
 
 void use_default_combiner() {
-  u32* p = pb_begin();
+  u32* p = blk_begin();
 #include "nv2a_ps.inl"
   for (u32 unit = 1; unit < 4; ++unit) p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0 + unit * 64, 0);
-  pb_end(p);
+  blk_end(p);
 }
 
 // One screen-aligned quad from (x0, y0) to (x1, y1); unit k's texture
@@ -706,32 +737,36 @@ void apply_glow() {
   const void* blurred = pb_extra_buffer(1);
   set_program_start(kGlowProgramSlot);
   use_sum_combiner();
-  u32* p = pb_begin();
+  u32* p = blk_begin();
   p = pb_push1(p, NV097_SET_BLEND_ENABLE, 0);
-  pb_end(p);
+  blk_end(p);
 
   // 1. A quarter of the size: four bilinear taps, each the average of 2x2,
   // cover the 4x4 block (output pixel x reads around source 4x + 1.5).
+  blk_flush();
   pb_target_extra_buffer(0);
   const float quarter[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
   const float even[4] = {0.25f, 0.25f, 0.25f, 0.25f};
   glow_pass(picture, width, height, pitch, w, h, 4, quarter, even);
   // 2, 3. Blur across, then down: four bilinear taps, eight texels.
+  blk_flush();
   pb_target_extra_buffer(1);
   const float across[4][2] = {{-2.5f, 0}, {-0.5f, 0}, {1.5f, 0}, {3.5f, 0}};
   glow_pass(small, width, height, pitch, w, h, 1, across, even);
+  blk_flush();
   pb_target_extra_buffer(0);
   const float down[4][2] = {{0, -2.5f}, {0, -0.5f}, {0, 1.5f}, {0, 3.5f}};
   glow_pass(blurred, width, height, pitch, w, h, 1, down, even);
 
   // 4. Added back over the picture, enlarged (bilinear).
+  blk_flush();
   pb_target_back_buffer();
-  p = pb_begin();
+  p = blk_begin();
   p = pb_push1(p, NV097_SET_BLEND_ENABLE, 1);
   p = pb_push1(p, NV097_SET_BLEND_FUNC_SFACTOR, 0x0001);  // one
   p = pb_push1(p, NV097_SET_BLEND_FUNC_DFACTOR, 0x0001);  // one
   p = pb_push1(p, NV097_SET_BLEND_EQUATION, 0x8006);      // add
-  pb_end(p);
+  blk_end(p);
   const float none[4][2] = {};
   const float strength[4] = {kGlowStrength, 0, 0, 0};
   glow_pass(small, width, height, pitch, (float)width, (float)height, 0.25f, none, strength);
@@ -818,7 +853,7 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   bind_texture(texture);
 
   u32 blend = regs[0x2201];
-  u32* p = pb_begin();
+  u32* p = blk_begin();
   p = pb_push1(p, NV097_SET_BLEND_FUNC_SFACTOR, blend_factor(blend & 0x1F));
   p = pb_push1(p, NV097_SET_BLEND_FUNC_DFACTOR, blend_factor((blend >> 8) & 0x1F));
   // Xenos BlendOp (add, subtract, min, max, reverse subtract) -> GL equation.
@@ -826,7 +861,7 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   u32 op = (blend >> 5) & 7;
   p = pb_push1(p, NV097_SET_BLEND_EQUATION, op < 5 ? kEquations[op] : 0x8006);
   if (prim == 1) p = pb_push1(p, NV097_SET_POINT_SIZE, 16);  // 2 px (units of 1/8)
-  pb_end(p);
+  blk_end(p);
 
   // Preferred: the shader as an NV2A vertex program.
   if (g_use_gpu_vertex) {
@@ -921,6 +956,7 @@ void gw_nv2a_swap() {
     gw_dump_allocations();
   }
   if (kGlow) apply_glow();
+  blk_flush();
   pb_erase_text_screen();
   pb_print("Geometry Wars RE2 - Xbox  frame %u\n", g_frames);
   pb_draw_text_screen();
