@@ -52,8 +52,9 @@ order. Measurements are from XEMU at 64 MB unless noted.
       `gw2log.txt` on hardware.
 - [ ] Grey textures (the fonts: white glyphs coloured by the vertices) are
       now kept exact as 16-bit alpha + grey instead of DXT5, whose 4x4
-      blocks smear small letters. Not yet seen; costs about 1.4 MB more for
-      the 1024x1024 font.
+      blocks smear small letters. On hardware the Deadline rules screen and
+      the menus read cleanly at 640x480; 720p is what would sharpen them
+      further.
 
 ## 3. Glow
 
@@ -63,7 +64,8 @@ order. Measurements are from XEMU at 64 MB unless noted.
       XEMU and nothing on hardware: the weights of the third and fourth
       samples went to combiner factors nothing reads. Fixed, and the GPU now
       finishes drawing each buffer before it is read back (needed on
-      hardware). Not yet seen.
+      hardware). Seen on hardware: halos around the ships, enemies, HUD
+      and menu panels; 19 fps in a level with it on.
 - The game's chain (from the menu capture): the grid and the scene are
   drawn into float targets, resolved, shrunk and blurred through about 80
   small passes down to 2x1, summed per pyramid and composited with a tone

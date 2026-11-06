@@ -790,7 +790,11 @@ void glow_pass(const void* from, u32 from_w, u32 from_h, u32 pitch, float w, flo
 
 void apply_glow() {
   const u32 width = pb_back_buffer_width(), height = pb_back_buffer_height(), pitch = pb_back_buffer_pitch();
-  const float w = (float)(width / 4), h = (float)(height / 4);
+  // The small buffers hold a (width / 4) x (height / 4) picture: sampled as
+  // that size, so the blur clamps at its edge instead of reading the stale
+  // rest of the buffer (coloured specks along the bottom on hardware).
+  const u32 sw = width / 4, sh = height / 4;
+  const float w = (float)sw, h = (float)sh;
   const void* picture = pb_back_buffer();
   const void* small = pb_extra_buffer(0);
   const void* blurred = pb_extra_buffer(1);
@@ -809,10 +813,10 @@ void apply_glow() {
   // 2, 3. Blur across, then down: four bilinear taps, eight texels.
   glow_target(1);
   const float across[4][2] = {{-2.5f, 0}, {-0.5f, 0}, {1.5f, 0}, {3.5f, 0}};
-  glow_pass(small, width, height, pitch, w, h, 1, across, even);
+  glow_pass(small, sw, sh, pitch, w, h, 1, across, even);
   glow_target(0);
   const float down[4][2] = {{0, -2.5f}, {0, -0.5f}, {0, 1.5f}, {0, 3.5f}};
-  glow_pass(blurred, width, height, pitch, w, h, 1, down, even);
+  glow_pass(blurred, sw, sh, pitch, w, h, 1, down, even);
 
   // 4. Added back over the picture, enlarged (bilinear).
   glow_target(-1);
@@ -824,7 +828,7 @@ void apply_glow() {
   blk_end(p);
   const float none[4][2] = {};
   const float strength[4] = {kGlowStrength, 0, 0, 0};
-  glow_pass(small, width, height, pitch, (float)width, (float)height, 0.25f, none, strength);
+  glow_pass(small, sw, sh, pitch, (float)width, (float)height, 0.25f, none, strength);
 
   use_default_combiner();
 }
