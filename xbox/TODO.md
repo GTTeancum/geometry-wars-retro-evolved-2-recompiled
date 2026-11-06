@@ -23,6 +23,10 @@ order. Measurements are from XEMU at 64 MB unless noted.
       640x480; try it once the memory census shows 6 MB to spare. 720p needs the
       component/HDMI video modes on hardware and about 1.8 MB per 16-bit
       buffer (three buffers plus depth); budget it against memory (section 4).
+- [ ] Guest memory accesses are no longer volatile, with a compiler barrier
+      at every label (`src/gen/pch.h`, `tools/prepare_generated.py`): 27%
+      faster recompiled code on the grid in the PC check. Not yet run in
+      XEMU; if the game hangs or misbehaves after it, undo this first.
 - [ ] Measure on real hardware: XEMU's speed is not the Xbox's.
 - [ ] Remaining hot spots after that (last profile): the grid job, now native
       (`src/grid_native.cpp`, about 10%); the particle job

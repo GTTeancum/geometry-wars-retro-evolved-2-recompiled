@@ -25,6 +25,26 @@ extern "C" void sub_821303B8(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base);
 #undef DEFINE_REX_FUNC
 #define DEFINE_REX_FUNC(name) extern "C" void original_##name(PPCContext& ctx, uint8_t* base)
+#ifdef GW_NONVOLATILE_ORIGINAL
+// Experiment: the originals with plain (non-volatile) guest loads and stores,
+// to measure what volatile costs the recompiled code.
+#undef REX_LOAD_U8
+#undef REX_LOAD_U16
+#undef REX_LOAD_U32
+#undef REX_LOAD_U64
+#undef REX_STORE_U8
+#undef REX_STORE_U16
+#undef REX_STORE_U32
+#undef REX_STORE_U64
+#define REX_LOAD_U8(x) (*(u8*)REX_HOST(x))
+#define REX_LOAD_U16(x) __builtin_bswap16(*(u16*)REX_HOST(x))
+#define REX_LOAD_U32(x) __builtin_bswap32(*(u32*)REX_HOST(x))
+#define REX_LOAD_U64(x) __builtin_bswap64(*(u64*)REX_HOST(x))
+#define REX_STORE_U8(x, y) (*(u8*)REX_HOST(x) = (y))
+#define REX_STORE_U16(x, y) (*(u16*)REX_HOST(x) = __builtin_bswap16(y))
+#define REX_STORE_U32(x, y) (*(u32*)REX_HOST(x) = __builtin_bswap32(y))
+#define REX_STORE_U64(x, y) (*(u64*)REX_HOST(x) = __builtin_bswap64(y))
+#endif
 #include "original.inc"
 
 extern "C" void sub_8205B880(PPCContext& ctx, uint8_t* base);

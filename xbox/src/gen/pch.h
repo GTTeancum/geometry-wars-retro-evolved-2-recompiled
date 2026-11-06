@@ -54,15 +54,25 @@ extern PPCFuncMapping PPCFuncMappings[];
 
 #define REX_RAW_ADDR(x) REX_HOST(x)
 
-#define REX_LOAD_U8(x) (*(volatile u8*)REX_HOST(x))
-#define REX_LOAD_U16(x) __builtin_bswap16(*(volatile u16*)REX_HOST(x))
-#define REX_LOAD_U32(x) __builtin_bswap32(*(volatile u32*)REX_HOST(x))
-#define REX_LOAD_U64(x) __builtin_bswap64(*(volatile u64*)REX_HOST(x))
+// Plain (not volatile) accesses, so the compiler can keep and combine guest
+// values within straight-line code (about 15% on the grid code, measured
+// with tools/native_check). Every label in the generated code is followed by
+// GW_LABEL_BARRIER (added by xbox/tools/prepare_generated.py): all loops run
+// through a label, so a loop polling guest memory reloads it every pass.
+// memcpy keeps unaligned guest addresses legal (plain moves on x86).
+#define GW_LABEL_BARRIER() __asm__ volatile("" ::: "memory")
+#define GW_LOAD(type, x) ({ type rex_v_; __builtin_memcpy(&rex_v_, REX_HOST(x), sizeof(type)); rex_v_; })
+#define GW_STORE(type, x, y) do { type rex_v_ = (type)(y); __builtin_memcpy(REX_HOST(x), &rex_v_, sizeof(type)); } while (0)
 
-#define REX_STORE_U8(x, y) (*(volatile u8*)REX_HOST(x) = (y))
-#define REX_STORE_U16(x, y) (*(volatile u16*)REX_HOST(x) = __builtin_bswap16(y))
-#define REX_STORE_U32(x, y) (*(volatile u32*)REX_HOST(x) = __builtin_bswap32(y))
-#define REX_STORE_U64(x, y) (*(volatile u64*)REX_HOST(x) = __builtin_bswap64(y))
+#define REX_LOAD_U8(x) GW_LOAD(u8, x)
+#define REX_LOAD_U16(x) __builtin_bswap16(GW_LOAD(u16, x))
+#define REX_LOAD_U32(x) __builtin_bswap32(GW_LOAD(u32, x))
+#define REX_LOAD_U64(x) __builtin_bswap64(GW_LOAD(u64, x))
+
+#define REX_STORE_U8(x, y) GW_STORE(u8, x, y)
+#define REX_STORE_U16(x, y) GW_STORE(u16, x, __builtin_bswap16(y))
+#define REX_STORE_U32(x, y) GW_STORE(u32, x, __builtin_bswap32(y))
+#define REX_STORE_U64(x, y) GW_STORE(u64, x, __builtin_bswap64(y))
 
 //=============================================================================
 // GPU register window

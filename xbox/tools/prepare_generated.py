@@ -15,6 +15,9 @@ into xbox/build/gen for nxdk.
 - fctiwz/fctidz (SIMDe's emulated cvttsd) become gw_trunc_i32/i64, and
   std::isnan the compiler builtin (nxdk builds without builtins, so it was a
   library call).
+- Every label gets GW_LABEL_BARRIER, a compiler memory barrier: guest memory
+  accesses are not volatile (pch.h), and loops polling memory jump through a
+  label.
 - generated *_register.cpp is skipped: the Xbox runtime fills its dispatch
   table from PPCFuncMappings instead.
 
@@ -38,6 +41,10 @@ REVERSED_COPY = re.compile(
     r'simde_mm_store_si128\(\(simde__m128i\*\)' + _OPERAND +
     r', simde_mm_shuffle_epi8\(simde_mm_load_si128\(\(simde__m128i\*\)' + _OPERAND +
     r'\), simde_mm_load_si128\(\(simde__m128i\*\)VectorMaskL\)\)\);')
+
+# A label of the generated code (every loop jumps back to one); gets a
+# compiler memory barrier, as guest memory accesses are not volatile (pch.h).
+LABEL = re.compile(r'(?m)^(loc_[0-9A-F]+:)$')
 
 # fctiwz/fctidz through SIMDe's SSE2 emulation -> gw_trunc_i32/i64 (pch.h).
 TRUNCATE = re.compile(r'simde_mm_cvttsd_si(32|64)\(simde_mm_load_sd\(&([\w.]+)\)\)')
@@ -87,6 +94,7 @@ def main():
             text = REVERSED_COPY.sub(r'gw_copy_reversed(\1, \2);', text)
             text = TRUNCATE.sub(r'gw_trunc_i\1(\2)', text)
             text = text.replace('std::isnan(', '__builtin_isnan(')
+            text = LABEL.sub(r'\1\n\tGW_LABEL_BARRIER();', text)
         changed += write_if_changed(DST / src.name, text)
     for stale in DST.iterdir():
         if stale.suffix in ('.cpp', '.h') and stale.name not in wanted:
