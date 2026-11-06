@@ -80,9 +80,11 @@ resolve vertex shaders are inline copies of one program).
 
 ### Progress (2026-11-06)
 
-`src/nv2a.cpp` draws with pbkit. Vertex shaders run on the CPU through a
-small Xenos interpreter (`src/xenos_vs.cpp`), so every vertex shader works,
-including the title screen's sin/cos warps; pixel shaders are only analysed
+`src/nv2a.cpp` draws with pbkit. Vertex shaders are translated to NV2A vertex
+programs (`src/xenos_vp.cpp`, checked against the interpreter on the PC by
+`tools\vp_check.cmd`); any that do not translate run on the CPU through a
+small Xenos interpreter (`src/xenos_vs.cpp`). The menu runs at about 16 frames
+a second in XEMU (7 with every shader on the CPU). Pixel shaders are only analysed
 for which interpolator feeds the texture. Draws into the main 1280×720 scene
 are drawn: the starfield and the warped vector effects show in XEMU. The
 title logo area is masked black by the game (a min-blend pass) and filled by
