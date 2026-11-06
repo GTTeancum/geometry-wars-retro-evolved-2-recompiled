@@ -574,7 +574,6 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
   if (rects && (count % 3 || !gp->attr_count || gp->stride > 64)) return false;
   const u32 out_count = rects ? count / 3 * 4 : count;
   u32 bytes = out_count * gp->stride;
-  if (!arena_room(bytes)) return false;
   if (g_loaded_key != gp->key) {
     u32* p = blk_begin();
     p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_LOAD, 8);
@@ -612,9 +611,35 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
   for (u32 i = 0; i < gp->const_count; ++i) memcpy(&c[(4 + i) * 4], &regs[0x4000 + gp->const_xenos[i] * 4], 16);
   upload_constants(0, c, 4 + gp->const_count);
 
-  // Vertices: the shader's stream, in draw order, words swapped to host order.
   u32 f0 = regs[0x4800 + gp->fetch_slot * 2], f1 = regs[0x4800 + gp->fetch_slot * 2 + 1];
   u32 stream = gw_gpu_to_guest(f0 & ~3u), endian = f1 & 3;
+  u32 formats[16] = {}, offsets[16] = {};
+  auto set_formats = [&](u32 base) {
+    for (u32 a = 0; a < gp->attr_count; ++a) {
+      const XvpProgram::Attribute& at = gp->attrs[a];
+      formats[a] = at.format == 6
+                       ? NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL | (4 << 4) | (gp->stride << 8)
+                       : NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | ((u32)at.components << 4) | (gp->stride << 8);
+      offsets[a] = base + at.offset;
+    }
+    set_arrays(formats, offsets);
+  };
+
+  // The grid's lines are already in the NV2A's order in contiguous memory
+  // (gw_grid_line_host): drawn where they are.
+  if (source == 2 && !rects) {
+    const u32 start = stream + first * gp->stride;
+    u8* host = gw_grid_line_host(start);
+    if (host && count && gw_grid_line_host(start + count * gp->stride - 1)) {
+      set_formats((u32)MmGetPhysicalAddress(host));
+      draw_arrays(nv_prim, count);
+      return true;
+    }
+  }
+
+  // Otherwise the vertices are copied into the arena, in draw order, words
+  // swapped to host order.
+  if (!arena_room(bytes)) return false;
   u32 words = gp->stride / 4;
   u32* out = (u32*)(g_arena + g_arena_used);
   u32 corners[3][16];  // a rectangle's three corners, host order
@@ -643,16 +668,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
     }
   }
 
-  u32 formats[16] = {}, offsets[16] = {};
-  u32 base = ((u32)g_arena & 0x03FFFFFF) + g_arena_used;
-  for (u32 a = 0; a < gp->attr_count; ++a) {
-    const XvpProgram::Attribute& at = gp->attrs[a];
-    formats[a] = at.format == 6
-                     ? NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL | (4 << 4) | (gp->stride << 8)
-                     : NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | ((u32)at.components << 4) | (gp->stride << 8);
-    offsets[a] = base + at.offset;
-  }
-  set_arrays(formats, offsets);
+  set_formats(((u32)g_arena & 0x03FFFFFF) + g_arena_used);
   g_arena_used += (bytes + 15) & ~15u;
   draw_arrays(nv_prim, out_count);
   return true;

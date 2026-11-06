@@ -81,6 +81,9 @@ u32 gw_allocation_base(u32 guest);           // 0 if not allocated
 void gw_virtual_free(u32 guest);
 u32 gw_virtual_size(u32 guest);              // size of the allocation containing guest
 u32 gw_physical_alloc(u32 size, u32 align);  // committed, zeroed; 0 on failure
+// The host mirror of the grid's line vertex buffer for a guest address in it
+// (src/kernel_memory.cpp), or null: NV2A-order vertices the GPU reads in place.
+u8* gw_grid_line_host(u32 guest);
 void gw_physical_free(u32 guest);
 u32 gw_system_alloc(u32 size, u32 align = 16);
 u32 gw_stack_alloc(u32 size);                // returns the low end

@@ -123,7 +123,22 @@ Constants load_constants() {
   return k;
 }
 
+// A line vertex: x, y, z, u, v, colour, edge (z on are guest words). Into
+// the buffer's host mirror when there is one (src/kernel_memory.cpp), in
+// host order, for the GPU to read in place; else into the guest buffer.
 inline void vertex(u32 out, float x, float y, u32 z, u32 u, u32 v, u32 colour, u32 edge) {
+  if (u8* host = gw_grid_line_host(out)) {
+    u32 words[7];
+    memcpy(&words[0], &x, 4);
+    memcpy(&words[1], &y, 4);
+    words[2] = __builtin_bswap32(z);
+    words[3] = __builtin_bswap32(u);
+    words[4] = __builtin_bswap32(v);
+    words[5] = __builtin_bswap32(colour);
+    words[6] = __builtin_bswap32(edge);
+    memcpy(host, words, sizeof(words));
+    return;
+  }
   sf(out + 0, x);
   sf(out + 4, y);
   sraw(out + 8, z);

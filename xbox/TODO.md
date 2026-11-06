@@ -105,15 +105,21 @@ order. Measurements are from XEMU at 64 MB unless noted.
 
 - [ ] Background grid: drawn into its own small target and distorted
       (vertex shader 8518CDFB, 46464 vertices); not drawn yet.
-- [ ] Grid lines (vertex shader 8E1A294A, pixel shader B16AAC17): they were
+- [x] Grid lines (vertex shader 8E1A294A, pixel shader B16AAC17): they were
       drawn but invisible (the stand-in combiner read a colour the program
       never wrote) and the 65528-vertex half was dropped (too big for the
       vertex arena). Now their own translation (`line_i` in xvp_get) and
       combiner (`use_line_combiner`): colour = (line colour x brightness)^2,
       faded as (1 - |edge|)^3 across each line, as the game's shader. The
       game's 18x12 colour map (a GPU render target) is one fixed colour for
-      now. Big draws go to the GPU in pieces. Not yet seen; watch the frame
-      rate (2.5 MB of line vertices a frame).
+      now. Big draws go to the GPU in pieces. Seen on hardware: blue grid,
+      every eighth line bright, bending around the ship and shots. The grid
+      job writes the lines straight into a contiguous host mirror in the
+      NV2A's order (`gw_grid_line_host`), drawn in place: copying them cost
+      19 -> 8 fps; in place a level runs at 25 fps. Still to do: the game's
+      colour map, and a second mirror if the one shared by the frames in
+      flight shows tearing. `make GRID_CHECK=y` compares the guest buffer,
+      which the native code no longer writes.
 - [ ] Vertex arena overflows on some menu frames ("vertex arena full").
 
 ## 6. Sound
