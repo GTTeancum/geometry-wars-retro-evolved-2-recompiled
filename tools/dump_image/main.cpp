@@ -35,5 +35,14 @@ int main(int argc, char** argv) {
   std::ofstream out(argv[3], std::ios::binary);
   out.write(reinterpret_cast<const char*>(runtime->virtual_membase() + base), size);
   std::printf("0x%08X 0x%08X\n", base, size);
+  // Variable imports (no thunk): the slot holds the address of a kernel
+  // variable, which the Xbox build has to provide itself.
+  for (const auto& lib : *xex->import_libraries()) {
+    for (const auto& fn : lib.imports) {
+      if (!fn.thunk_address) {
+        std::printf("var %s 0x%03X slot 0x%08X\n", lib.name.c_str(), fn.ordinal, fn.value_address);
+      }
+    }
+  }
   return out ? 0 : 1;
 }

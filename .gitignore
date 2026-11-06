@@ -45,3 +45,9 @@ cmake-build-*/
 
 # Python
 __pycache__/
+
+# Original Xbox build and XEMU test output
+/xbox/build/
+/xbox/test-artifacts/
+*.cpp.d
+*.c.d

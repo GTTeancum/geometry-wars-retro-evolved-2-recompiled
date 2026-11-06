@@ -1,0 +1,33 @@
+[general]
+show_welcome = false
+screenshot_dir='C:/Programming/GitHub/Geometry Wars 2/xbox/test-artifacts/captures'
+skip_boot_anim = true
+
+[input]
+gamepad_mappings = [
+    { gamepad_id = '0300fa675e040000ff02000000007801'}
+    ]
+
+[input.bindings]
+port1_driver = 'usb-xbox-gamepad'
+port1 = '0300fa675e040000ff02000000007801'
+port2_driver = 'usb-xbox-gamepad'
+
+[display.quality]
+surface_scale=2
+
+[display.window]
+startup_size='1280x720'
+
+[sys.files]
+bootrom_path = 'C:/Games/Emulators/Xemu/MCPX/mcpx_1.0.bin'
+flashrom_path = 'C:/Games/Emulators/Xemu/BIOS/xbox-4627_debug.bin'
+eeprom_path='C:/Programming/GitHub/Geometry Wars 2/xbox/build/xemu/eeprom-test.bin'
+hdd_path='C:/Games/Emulators/Xemu/HDD/xbox_hdd.qcow2'
+dvd_path='C:/Programming/GitHub/Geometry Wars 2/xbox/test-artifacts/gw2-current.iso'
+[display.ui]
+fit='scale'
+aspect_ratio='16x9'
+[sys]
+mem_limit='64'
+
