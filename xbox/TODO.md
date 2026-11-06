@@ -34,7 +34,10 @@ order. Measurements are from XEMU at 64 MB unless noted.
       1024x1024 atlas. Now (not yet seen in XEMU): up to 1024, and textures
       larger than 256 as DXT5 (`src/dxt.cpp`), so full resolution costs less
       memory than before. Check the text on screen.
-- [ ] Texture filtering and the 640x480 output also soften text; 720p helps.
+- [ ] Converted textures now carry mipmaps (2x2 averages, DXT5 down to 4x4)
+      with trilinear filtering: the game draws its text smaller than the
+      textures at 640x480, and without mipmaps the glyphs alias. Not yet seen
+      in XEMU. 720p would help further.
 - [ ] Texture format 26 (seen as 18x12) is not converted yet.
 - [ ] Remove the debug overlay ("Geometry Wars RE2 - Xbox frame N") once
       hangs no longer need reporting by frame.

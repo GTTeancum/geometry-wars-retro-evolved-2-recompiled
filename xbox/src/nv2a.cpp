@@ -52,6 +52,7 @@ struct Texture {
   u32 key;  // gpu address ^ size ^ format
   u32* pixels;
   u32 format;
+  u32 filter;  // NV097_SET_TEXTURE_FILTER
 };
 Texture g_textures[32];
 Texture g_white;
@@ -101,9 +102,9 @@ u32 swap_endian(u32 v, u32 endian) {
   }
 }
 
-u32 nv_format(u32 w, u32 h, u32 colour = NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8) {
-  return 1 | (2 << 4) | NV097_SET_TEXTURE_FORMAT_BORDER_SOURCE | (colour << 8) | (1 << 16) | (log2_ceil(w) << 20) |
-         (log2_ceil(h) << 24);
+u32 nv_format(u32 w, u32 h, u32 colour = NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8, u32 levels = 1) {
+  return 1 | (2 << 4) | NV097_SET_TEXTURE_FORMAT_BORDER_SOURCE | (colour << 8) | (levels << 16) |
+         (log2_ceil(w) << 20) | (log2_ceil(h) << 24);
 }
 
 // Converts a k_8_8_8_8 texture to an NV2A texture, cached by address: sides
@@ -151,7 +152,17 @@ Texture* texture_from_fetch(const u32* f) {
   if (tw > 1024) tw = 1024;
   if (th > 1024) th = 1024;
   const bool compressed = (tw > 256 || th > 256) && tw >= 4 && th >= 4;
-  const u32 bytes = compressed ? tw * th : tw * th * 4;
+  // Mipmaps, each level a 2x2 average of the one above: the game draws its
+  // text and art smaller than the textures (1280-wide art on a 640-wide
+  // screen), and without them the minified glyphs alias. Down to 4 texels a
+  // side for DXT5 (one block), 1 otherwise.
+  const u32 smallest = compressed ? 4 : 1;
+  u32 levels = 1, bytes = 0;
+  for (u32 w = tw, h = th;; w >>= 1, h >>= 1) {
+    bytes += compressed ? w * h : w * h * 4;
+    if (w / 2 < smallest || h / 2 < smallest || levels == 10) break;
+    ++levels;
+  }
   u32* pixels = (u32*)MmAllocateContiguousMemoryEx(bytes, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
   if (!pixels) return nullptr;
   bool tiled = f[0] >> 31;
@@ -166,25 +177,71 @@ Texture* texture_from_fetch(const u32* f) {
     memcpy(&raw, src + offset, 4);
     return swap_endian(raw, endian);
   };
-  if (compressed) {
-    u8* out = (u8*)pixels;
-    for (u32 by = 0; by < th; by += 4) {
-      for (u32 bx = 0; bx < tw; bx += 4, out += 16) {
-        u32 block[16];
-        for (u32 i = 0; i < 16; ++i) block[i] = texel(bx + (i & 3), by + (i >> 2));
-        gw_dxt5_block(block, out);
+  // Writes one level (w x h) from get(x, y) at 'out'; returns the bytes used.
+  auto write_level = [&](u8* out, u32 w, u32 h, auto&& get) {
+    if (compressed) {
+      for (u32 by = 0; by < h; by += 4) {
+        for (u32 bx = 0; bx < w; bx += 4, out += 16) {
+          u32 block[16];
+          for (u32 i = 0; i < 16; ++i) block[i] = get(bx + (i & 3), by + (i >> 2));
+          gw_dxt5_block(block, out);
+        }
       }
+      return w * h;
     }
-  } else {
-    for (u32 y = 0; y < th; ++y) {
-      for (u32 x = 0; x < tw; ++x) pixels[swizzle_offset(x, y, tw, th)] = texel(x, y);
+    u32* texels = (u32*)out;
+    for (u32 y = 0; y < h; ++y) {
+      for (u32 x = 0; x < w; ++x) texels[swizzle_offset(x, y, w, h)] = get(x, y);
+    }
+    return w * h * 4;
+  };
+  auto average = [](u32 a, u32 b, u32 c, u32 d) {
+    u32 out = 0;
+    for (u32 shift = 0; shift < 32; shift += 8) {
+      const u32 sum = ((a >> shift) & 255) + ((b >> shift) & 255) + ((c >> shift) & 255) + ((d >> shift) & 255);
+      out |= ((sum + 2) / 4) << shift;
+    }
+    return out;
+  };
+  u8* out = (u8*)pixels;
+  out += write_level(out, tw, th, texel);
+  if (levels > 1) {
+    // Level 1 from the source, then each level from the one before, kept in
+    // a linear scratch copy (a quarter of level 0).
+    u32 w = tw / 2, h = th / 2;
+    u32* level = (u32*)malloc(w * h * 4);
+    if (!level) {
+      levels = 1;
+    } else {
+      for (u32 y = 0; y < h; ++y) {
+        for (u32 x = 0; x < w; ++x) {
+          level[y * w + x] =
+              average(texel(2 * x, 2 * y), texel(2 * x + 1, 2 * y), texel(2 * x, 2 * y + 1), texel(2 * x + 1, 2 * y + 1));
+        }
+      }
+      for (u32 n = 1; n < levels; ++n) {
+        out += write_level(out, w, h, [&](u32 x, u32 y) { return level[y * w + x]; });
+        if (n + 1 == levels) break;
+        const u32 nw = w / 2, nh = h / 2;
+        for (u32 y = 0; y < nh; ++y) {
+          for (u32 x = 0; x < nw; ++x) {
+            level[y * nw + x] = average(level[2 * y * w + 2 * x], level[2 * y * w + 2 * x + 1],
+                                        level[(2 * y + 1) * w + 2 * x], level[(2 * y + 1) * w + 2 * x + 1]);
+          }
+        }
+        w = nw;
+        h = nh;
+      }
+      free(level);
     }
   }
   slot->key = key;
   slot->pixels = pixels;
-  slot->format = compressed ? nv_format(tw, th, NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8) : nv_format(tw, th);
-  gw_log("nv2a: texture %08X %ux%u%s -> %ux%u%s\n", base, width, height, tiled ? " tiled" : "", tw, th,
-         compressed ? " DXT5" : "");
+  slot->format = compressed ? nv_format(tw, th, NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8, levels)
+                            : nv_format(tw, th, NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8, levels);
+  slot->filter = levels > 1 ? 0x02062000 : 0x02022000;  // trilinear with mipmaps, else bilinear
+  gw_log("nv2a: texture %08X %ux%u%s -> %ux%u%s, %u levels\n", base, width, height, tiled ? " tiled" : "", tw, th,
+         compressed ? " DXT5" : "", levels);
   // Large images (the title screens) are only read by the GPU: once
   // converted, the 360-format original gives its memory back. A later touch
   // recommits it as zeros.
@@ -232,7 +289,7 @@ void bind_texture(const Texture* t) {
   p = pb_push2(p, NV097_SET_TEXTURE_OFFSET, (u32)t->pixels & 0x03FFFFFF, t->format);
   p = pb_push1(p, NV097_SET_TEXTURE_ADDRESS, 0x00030303);  // clamp
   p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0, 0x4003FFC0);
-  p = pb_push1(p, NV097_SET_TEXTURE_FILTER, 0x02022000);   // linear
+  p = pb_push1(p, NV097_SET_TEXTURE_FILTER, t->filter);
   pb_end(p);
 }
 
@@ -305,6 +362,7 @@ void gw_nv2a_init() {
   g_white.pixels = (u32*)MmAllocateContiguousMemoryEx(16, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
   for (int i = 0; i < 4; ++i) g_white.pixels[i] = 0xFFFFFFFF;
   g_white.format = nv_format(2, 2);
+  g_white.filter = 0x02022000;
 
   g_scale_x = (float)pb_back_buffer_width() / 1280.0f;
   g_scale_y = (float)pb_back_buffer_height() / 720.0f;
