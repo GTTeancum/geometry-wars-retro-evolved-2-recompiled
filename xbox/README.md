@@ -101,9 +101,8 @@ running out of memory. What got it there:
   (`src/particle_buffers.cpp`, `src/kernel_memory.cpp`).
 
 Built since that test and not yet run in XEMU: our own glow, the in-level
-grid lines, mipmapped full-resolution textures (readable text), the GPU
-drawing one frame while the game builds the next, and the native starfield
-and particles. `TODO.md` lists what is left (60 fps at 720p, the game's own
+grid lines, mipmapped full-resolution textures (readable text), and the
+native starfield and particles. `TODO.md` lists what is left (60 fps at 720p, the game's own
 glow chain, sound).
 
 Fixed on the way: the CP's read-pointer writeback was little-endian (hang at
