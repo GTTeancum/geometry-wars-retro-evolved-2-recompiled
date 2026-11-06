@@ -177,6 +177,16 @@ struct FPSCRRegister {
     setcsr(csr);
   }
 
+#if defined(__i386__)
+  // Xbox: scalar floating point is x87, which MXCSR does not affect, and the
+  // vector (SSE) code wants flush-to-zero as VMX does, so MXCSR keeps FTZ on
+  // for good (set at guest thread start, src/kernel_threads.cpp) and the
+  // generated code's ~7700 per-operation mode switches cost nothing.
+  inline void enableFlushModeUnconditional() noexcept {}
+  inline void disableFlushModeUnconditional() noexcept {}
+  inline void enableFlushMode() noexcept {}
+  inline void disableFlushMode() noexcept {}
+#else
   inline void enableFlushModeUnconditional() noexcept {
     csr |= FlushMask;
     setcsr(csr);
@@ -200,6 +210,7 @@ struct FPSCRRegister {
       setcsr(csr);
     }
   }
+#endif
 
   inline void InitHost() noexcept {
     csr = getcsr();

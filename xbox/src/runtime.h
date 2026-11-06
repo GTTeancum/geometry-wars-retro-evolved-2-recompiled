@@ -119,6 +119,15 @@ inline u32 gw_kthread() {
   return thread;
 }
 
+// Flush-to-zero for SSE on a thread that runs guest code (see FPSCRRegister
+// in include/rex/ppc/context.h: the generated code no longer switches it).
+inline void gw_guest_fp_setup() {
+  unsigned csr;
+  __asm__ volatile("stmxcsr %0" : "=m"(csr));
+  csr |= 0x8000;  // FTZ
+  __asm__ volatile("ldmxcsr %0" : : "m"(csr));
+}
+
 // Wait timing by call site (src/wait_stats.cpp).
 u64 gw_wait_begin();
 void gw_wait_end(u64 start, u32 caller, const char* what);
