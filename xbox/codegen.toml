@@ -1,0 +1,22 @@
+# Xbox-only ReXGlue codegen: the same image as the PC manifest
+# (geometry_wars_retro_evolved_2_manifest.toml), with scratch and saved
+# registers kept in C++ locals instead of the context struct, so the i386
+# compiler can keep them in registers. Run by xbox/tools/codegen.ps1 into
+# xbox/build/generated.
+[project]
+name = "geometry_wars_retro_evolved_2"
+sdk_version = "0.10.0"
+game_root = "../game/extracted"
+
+[entrypoint]
+file_path = "../game/extracted/default.xex"
+out_directory_path = "build/generated"
+includes = ["../config/overrides.toml", "../config/discovered-functions.toml"]
+setjmp_address = 0x82131CD0
+longjmp_address = 0x82131890
+non_argument_as_local = true
+cr_as_local = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+non_volatile_as_local = true

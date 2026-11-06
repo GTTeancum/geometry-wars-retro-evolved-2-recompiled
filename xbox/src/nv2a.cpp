@@ -133,6 +133,10 @@ Texture* texture_from_fetch(const u32* f) {
   }
   if (!slot) return nullptr;
   u32 tw = 1u << log2_ceil(width), th = 1u << log2_ceil(height);
+  // Round a side down instead when rounding up would grow it by over half
+  // (300 -> 256, not 512): converted textures are a large share of memory.
+  if (tw > width + width / 2) tw >>= 1;
+  if (th > height + height / 2) th >>= 1;
   if (tw > 512) tw = 512;
   if (th > 512) th = 512;
   u32* pixels = (u32*)MmAllocateContiguousMemoryEx(tw * th * 4, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
@@ -272,9 +276,10 @@ namespace {
 // Per-frame census of vertex shaders (logged every 300 frames) to find the
 // draws that make up whatever screen is showing.
 struct CensusEntry {
-  u32 hash, draws, prim, vertices;
+  u32 hash, draws, prim, vertices, gpu, cpu;  // gpu/cpu: vertices drawn by each path
 };
 CensusEntry g_census[32];
+CensusEntry* g_census_entry;
 }  // namespace
 
 namespace {
@@ -422,12 +427,14 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   if (!g_ready) return;
   u32 initiator = opcode == 0x22 ? words[1] : words[0];
   u32 prim = initiator & 0x3F, source = (initiator >> 6) & 3, count = initiator >> 16;
+  g_census_entry = nullptr;
   for (CensusEntry& e : g_census) {
     if (!e.hash || e.hash == vs_hash) {
       e.hash = vs_hash;
       ++e.draws;
       e.prim = prim;
       e.vertices += count;
+      g_census_entry = &e;
       break;
     }
   }
@@ -495,7 +502,10 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   // Preferred: the shader as an NV2A vertex program.
   if (g_use_gpu_vertex) {
     const XvpProgram* gp = xvp_get(vs, uv_i, color_i, !(vte & 0x100));
-    if (gp && draw_on_gpu(gp, regs, nv_prim, count, source, index_base, index_endian, index32, vte)) return;
+    if (gp && draw_on_gpu(gp, regs, nv_prim, count, source, index_base, index_endian, index32, vte)) {
+      if (g_census_entry) g_census_entry->gpu += count;
+      return;
+    }
   }
 
   // Fallback: interpret the shader on the CPU, draw pre-transformed vertices.
@@ -506,6 +516,7 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     }
     return;
   }
+  if (g_census_entry) g_census_entry->cpu += count;
   set_program_start(0);
   u32* out = (u32*)(g_arena + g_arena_used);
   for (u32 i = 0; i < count; ++i) {
@@ -567,10 +578,17 @@ void gw_nv2a_swap() {
   if (g_frames % 300 == 0) {
     gw_log("nv2a: frame %u vertex shaders:\n", g_frames);
     for (const CensusEntry& e : g_census) {
-      if (e.hash) gw_log("  %08X: %u draws, prim %u, %u vertices\n", e.hash, e.draws, e.prim, e.vertices);
+      if (e.hash) {
+        gw_log("  %08X: %u draws, prim %u, %u vertices (%u on the GPU, %u on the CPU)\n", e.hash, e.draws,
+               e.prim, e.vertices, e.gpu, e.cpu);
+      }
     }
   }
   memset(g_census, 0, sizeof(g_census));
+  if (gw_census_due()) {
+    gw_log_memory("census");
+    gw_dump_allocations();
+  }
   pb_erase_text_screen();
   pb_print("Geometry Wars RE2 - Xbox  frame %u\n", g_frames);
   pb_draw_text_screen();

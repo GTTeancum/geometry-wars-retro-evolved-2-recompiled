@@ -11,6 +11,8 @@ param(
     [string]$XemuRoot = 'C:\Games\Emulators\Xemu',
     [string]$NxdkRoot = 'C:\nxdk',
     [int]$MonitorPort = 9257,
+    # Test-only GDB stub, used by tools\xemu_pad.py to write the remote pad.
+    [int]$GdbPort = 9258,
     [ValidateRange(1,10)][int]$RenderScale = 1,
     [ValidateSet(64,128)][int]$MemoryMb = 64
 )
@@ -51,6 +53,7 @@ $config = [regex]::Replace($config, "(?m)^mem_limit\s*=.*$", "mem_limit='$Memory
 Set-Content -LiteralPath $configPath -Value $config
 
 $launchArgs = @('-config_path', ('"' + $configPath + '"'), '-monitor', "tcp:127.0.0.1:$MonitorPort,server,nowait", '-snapshot')
+if ($GdbPort -gt 0) { $launchArgs += @('-gdb', "tcp:127.0.0.1:$GdbPort") }
 $previousTemp = $env:TEMP; $previousTmp = $env:TMP
 try {
     $env:TEMP = $artifacts; $env:TMP = $artifacts

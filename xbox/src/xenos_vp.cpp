@@ -331,7 +331,7 @@ const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool div
     if (vector_used) {
       Op a = src[0], bb = src[1], c = src[2];
       Op ops[3] = {a, bb, c};
-      int nops = in.vop == 11 ? 3 : 2;
+      int nops = in.vop >= 11 && in.vop <= 14 ? 3 : 2;
       split_constants(b, ops, nops);
       a = ops[0], bb = ops[1], c = ops[2];
       Builder::Dest stage = b.to_temp(kStage);
@@ -353,6 +353,26 @@ const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool div
           }
           break;
         case 11: b.mac(MAD, a, bb, c, stage); break;
+        case 12:  // cndeq: a == 0 ? b : c
+        case 13:  // cndge: a >= 0 ? b : c
+        case 14:  // cndgt: a > 0 ? b : c
+          // mask m in kS0, then c + m * (b - c).
+          if (a.type == kConst) {
+            b.mov(b.to_temp(kS1), a);
+            a = temp(kS1);
+          }
+          if (in.vop == 14) {
+            b.mac(SLT, cnst(0, "xxxx"), a, Op(), b.to_temp(kS0));
+          } else {
+            b.mac(SGE, a, cnst(0, "xxxx"), Op(), b.to_temp(kS0));
+            if (in.vop == 12) {
+              b.mac(SGE, neg(a), cnst(0, "xxxx"), Op(), b.to_temp(kS1));
+              b.mac(MUL, temp(kS0), temp(kS1), Op(), b.to_temp(kS0));
+            }
+          }
+          b.mac(ADD, bb, Op(), neg(c), b.to_temp(kS1));
+          b.mac(MAD, temp(kS0), temp(kS1), c, stage);
+          break;
         case 15: b.mac(DP4, a, bb, Op(), stage); break;
         case 16: b.mac(DP3, a, bb, Op(), stage); break;
         default: return b.fail(), nullptr;

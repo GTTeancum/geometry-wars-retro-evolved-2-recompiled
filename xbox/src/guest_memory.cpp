@@ -37,6 +37,10 @@ u32 g_system_next = kGuestSystemBase;
 u32 g_system_committed_end = kGuestSystemBase;
 CRITICAL_SECTION g_system_lock;
 volatile u32 g_committed = 0;
+// A census is logged (from the swap, gw_census_due) each time the committed
+// total passes another 4 MB above 32 MB.
+u32 g_census_at = 32 << 20;
+volatile bool g_census_wanted = false;
 
 bool reserve(u32 guest, u32 size) {
   void* want = gw_host(guest);
@@ -65,6 +69,10 @@ bool commit(u32 guest, u32 size) {
   void* got = VirtualAlloc(want, size, MEM_COMMIT, PAGE_READWRITE);
   if (got != want) return false;
   g_committed += newly;
+  if (g_committed >= g_census_at) {
+    g_census_at += 4 << 20;
+    g_census_wanted = true;
+  }
   return true;
 }
 
@@ -364,12 +372,14 @@ u32 gw_current_caller();
 
 // --- dispatch -----------------------------------------------------------------
 
-PPCFunc* gw_dispatch_table[(REX_CODE_SIZE + REX_THUNK_RESERVE_SIZE) / 4];
+GwDispatchEntry gw_dispatch_table[1u << kGwDispatchBits];
 
-PPCFunc* gw_lookup(u32 guest_address) {
-  u32 slot = guest_address - REX_CODE_BASE;
-  if (slot >= REX_CODE_SIZE + REX_THUNK_RESERVE_SIZE) return nullptr;
-  return gw_dispatch_table[slot >> 2];
+PPCFunc* gw_lookup(u32 guest_address) { return gw_dispatch_find(guest_address); }
+
+bool gw_census_due() {
+  if (!g_census_wanted) return false;
+  g_census_wanted = false;
+  return true;
 }
 
 namespace rex::runtime {

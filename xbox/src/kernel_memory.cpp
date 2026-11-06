@@ -74,16 +74,61 @@ GW_EXPORT(NtQueryVirtualMemory) {
 }
 
 // MmAllocatePhysicalMemoryEx(flags, size, protect, min, max, alignment)
+// The spark particles' vertex buffers (92048 vertices of 28 bytes) are
+// triple-buffered and rewritten in full every frame: 7.5 MB that does not fit
+// in 64 MB with the rest of a level. The third buffer shares the first one's
+// memory, as the draws read a buffer before the game comes back to it two
+// frames later.
+namespace {
+constexpr u32 kSparkBufferSize = 0x2753C0;
+struct SharedBuffer {
+  u32 address, users;
+};
+SharedBuffer g_spark_buffers[2];
+
+u32 alloc_spark_buffer(u32 alignment) {
+  for (SharedBuffer& b : g_spark_buffers) {
+    if (!b.address) {
+      b.address = gw_physical_alloc(kSparkBufferSize, alignment);
+      b.users = b.address ? 1 : 0;
+      return b.address;
+    }
+  }
+  SharedBuffer& first = g_spark_buffers[0];
+  if (first.users == 1) {
+    first.users = 2;
+    return first.address;
+  }
+  return gw_physical_alloc(kSparkBufferSize, alignment);
+}
+
+// True when the free was of a shared spark buffer (released on its last user).
+bool free_spark_buffer(u32 address) {
+  for (SharedBuffer& b : g_spark_buffers) {
+    if (!b.address || b.address != address) continue;
+    if (--b.users == 0) {
+      gw_physical_free(address);
+      b.address = 0;
+    }
+    return true;
+  }
+  return false;
+}
+}  // namespace
+
 GW_EXPORT(MmAllocatePhysicalMemoryEx) {
   u32 size = GW_ARG(4), alignment = GW_ARG(8);
-  u32 result = gw_physical_alloc(size, alignment > 0x1000 ? alignment : 0x1000);
+  alignment = alignment > 0x1000 ? alignment : 0x1000;
+  u32 result = size == kSparkBufferSize ? alloc_spark_buffer(alignment) : gw_physical_alloc(size, alignment);
   gw_log("MmAllocatePhysicalMemoryEx(%X, align %X) -> %08X lr %08X\n", size, alignment, result, (u32)ctx.lr);
   static int traced_128k = 0;
   if (size >= 0x100000 || (size == 0x20000 && traced_128k++ % 50 == 0)) gw_log_backtrace(ctx);
   GW_RETURN(result);
 }
 
-GW_EXPORT(MmFreePhysicalMemory) { gw_physical_free(GW_ARG(4)); }
+GW_EXPORT(MmFreePhysicalMemory) {
+  if (!free_spark_buffer(GW_ARG(4))) gw_physical_free(GW_ARG(4));
+}
 
 GW_EXPORT(MmGetPhysicalAddress) {
   u32 address = GW_ARG(3);

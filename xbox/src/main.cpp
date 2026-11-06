@@ -50,13 +50,14 @@ int main() {
 
   u32 functions = 0;
   for (PPCFuncMapping* m = PPCFuncMappings; m->host; ++m, ++functions) {
-    gw_dispatch_table[((u32)m->guest - REX_CODE_BASE) >> 2] = m->host;
+    gw_dispatch_add((u32)m->guest, m->host);
   }
 
   gw_kernel_threads_init();
   gw_kernel_variables_init(header, header_size);
   free(header);
   gw_gpu_init();
+  gw_input_init();
 
   gw_log("%u functions, image loaded, starting the game at %08X\n", functions, kEntryPoint);
   gw_run_main_thread();

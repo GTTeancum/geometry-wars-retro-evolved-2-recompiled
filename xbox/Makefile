@@ -4,6 +4,7 @@ XBE_TITLE = Geometry\ Wars\ Retro\ Evolved\ 2
 OUTPUT_DIR = build/release
 NXDK_DIR ?= /c/nxdk
 NXDK_CXX = y
+NXDK_SDL = y
 
 REXGLUE_INCLUDE = ../tools/rexglue/win-amd64/include
 
@@ -20,8 +21,8 @@ RUNTIME_OBJS = $(addsuffix .obj,$(basename $(RUNTIME_SRCS)))
 $(PROJECT_OBJS): NXDK_CXXFLAGS += -std=c++20 -O2 -Iinclude -Isrc -isystem $(REXGLUE_INCLUDE) \
 	-ffunction-sections -fdata-sections -Wno-unused-label -Wno-unused-variable \
 	-Wno-pass-failed -Wno-unused-but-set-variable -Wno-deprecated-volatile
-# Size over speed for the generated code: memory is the tighter limit.
-$(GEN_OBJS): NXDK_CXXFLAGS += -Ibuild/gen -Os
+# With registers as C++ locals (xbox/codegen.toml) -O2 code is no bigger than -Os.
+$(GEN_OBJS): NXDK_CXXFLAGS += -Ibuild/gen -O2
 
 # nxdk passes -fno-builtin, which turns every small memcpy (gw_load32, the
 # shader interpreter) into a call; the runtime gets the builtins back.

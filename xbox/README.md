@@ -84,7 +84,13 @@ resolve vertex shaders are inline copies of one program).
 programs (`src/xenos_vp.cpp`, checked against the interpreter on the PC by
 `tools\vp_check.cmd`); any that do not translate run on the CPU through a
 small Xenos interpreter (`src/xenos_vs.cpp`). The menu runs at about 16 frames
-a second in XEMU (7 with every shader on the CPU). Pixel shaders are only analysed
+a second in XEMU (7 with every shader on the CPU).
+
+Controllers work (`src/input.cpp`), and Deadline is playable in XEMU at about
+17 frames a second (11.6 before the registers moved into C++ locals). At 64 MB
+a level still runs out of memory after a minute or two: the game's particle
+buffers fill in as play goes on (36 MB of guest memory at the start, 49 MB
+later on a development kit). Pixel shaders are only analysed
 for which interpolator feeds the texture. Draws into the main 1280×720 scene
 are drawn: the starfield and the warped vector effects show in XEMU. The
 title logo area is masked black by the game (a min-blend pass) and filled by
@@ -115,14 +121,20 @@ Prerequisites: nxdk in `C:\nxdk`, LLVM in `C:\Program Files\LLVM`, MSYS2 in
 one-off image dump).
 
 1. `.\tools\extract_stfs.ps1 -Package <LIVE package> -OutDir game\extracted`
-2. `.\tools\codegen.ps1` (generates `generated\`)
+2. `.\tools\codegen.ps1` (downloads the SDK, generates the PC `generated\`),
+   then `xbox\tools\codegen.ps1` (the Xbox variant in `xbox\build\generated`,
+   registers as C++ locals; see `xbox\codegen.toml`).
 3. `xbox\tools\dump_image.cmd` writes the decrypted game image to
    `game\analysis\default.image.bin` and lists the variable imports.
 4. `bash xbox/tools/build.sh` builds `xbox\build\release\default.xbe`.
 5. `powershell -ExecutionPolicy Bypass -File xbox\tools\boot_xemu.ps1` stages
    `xbox\build\staged-disc`, builds `xbox\test-artifacts\gw2-current.iso` and
    boots it in an isolated XEMU (own config, test EEPROM, hard disk snapshot).
-6. `python xbox\tools\read_log.py` prints the counters and the log tail from
+   `-MemoryMb 128` boots a development-kit Xbox (test only).
+6. `python xbox\tools\xemu_pad.py "press A" "wait 120" "shot menu"` presses
+   buttons through a test-only remote pad and saves screenshots to
+   `xbox\test-artifacts\pad` (a real controller works too).
+7. `python xbox\tools\read_log.py` prints the counters and the log tail from
    the running emulator. Every 10 s without a frame the log lists what each
    game thread last called.
 

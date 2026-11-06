@@ -97,22 +97,18 @@ extern PPCFuncMapping PPCFuncMappings[];
                           : REX_LOAD_U16(addr))
 
 //=============================================================================
-// Calls. Indirect calls use a host-side table, one entry per guest
-// instruction slot (1.4 MB), filled from PPCFuncMappings at boot.
+// Calls. Indirect calls look the target up in a host-side hash table
+// (dispatch.h), filled from PPCFuncMappings at boot.
 //=============================================================================
 
 #define REX_CALL_FUNC(x) x(ctx, base)
 
-extern PPCFunc* gw_dispatch_table[];
+#include "dispatch.h"
 
 #define REX_CALL_INDIRECT_FUNC(x)                                                       \
   do {                                                                                  \
     u32 rex_indirect_target_ = (u32)(x);                                                \
-    u32 rex_indirect_slot_ = rex_indirect_target_ - REX_CODE_BASE;                      \
-    PPCFunc* rex_indirect_func_ =                                                       \
-        rex_indirect_slot_ < REX_CODE_SIZE + REX_THUNK_RESERVE_SIZE                     \
-            ? gw_dispatch_table[rex_indirect_slot_ >> 2]                                \
-            : nullptr;                                                                  \
+    PPCFunc* rex_indirect_func_ = gw_dispatch_find(rex_indirect_target_);               \
     if (!rex_indirect_func_) [[unlikely]] {                                             \
       ctx.last_indirect_target = rex_indirect_target_;                                  \
       rex_indirect_func_ = rex::runtime::ResolveIndirectFunction(rex_indirect_target_); \

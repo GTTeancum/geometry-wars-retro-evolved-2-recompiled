@@ -283,12 +283,13 @@ GW_EXPORT(XamInputGetCapabilities) {
   GW_RETURN(X_ERROR_SUCCESS);
 }
 
-// XamInputGetState(user_index, flags, state_ptr): pad 0 connected, nothing pressed.
+// XamInputGetState(user_index, flags, state_ptr): pads from src/input.cpp; pad 0
+// always reads as connected (idle when nothing is plugged in).
 GW_EXPORT(XamInputGetState) {
-  if (GW_ARG(3) != 0) GW_RETURN(X_ERROR_DEVICE_NOT_CONNECTED);
+  u32 user = GW_ARG(3), state = GW_ARG(5);
   static u32 packet = 0;
-  u32 state = GW_ARG(5);
   memset(gw_host(state), 0, 16);
+  if (!gw_input_read(user, state + 4) && user != 0) GW_RETURN(X_ERROR_DEVICE_NOT_CONNECTED);
   gw_store32(state, ++packet);
   GW_RETURN(X_ERROR_SUCCESS);
 }

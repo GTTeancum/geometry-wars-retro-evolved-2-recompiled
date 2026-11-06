@@ -85,6 +85,8 @@ inline u32 gw_gpu_to_guest(u32 gpu) { return kGuestPhysicalBase + (gpu & 0x1FFFF
 inline u32 gw_guest_to_gpu(u32 guest) { return guest & 0x1FFFFFFF; }
 u32 gw_memory_committed();                   // bytes committed by the guest
 void gw_log_memory(const char* when);        // Xbox kernel memory breakdown
+void gw_dump_allocations();                   // largest guest allocations
+bool gw_census_due();                         // committed memory passed another 4 MB step
 
 // --- logging / status -------------------------------------------------------
 
@@ -105,6 +107,10 @@ struct GwStats {
   volatile u32 gpu_draws;
 };
 extern GwStats gw_stats;
+
+// Controllers (src/input.cpp).
+void gw_input_init();
+bool gw_input_read(u32 user, u32 gamepad);
 
 // --- threads ----------------------------------------------------------------
 
@@ -135,7 +141,7 @@ u32 gw_gpu_read_register(u32 addr);
 
 // --- dispatch ---------------------------------------------------------------
 
-extern PPCFunc* gw_dispatch_table[];
+#include "dispatch.h"
 PPCFunc* gw_lookup(u32 guest_address);
 
 // --- export helpers ---------------------------------------------------------
