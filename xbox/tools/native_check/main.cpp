@@ -23,6 +23,7 @@ extern "C" void sub_820A1800(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_820A1850(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_821303B8(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_820A87B0(PPCContext& ctx, uint8_t* base);
 #undef DEFINE_REX_FUNC
 #define DEFINE_REX_FUNC(name) extern "C" void original_##name(PPCContext& ctx, uint8_t* base)
 #ifdef GW_NONVOLATILE_ORIGINAL
@@ -51,6 +52,9 @@ extern "C" void sub_8205B880(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_82075548(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_820A91A0(PPCContext& ctx, uint8_t* base);
+// The constant upload's full-buffer helper: never reached (the test buffer has room).
+extern "C" void sub_820A87B0(PPCContext&, uint8_t*) { gw_fatal("sub_820A87B0 reached"); }
 
 // Stand-ins for what the starfield calls: the vertex buffer lock returns the
 // buffer address plus kLockedOffset as its data; pow is the C library's.
@@ -440,6 +444,46 @@ int main(int argc, char** argv) {
     free(stars_before);
     free(image_before);
     free(want);
+  }
+
+  // Shader constant upload (guest 0x820A91A0): random dirty masks into a
+  // command buffer with room (the full-buffer path calls into Direct3D).
+  {
+    constexpr u32 kDevice = kArgs + 0x8000, kBuffer = 0xC0740000, kSource = 0xC0780000;
+    int differ = 0;
+    for (int n = 0; n < 2000; ++n) {
+      for (u32 i = 0; i < 0x4000; i += 4) gw_store32(kSource + i, (u32)rand() << 16 ^ (u32)rand());
+      const u32 start = kBuffer + 4 * (u32)(rand() % 4);
+      u64 mask = 0;
+      for (int b = 0; b < 4; ++b) mask = mask << 16 ^ (u64)(rand() & 0xFFFF);
+      if (n % 7 == 0) mask = ~0ull;
+      const u32 reg = (u32)(rand() % 64);
+      u8 want[0x5000];
+      for (int pass = 0; pass < 2; ++pass) {
+        memset(gw_host(kBuffer), 0xEE, 0x5000);
+        gw_store32(kDevice + 48, start);
+        gw_store32(kDevice + 52, kBuffer + 0x5000);
+        static PPCContext ctx;
+        ctx = PPCContext{};
+        ctx.r1.u64 = kStack;
+        ctx.r3.u64 = kDevice;
+        ctx.r4.u64 = mask;
+        ctx.r5.u64 = reg;
+        ctx.r6.u64 = kSource;
+        if (pass == 0) original_sub_820A91A0(ctx, gw_host(0));
+        else sub_820A91A0(ctx, gw_host(0));
+        if (pass == 0) {
+          memcpy(want, gw_host(kBuffer), 0x5000);
+          memcpy(want + 0x4FF8, gw_host(kDevice + 48), 4);  // compared separately below
+        } else {
+          u32 want_end;
+          memcpy(&want_end, want + 0x4FF8, 4);
+          if (memcmp(want, gw_host(kBuffer), 0x4FF8) != 0 || want_end != *(u32*)gw_host(kDevice + 48)) ++differ;
+        }
+      }
+    }
+    printf("shader constant upload: %d of 2000 differ\n", differ);
+    bad += differ;
   }
 
   // DXT5 texture compression: round trip of a text-like image (white glyphs,
