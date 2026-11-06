@@ -153,11 +153,17 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
       for (int spins = 0;; ++spins) {
         u32 value = (info & 0x10) ? gpu_load(poll) : g_regs[poll & 0x5FFF];
         if (compare(info, value & mask, ref)) break;
-        if (spins > 2000) {
-          gw_log("gpu: WAIT_REG_MEM %08X never matched (value %08X ref %08X)\n", poll, value, ref);
+        // Nothing renders yet, so there is nothing for this wait to order:
+        // give the CPU a moment to release it, then move on. (One wait,
+        // memory 0x20B000 == 0, is never released and stalled every frame.)
+        if (spins >= 20) {
+          static u32 skipped = 0;
+          if (skipped++ < 4) {
+            gw_log("gpu: WAIT_REG_MEM %08X skipped (value %08X ref %08X function %u)\n", poll, value, ref, info & 7);
+          }
           break;
         }
-        Sleep(spins < 100 ? 0 : 1);
+        Sleep(0);
       }
       break;
     }

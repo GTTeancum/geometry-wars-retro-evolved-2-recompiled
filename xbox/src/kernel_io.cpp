@@ -9,6 +9,10 @@
 
 namespace {
 
+// Reads at least this large into reserved memory are left on the disc and
+// paged in when touched.
+constexpr u32 kDiscBackedMin = 0x80000;
+
 struct GwFile {
   HANDLE host;
   bool directory;
@@ -147,10 +151,26 @@ GW_EXPORT(NtReadFile) {
       SetFilePointerEx(f->host, pos, nullptr, FILE_BEGIN);
     }
   }
-  // The kernel cannot fault pages in for us mid-read.
-  gw_commit_range(buffer, length);
   DWORD done = 0;
-  BOOL ok = ReadFile(f->host, gw_host(buffer), length, &done, nullptr);
+  BOOL ok = TRUE;
+  LARGE_INTEGER zero{}, pos{};
+  SetFilePointerEx(f->host, zero, &pos, FILE_CURRENT);
+  u64 remaining = file_size(f) - (u64)pos.QuadPart;
+  u32 mapped = length < remaining ? length : (u32)remaining;
+  if (length >= 0x10000) {
+    gw_log("read %s +%X len %X into %08X\n", f->path, (u32)pos.QuadPart, length, buffer);
+  }
+  if (mapped >= kDiscBackedMin && gw_map_from_disc(buffer, mapped, f->path, (u64)pos.QuadPart)) {
+    // Large read into reserved memory: pages come from the disc when touched.
+    LARGE_INTEGER skip;
+    skip.QuadPart = mapped;
+    SetFilePointerEx(f->host, skip, nullptr, FILE_CURRENT);
+    done = mapped;
+  } else {
+    // The kernel cannot fault pages in for us mid-read.
+    gw_commit_range(buffer, length);
+    ok = ReadFile(f->host, gw_host(buffer), length, &done, nullptr);
+  }
   u32 status = !ok ? X_STATUS_UNSUCCESSFUL : (done == 0 && length) ? X_STATUS_END_OF_FILE : X_STATUS_SUCCESS;
   set_io_status(io_status, status, done);
   gw_stats.bytes_read += done;

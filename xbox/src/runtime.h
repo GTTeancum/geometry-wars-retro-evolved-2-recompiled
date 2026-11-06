@@ -4,15 +4,22 @@
 // 32-bit wraparound. GW_MEMBASE is chosen so that every guest window used
 // below lands in free Xbox virtual memory:
 //
-//   guest 0x40000000-0x4FFFFFFF  virtual heap (NtAllocateVirtualMemory, XamAlloc)
+//   guest 0x60000000-0x6EFFFFFF  virtual heap (NtAllocateVirtualMemory, XamAlloc)
 //   guest 0x6F000000-0x6FFFFFFF  system heap (PCRs, TLS, kernel objects/vars)
 //   guest 0x70000000-0x70FFFFFF  thread stacks
 //   guest 0x82000000-0x8221FFFF  game image (game/analysis/default.image.bin)
-//   guest 0xA0000000-0xAEFFFFFF  physical memory (MmAllocatePhysicalMemoryEx);
-//                                GPU address = guest - 0xA0000000
+//   guest 0xC0000000-0xDCFFFFFF  physical memory (MmAllocatePhysicalMemoryEx);
+//                                GPU address = guest & 0x1FFFFFFF
 //
-// host = guest - 0x30000000, so the windows sit at host 0x10000000,
-// 0x3F000000, 0x40000000, 0x52000000 and 0x70000000.
+// Physical memory lives at the 360's 0xC0000000 view because the game's
+// Direct3D turns GPU addresses back into CPU ones with "0xC0000000 + physical"
+// (the views at 0xA0000000/0xE0000000 cannot be mirrored here: one base maps
+// every guest address).
+//
+// host = guest - 0x5E000000, so the windows sit at host 0x02000000 (above the
+// XBE), 0x11000000, 0x12000000, 0x24000000 and 0x62000000-0x7EFFFFFF. The
+// physical window gets most of the space: the game reserves ~250 MB of GPU
+// buffers sized for the Xbox 360, of which it touches a few MB.
 #pragma once
 
 #include <stdarg.h>
@@ -21,18 +28,18 @@
 
 #include "gen/pch.h"
 
-#define GW_MEMBASE ((u8*)0xD0000000u)
+#define GW_MEMBASE ((u8*)0xA2000000u)
 
-constexpr u32 kGuestVirtualBase = 0x40000000;
-constexpr u32 kGuestVirtualSize = 0x10000000;
+constexpr u32 kGuestVirtualBase = 0x60000000;
+constexpr u32 kGuestVirtualSize = 0x0F000000;
 constexpr u32 kGuestSystemBase = 0x6F000000;
 constexpr u32 kGuestSystemSize = 0x01000000;
 constexpr u32 kGuestStackBase = 0x70000000;
 constexpr u32 kGuestStackSize = 0x01000000;
 constexpr u32 kGuestImageBase = 0x82000000;
 constexpr u32 kGuestImageSize = 0x00220000;
-constexpr u32 kGuestPhysicalBase = 0xA0000000;
-constexpr u32 kGuestPhysicalSize = 0x0F000000;
+constexpr u32 kGuestPhysicalBase = 0xC0000000;
+constexpr u32 kGuestPhysicalSize = 0x1D000000;
 
 constexpr u32 kEntryPoint = 0x82095FD8;
 constexpr u32 kDefaultStackSize = 0x40000;
@@ -57,6 +64,8 @@ u32 gw_virtual_reserve(u32 size, u32 align); // address range only
 bool gw_virtual_commit(u32 guest, u32 size);   // large ranges are left to gw_handle_fault
 bool gw_commit_range(u32 guest, u32 size);     // always commits now
 bool gw_handle_fault(u32 host_address);        // commit-on-touch; false if not ours
+// Records a file read into uncommitted guest memory; pages are read on touch.
+bool gw_map_from_disc(u32 guest, u32 size, const char* host_path, u64 offset);
 int gw_fault_filter(void* exception_pointers);  // SEH filter for guest threads
 void gw_virtual_decommit(u32 guest, u32 size);
 u32 gw_allocation_base(u32 guest);           // 0 if not allocated

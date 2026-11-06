@@ -25,10 +25,12 @@ bool read_file(const char* path, u32 offset, void* out, u32 size, u32* got) {
 }  // namespace
 
 int main() {
+  // Reserve the guest windows before anything else allocates (the virtual
+  // heap window starts just above the XBE).
+  bool reserved = gw_memory_init();
   gw_status_init();
   gw_log("boot\n");
-
-  if (!gw_memory_init()) gw_fatal("could not reserve the guest memory windows");
+  if (!reserved) gw_fatal("could not reserve the guest memory windows");
   gw_log_memory("after reserving guest windows");
 
   u32 got = 0;

@@ -30,33 +30,35 @@ Later milestones:
 
 ## Status (2026-11-05)
 
-Booting in XEMU at 64 MB, the game:
+**Milestone 1 reached.** In XEMU at 64 MB the game boots, loads all its data,
+title images, sound effects and the six songs, and runs its own loop: about 11
+frames a second (some 120 draw calls each), with 35 MB of guest memory
+committed. The status page shows the frame counter rising. Nothing is drawn
+and no sound plays yet.
 
-- sets up its graphics (ring buffer, interrupt callback), starts its worker,
-  audio and loader threads (18 threads), and issues its first draw calls;
-- loads its text, the five title images and its data file;
-- starts its audio engine and loads the sound effects and menu music.
+How it fits in 64 MB:
 
-It does not yet complete a frame. The blocker is memory:
+- **Commit on first touch.** The game reserves two vertex-buffer rings
+  (18 × 4 MB and 18 × 3.5 MB) and 256 buffers of 128 KB, about 167 MB sized
+  for the 360's 512 MB. Allocations of 128 KB and up get address space only;
+  the first touch of each 16 KB backs it with memory.
+- **Music stays on the disc.** The game reads each song bank whole (about
+  33 MB for the six) and copies the sample data into its sound buffers. Large
+  reads into untouched memory are recorded instead of performed, the game's
+  memcpy/XMemCpy hand the record on to the destination, and a page is read
+  from the disc only if something touches it. The sound layer can stream music
+  from the same records later.
+- **Physical memory at 0xC0000000.** The game's Direct3D converts GPU
+  addresses back with "0xC0000000 + physical", so that view is the real one.
 
-| Use | Size |
-| --- | --- |
-| Program (recompiled code) | 18.6 MB |
-| Title screen images | 12 MB |
-| Music: six song banks, all kept in memory | ~33 MB |
-| Sound effects and menu music | ~5 MB |
-
-At 128 MB (a development kit, `boot_xemu.ps1 -MemoryMb 128`) it loads all six
-songs and then runs out of guest address space during the last one. Music has
-to be streamed from the disc or converted to a smaller format before the game
-can fit in 64 MB; that is the next step.
-
-Fixed on the way:
+Other fixes on the way:
 
 - The game's heap commits 64 KB pages and relies on the rounded-up tail.
-- Two vertex-buffer rings of 18 × 4 MB and 18 × 3.5 MB, and 256 buffers of
-  128 KB (about 167 MB in all, sized for the 360's 512 MB) are now reserved
-  and backed only when touched. They use a few MB.
+- XMP (the music player) polling is answered as on ReXGlue.
+- Two GPU waits on memory at 0x20B000 are never released by the game; with
+  no rendering they are skipped after a short spin.
+
+Next: milestone 2, the title screen picture.
 
 ## Building and testing
 

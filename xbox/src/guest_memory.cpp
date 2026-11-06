@@ -127,10 +127,13 @@ int window_find(Window& w, u32 guest) {
   return -1;
 }
 
+void drop_disc_ranges(u32 start, u32 size);
+
 void window_free(Window& w, u32 guest) {
   EnterCriticalSection(&w.lock);
   int i = window_find(w, guest);
   if (i >= 0) {
+    drop_disc_ranges(w.used[i].start, w.used[i].size);
     decommit(w.used[i].start, w.used[i].size);
     memmove(&w.used[i], &w.used[i + 1], (w.count - i - 1) * sizeof(Range));
     --w.count;
@@ -204,9 +207,121 @@ u32 gw_system_alloc(u32 size, u32 align) {
 u32 gw_memory_committed() { return g_committed; }
 
 volatile u32 gw_lazy_faults;
+volatile u32 gw_disc_pages;  // pages filled from the disc on touch
+
+// --- disc-backed ranges ----------------------------------------------------------
+// A large file read into reserved memory is recorded here instead of being
+// performed (the song banks: ~33 MB the game loads whole but only the sound
+// hardware reads). A page is read from the disc the first time it is touched.
+
+namespace {
+
+struct DiscRange {
+  u32 guest;
+  u32 size;
+  u64 offset;      // file offset of guest
+  HANDLE file;     // our own handle; the game may close its own
+  char path[64];
+};
+
+constexpr int kMaxDiscRanges = 256;
+DiscRange g_disc[kMaxDiscRanges];
+CRITICAL_SECTION g_disc_lock;
+bool g_disc_lock_ready = false;
+
+// Reads the part of r that falls in [lo, hi) into guest memory.
+void fill_range(DiscRange& r, u32 lo, u32 hi) {
+  if (lo < r.guest) lo = r.guest;
+  if (hi > r.guest + r.size) hi = r.guest + r.size;
+  if (lo >= hi) return;
+  LARGE_INTEGER pos;
+  pos.QuadPart = (LONGLONG)(r.offset + (lo - r.guest));
+  SetFilePointerEx(r.file, pos, nullptr, FILE_BEGIN);
+  DWORD done = 0;
+  ReadFile(r.file, gw_host(lo), hi - lo, &done, nullptr);
+  ++gw_disc_pages;
+}
+
+void fill_from_disc(u32 page) {
+  EnterCriticalSection(&g_disc_lock);
+  for (DiscRange& r : g_disc) {
+    if (r.file) fill_range(r, page, page + 0x1000);
+  }
+  LeaveCriticalSection(&g_disc_lock);
+}
+
+void drop_disc_ranges(u32 start, u32 size) {
+  if (!g_disc_lock_ready) return;
+  EnterCriticalSection(&g_disc_lock);
+  for (DiscRange& r : g_disc) {
+    if (r.file && r.guest >= start && r.guest < start + size) {
+      CloseHandle(r.file);
+      r = {};
+    }
+  }
+  LeaveCriticalSection(&g_disc_lock);
+}
+
+bool page_committed(u32 page) {
+  MEMORY_BASIC_INFORMATION info;
+  return VirtualQuery(gw_host(page), &info, sizeof(info)) && info.State == MEM_COMMIT;
+}
+
+}  // namespace
+
+// Records a read of [offset, offset+size) of host_path into guest memory
+// without performing it. Pages that are already committed (an allocation's
+// header page, say) are read now; the rest wait for their first touch.
+bool gw_map_from_disc(u32 guest, u32 size, const char* host_path, u64 offset) {
+  if (!g_disc_lock_ready) {
+    InitializeCriticalSection(&g_disc_lock);
+    g_disc_lock_ready = true;
+  }
+  if (!gw_allocation_base(guest) || strlen(host_path) >= sizeof(DiscRange::path)) return false;
+  HANDLE file = CreateFileA(host_path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  EnterCriticalSection(&g_disc_lock);
+  for (DiscRange& r : g_disc) {
+    if (r.file) continue;
+    r = {guest, size, offset, file, {}};
+    strcpy(r.path, host_path);
+    for (u32 p = guest & ~0xFFFu; p < guest + size; p += 0x1000) {
+      if (page_committed(p)) fill_range(r, p, p + 0x1000);
+    }
+    LeaveCriticalSection(&g_disc_lock);
+    gw_log("disc-backed: %s +%X, %u KiB at %08X\n", host_path, (u32)offset, size >> 10, guest);
+    return true;
+  }
+  LeaveCriticalSection(&g_disc_lock);
+  CloseHandle(file);
+  return false;
+}
+
+// A guest memcpy whose source lies inside one disc-backed range becomes a new
+// disc-backed range at the destination, so a whole song bank moves from the
+// loader's buffer to its final one without being read.
+bool gw_disc_copy(u32 dst, u32 src, u32 n) {
+  if (!g_disc_lock_ready) return false;
+  char path[64];
+  u64 offset = 0;
+  bool found = false;
+  EnterCriticalSection(&g_disc_lock);
+  for (DiscRange& r : g_disc) {
+    if (r.file && src >= r.guest && src + n <= r.guest + r.size) {
+      strcpy(path, r.path);
+      offset = r.offset + (src - r.guest);
+      found = true;
+      break;
+    }
+  }
+  LeaveCriticalSection(&g_disc_lock);
+  return found && gw_map_from_disc(dst, n, path, offset);
+}
 
 // Access violation in a reserved guest allocation: commit the 16 KiB around
-// it (clamped to the allocation) and let the access retry.
+// it (clamped to the allocation), fill newly committed pages that belong to a
+// disc-backed range, and let the access retry.
 bool gw_handle_fault(u32 host_address) {
   u32 guest = host_address - (u32)GW_MEMBASE;
   Window* w = nullptr;
@@ -222,7 +337,12 @@ bool gw_handle_fault(u32 host_address) {
     u32 lo = w->used[i].start, hi = w->used[i].start + w->used[i].size;
     if (start < lo) start = lo & ~0xFFFu;
     if (end > hi) end = (hi + 0xFFF) & ~0xFFFu;
-    ok = commit(start, end - start);
+    ok = true;
+    for (u32 page = start; page < end && ok; page += 0x1000) {
+      if (page_committed(page)) continue;
+      ok = commit(page, 0x1000);
+      if (ok && g_disc_lock_ready) fill_from_disc(page);
+    }
     ++gw_lazy_faults;
   }
   LeaveCriticalSection(&w->lock);

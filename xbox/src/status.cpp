@@ -65,7 +65,19 @@ DWORD WINAPI status_thread(LPVOID) {
     last_swaps = swaps;
     last_tick = now;
     EnterCriticalSection(&g_log_lock);
-    tail_lines(tail, sizeof(tail), 18);
+    tail_lines(tail, sizeof(tail), 10);
+    // Clip each line to the screen width so wrapping never scrolls the
+    // counters off the top.
+    {
+      char* out = tail;
+      int column = 0;
+      for (const char* p = tail; *p; ++p) {
+        if (*p == '\n') column = -1;
+        if (column < 74) *out++ = *p;
+        ++column;
+      }
+      *out = 0;
+    }
     LeaveCriticalSection(&g_log_lock);
     debugClearScreen();
     debugPrint("Geometry Wars: Retro Evolved 2 - Xbox bring-up\n");
