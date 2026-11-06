@@ -47,14 +47,23 @@ order. Measurements are from XEMU at 64 MB unless noted.
       textures at 640x480, and without mipmaps the glyphs alias. Not yet seen
       in XEMU. 720p would help further.
 - [ ] Texture format 26 (seen as 18x12) is not converted yet.
-- [ ] Remove the debug overlay ("Geometry Wars RE2 - Xbox frame N") once
-      hangs no longer need reporting by frame.
+- [x] The debug overlay ("Geometry Wars RE2 - Xbox frame N") covered the
+      score; it is off unless `make OVERLAY=y`. The frame rate is in
+      `gw2log.txt` on hardware.
+- [ ] Grey textures (the fonts: white glyphs coloured by the vertices) are
+      now kept exact as 16-bit alpha + grey instead of DXT5, whose 4x4
+      blocks smear small letters. Not yet seen; costs about 1.4 MB more for
+      the 1024x1024 font.
 
 ## 3. Glow
 
 - [ ] Our own glow (`apply_glow` in `src/nv2a.cpp`, on by default, `make
       GLOW=n` without): the finished picture shrunk 4x, blurred, added back.
-      Not yet seen in XEMU. Stand-in until the game's own chain below.
+      Stand-in until the game's own chain below. It drew bright blocks in
+      XEMU and nothing on hardware: the weights of the third and fourth
+      samples went to combiner factors nothing reads. Fixed, and the GPU now
+      finishes drawing each buffer before it is read back (needed on
+      hardware). Not yet seen.
 - The game's chain (from the menu capture): the grid and the scene are
   drawn into float targets, resolved, shrunk and blurred through about 80
   small passes down to 2x1, summed per pyramid and composited with a tone

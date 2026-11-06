@@ -136,9 +136,9 @@ u32 nv_format(u32 w, u32 h, u32 colour = NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G
 
 // Converts a k_8_8_8_8 texture to an NV2A texture, cached by address: sides
 // rounded to powers of two (down where up would grow them by over half), at
-// most 1024. Up to 256x256 as swizzled A8R8G8B8; larger ones (fonts, title
-// art) as DXT5, which keeps their full resolution, and so the text sharp, in
-// a quarter of the memory.
+// most 1024. Grey ones (the fonts) as swizzled A8Y8, exact; other colour
+// ones up to 256x256 as swizzled A8R8G8B8, larger ones (title art) as DXT5,
+// which keeps their full resolution in a quarter of the memory.
 Texture* texture_from_fetch(const u32* f) {
   u32 format = f[1] & 0x3F;
   if (format != 6) {
@@ -178,20 +178,6 @@ Texture* texture_from_fetch(const u32* f) {
   if (th > height + height / 2) th >>= 1;
   if (tw > 1024) tw = 1024;
   if (th > 1024) th = 1024;
-  const bool compressed = (tw > 256 || th > 256) && tw >= 4 && th >= 4;
-  // Mipmaps, each level a 2x2 average of the one above: the game draws its
-  // text and art smaller than the textures (1280-wide art on a 640-wide
-  // screen), and without them the minified glyphs alias. Down to 4 texels a
-  // side for DXT5 (one block), 1 otherwise.
-  const u32 smallest = compressed ? 4 : 1;
-  u32 levels = 1, bytes = 0;
-  for (u32 w = tw, h = th;; w >>= 1, h >>= 1) {
-    bytes += compressed ? w * h : w * h * 4;
-    if (w / 2 < smallest || h / 2 < smallest || levels == 10) break;
-    ++levels;
-  }
-  u32* pixels = (u32*)MmAllocateContiguousMemoryEx(bytes, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
-  if (!pixels) return nullptr;
   bool tiled = f[0] >> 31;
   u32 pitch = ((f[0] >> 22) & 0x1FF) * 32;
   u32 endian = (f[1] >> 6) & 3;
@@ -204,6 +190,35 @@ Texture* texture_from_fetch(const u32* f) {
     memcpy(&raw, src + offset, 4);
     return swap_endian(raw, endian);
   };
+  // Grey images (the fonts: white glyphs, coloured by the vertices) are kept
+  // as 16-bit alpha + grey, exact and half the size of 32-bit; DXT5's 4x4
+  // blocks smear the edges of small letters. Within 2 levels of grey counts.
+  bool grey = true;
+  for (u32 y = 0; y < th && grey; ++y) {
+    for (u32 x = 0; x < tw; ++x) {
+      const u32 v = texel(x, y);
+      const int r = (v >> 16) & 255, g = (v >> 8) & 255, b = v & 255;
+      if (r - g > 2 || g - r > 2 || b - g > 2 || g - b > 2) {
+        grey = false;
+        break;
+      }
+    }
+  }
+  const bool compressed = !grey && (tw > 256 || th > 256) && tw >= 4 && th >= 4;
+  // Mipmaps, each level a 2x2 average of the one above: the game draws its
+  // text and art smaller than the textures (1280-wide art on a 640-wide
+  // screen), and without them the minified glyphs alias. Down to 4 texels a
+  // side for DXT5 (one block), 1 otherwise.
+  const u32 smallest = compressed ? 4 : 1;
+  u32 levels = 1, bytes = 0;
+  for (u32 w = tw, h = th;; w >>= 1, h >>= 1) {
+    bytes += compressed ? w * h : grey ? w * h * 2 : w * h * 4;
+    if (w / 2 < smallest || h / 2 < smallest || levels == 10) break;
+    ++levels;
+  }
+  bytes = (bytes + 3) & ~3u;
+  u32* pixels = (u32*)MmAllocateContiguousMemoryEx(bytes, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
+  if (!pixels) return nullptr;
   // Writes one level (w x h) from get(x, y) at 'out'; returns the bytes used.
   auto write_level = [&](u8* out, u32 w, u32 h, auto&& get) {
     if (compressed) {
@@ -215,6 +230,17 @@ Texture* texture_from_fetch(const u32* f) {
         }
       }
       return w * h;
+    }
+    if (grey) {
+      // A8Y8: grey in the low byte, alpha in the high one.
+      u16* texels = (u16*)out;
+      for (u32 y = 0; y < h; ++y) {
+        for (u32 x = 0; x < w; ++x) {
+          const u32 v = get(x, y);
+          texels[swizzle_offset(x, y, w, h)] = (u16)(((v >> 16) & 0xFF00) | ((v >> 8) & 0xFF));
+        }
+      }
+      return w * h * 2;
     }
     u32* texels = (u32*)out;
     for (u32 y = 0; y < h; ++y) {
@@ -264,11 +290,14 @@ Texture* texture_from_fetch(const u32* f) {
   }
   slot->key = key;
   slot->pixels = pixels;
-  slot->format = compressed ? nv_format(tw, th, NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8, levels)
-                            : nv_format(tw, th, NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8, levels);
+  slot->format = nv_format(tw, th,
+                           compressed ? NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8
+                           : grey     ? NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8Y8
+                                      : NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8,
+                           levels);
   slot->filter = levels > 1 ? 0x02062000 : 0x02022000;  // trilinear with mipmaps, else bilinear
   gw_log("nv2a: texture %08X %ux%u%s -> %ux%u%s, %u levels\n", base, width, height, tiled ? " tiled" : "", tw, th,
-         compressed ? " DXT5" : "", levels);
+         compressed ? " DXT5" : grey ? " grey" : "", levels);
   // Large images (the title screens) are only read by the GPU: once
   // converted, the 360-format original gives its memory back. A later touch
   // recommits it as zeros.
@@ -639,7 +668,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, 
 void bind_linear(u32 unit, const void* pixels, u32 width, u32 height, u32 pitch) {
   const u32 o = unit * 64;
   u32* p = blk_begin();
-  p = pb_push2(p, NV097_SET_TEXTURE_OFFSET + o, (u32)pixels & 0x03FFFFFF,
+  p = pb_push2(p, NV097_SET_TEXTURE_OFFSET + o, (u32)MmGetPhysicalAddress((PVOID)pixels),
                1 | (2 << 4) | NV097_SET_TEXTURE_FORMAT_BORDER_SOURCE |
                    (NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R5G6B5 << 8) | (1 << 16));
   p = pb_push1(p, NV097_SET_TEXTURE_ADDRESS + o, 0x00030303);  // clamp
@@ -650,9 +679,15 @@ void bind_linear(u32 unit, const void* pixels, u32 width, u32 height, u32 pitch)
   blk_end(p);
 }
 
-// Combiner constants for the four-texture sum: stage 0's factors weigh units
-// 0 and 1, stage 1's and stage 2's second factors units 2 and 3 (where
-// fp20compiler put them; each stage keeps its own factors).
+// Combiner constants for the four-texture sum, where fp20compiler put them
+// (nv2a_sum_ps.inl; each stage keeps its own factors):
+//   stage 0: t0 * factor0 + t1 * factor1
+//   stage 1: previous + t2 * factor0   (its D source is 1, factor 0)
+//   stage 2: previous + t3 * factor0
+// Weights 2 and 3 used to go to factor 1 of stages 1 and 2, which nothing
+// reads: on hardware those factors stayed 0 and the glow came out at an
+// eighth of its strength (invisible); XEMU's leftovers made bright blocks.
+// The unused factors are cleared so nothing is left over from earlier.
 void set_sum_weights(const float w[4]) {
   auto colour = [](float v) {
     const u32 b = v <= 0 ? 0 : v >= 1 ? 255 : (u32)(v * 255.0f + 0.5f);
@@ -661,9 +696,33 @@ void set_sum_weights(const float w[4]) {
   u32* p = blk_begin();
   p = pb_push1(p, NV097_SET_COMBINER_FACTOR0 + 0 * 4, colour(w[0]));
   p = pb_push1(p, NV097_SET_COMBINER_FACTOR1 + 0 * 4, colour(w[1]));
-  p = pb_push1(p, NV097_SET_COMBINER_FACTOR1 + 1 * 4, colour(w[2]));
-  p = pb_push1(p, NV097_SET_COMBINER_FACTOR1 + 2 * 4, colour(w[3]));
+  p = pb_push1(p, NV097_SET_COMBINER_FACTOR0 + 1 * 4, colour(w[2]));
+  p = pb_push1(p, NV097_SET_COMBINER_FACTOR1 + 1 * 4, 0);
+  p = pb_push1(p, NV097_SET_COMBINER_FACTOR0 + 2 * 4, colour(w[3]));
+  p = pb_push1(p, NV097_SET_COMBINER_FACTOR1 + 2 * 4, 0);
   blk_end(p);
+}
+
+// The GPU finishes every earlier draw before the next command: needed on
+// hardware between drawing a surface and reading it as a texture, and before
+// pbkit moves the render target (it rewrites the target's DMA object, which
+// draws still in flight would otherwise land in).
+void wait_for_idle() {
+  u32* p = blk_begin();
+  p = pb_push1(p, NV097_WAIT_FOR_IDLE, 0);
+  blk_end(p);
+  blk_flush();
+}
+
+// Render into pbkit's extra buffer 'index' (-1: the back buffer), ordered
+// after everything drawn so far.
+void glow_target(int index) {
+  wait_for_idle();
+  if (index < 0) {
+    pb_target_back_buffer();
+  } else {
+    pb_target_extra_buffer(index);
+  }
 }
 
 void use_sum_combiner() {
@@ -743,24 +802,20 @@ void apply_glow() {
 
   // 1. A quarter of the size: four bilinear taps, each the average of 2x2,
   // cover the 4x4 block (output pixel x reads around source 4x + 1.5).
-  blk_flush();
-  pb_target_extra_buffer(0);
+  glow_target(0);
   const float quarter[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
   const float even[4] = {0.25f, 0.25f, 0.25f, 0.25f};
   glow_pass(picture, width, height, pitch, w, h, 4, quarter, even);
   // 2, 3. Blur across, then down: four bilinear taps, eight texels.
-  blk_flush();
-  pb_target_extra_buffer(1);
+  glow_target(1);
   const float across[4][2] = {{-2.5f, 0}, {-0.5f, 0}, {1.5f, 0}, {3.5f, 0}};
   glow_pass(small, width, height, pitch, w, h, 1, across, even);
-  blk_flush();
-  pb_target_extra_buffer(0);
+  glow_target(0);
   const float down[4][2] = {{0, -2.5f}, {0, -0.5f}, {0, 1.5f}, {0, 3.5f}};
   glow_pass(blurred, width, height, pitch, w, h, 1, down, even);
 
   // 4. Added back over the picture, enlarged (bilinear).
-  blk_flush();
-  pb_target_back_buffer();
+  glow_target(-1);
   p = blk_begin();
   p = pb_push1(p, NV097_SET_BLEND_ENABLE, 1);
   p = pb_push1(p, NV097_SET_BLEND_FUNC_SFACTOR, 0x0001);  // one
@@ -957,9 +1012,11 @@ void gw_nv2a_swap() {
   }
   if (kGlow) apply_glow();
   blk_flush();
+#ifdef GW_OVERLAY
   pb_erase_text_screen();
   pb_print("Geometry Wars RE2 - Xbox  frame %u\n", g_frames);
   pb_draw_text_screen();
+#endif
   // The GPU draws this frame while the game builds the next one: the next
   // frame's pb_reset (begin_frame) is what waits for it, so the vertex arena
   // is only reused once the GPU is done with it. Here the flip is queued,
