@@ -1,0 +1,26 @@
+// The glow passes (src/nv2a.cpp): positions in screen pixels, four texture
+// coordinates (one per texture unit, in texels of a linear texture) passed
+// through.
+struct VertexIn {
+    float4 position : POSITION;
+    float4 uv0 : TEXCOORD0;
+    float4 uv1 : TEXCOORD1;
+    float4 uv2 : TEXCOORD2;
+    float4 uv3 : TEXCOORD3;
+};
+struct VertexOut {
+    float4 position : POSITION;
+    float4 uv0 : TEXCOORD0;
+    float4 uv1 : TEXCOORD1;
+    float4 uv2 : TEXCOORD2;
+    float4 uv3 : TEXCOORD3;
+};
+VertexOut main(VertexIn input) {
+    VertexOut output;
+    output.position = input.position;
+    output.uv0 = input.uv0;
+    output.uv1 = input.uv1;
+    output.uv2 = input.uv2;
+    output.uv3 = input.uv3;
+    return output;
+}

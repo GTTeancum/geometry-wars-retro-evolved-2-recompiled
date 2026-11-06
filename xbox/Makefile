@@ -28,6 +28,11 @@ $(GEN_OBJS): NXDK_CXXFLAGS += -Ibuild/gen -O2
 # shader interpreter) into a call; the runtime gets the builtins back.
 $(RUNTIME_OBJS): NXDK_CXXFLAGS += -fbuiltin -mfpmath=sse
 
+# Our own glow over each frame (see src/nv2a.cpp): make GLOW=y
+ifeq ($(GLOW),y)
+src/nv2a.obj: NXDK_CXXFLAGS += -DGW_GLOW
+endif
+
 # 1280x720 output instead of 640x480: make VIDEO=720p
 ifeq ($(VIDEO),720p)
 src/status.obj: NXDK_CXXFLAGS += -DGW_VIDEO_720P
@@ -49,4 +54,4 @@ include $(NXDK_DIR)/Makefile
 
 # After the include, so the XBE stays the default target.
 # NV2A shaders (nxdk's Cg rules): pass-through vertex program, combiners.
-src/nv2a.obj: src/nv2a_vs.inl src/nv2a_ps.inl
+src/nv2a.obj: src/nv2a_vs.inl src/nv2a_ps.inl src/nv2a_sum_ps.inl src/nv2a_glow_vs.inl

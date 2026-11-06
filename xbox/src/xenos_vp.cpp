@@ -34,7 +34,7 @@ enum Ilu : u8 { IMOV = 1, RCP = 2, RCC = 3, RSQ = 4, EXP = 5, LOG = 6 };
 
 constexpr u8 kStage = 4, kPos = 10, kPrev = 11, kS0 = 8, kS1 = 9;
 constexpr u8 kOutPos = 0, kOutD0 = 3, kOutT0 = 9;
-constexpr int kMaxNv2a = 128;  // of 136, leaving room
+constexpr int kMaxNv2a = 120;  // slots 8..127; 0..7 pass-through, 128..135 the glow passes
 
 struct Op {
   u8 type = kNone;
@@ -429,6 +429,18 @@ const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool div
       } else {
         if (dst > 3) return b.fail();
         d = b.to_temp(dst, mask);
+      }
+      if (d.output == kOutT0) {
+        // Texture coordinates: scaled by constant 0's z, w (1 for ordinary
+        // textures, the size in pixels for a render target sampled as a
+        // linear texture), and copied to all four texture units for the
+        // multi-texture sums of the glow passes.
+        for (u8 unit = 0; unit < 4; ++unit) {
+          Builder::Dest t = d;
+          t.output = (u8)(kOutT0 + unit);
+          b.mac(MUL, value, cnst(0, "zwyy"), Op(), t);
+        }
+        return;
       }
       b.mov(d, value);
     };

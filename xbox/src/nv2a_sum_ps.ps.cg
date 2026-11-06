@@ -1,0 +1,10 @@
+// Weighted sum of four textures, for the glow chain's passes (see XpsSum in
+// xenos_vs.h): each weight arrives replicated in all four channels of its
+// combiner constant (set per draw in src/nv2a.cpp); unused stages bind a
+// black texel or a zero weight.
+struct Fragment { float4 uv0 : TEXCOORD0; float4 uv1 : TEXCOORD1; float4 uv2 : TEXCOORD2; float4 uv3 : TEXCOORD3; };
+float4 main(Fragment input, uniform sampler2D t0, uniform sampler2D t1, uniform sampler2D t2, uniform sampler2D t3,
+            uniform float4 w0, uniform float4 w1, uniform float4 w2, uniform float4 w3) : COLOR {
+    return tex2D(t0, input.uv0.xy) * w0 + tex2D(t1, input.uv1.xy) * w1 + tex2D(t2, input.uv2.xy) * w2 +
+           tex2D(t3, input.uv3.xy) * w3;
+}

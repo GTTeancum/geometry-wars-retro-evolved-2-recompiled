@@ -149,7 +149,7 @@ int compare(const XvsProgram* program, const XvpProgram* gp, int uv_i, int color
       for (u32 k = 0; k < at.components; ++k) in[a].v[k] = float_of(gw_load32(kDataGuest + vtx * gp->stride + at.offset + k * 4));
     }
     Vec c[192] = {};
-    static const float kFixed[12] = {0, 1, 0, 0, 0.15915494f, 0.5f, 6.2831853f, 3.1415927f,
+    static const float kFixed[12] = {0, 1, 2, 3, 0.15915494f, 0.5f, 6.2831853f, 3.1415927f,
                                      1.2732395f, -0.40528473f, 0.225f, 1.5707963f};
     memcpy(c, kFixed, sizeof(kFixed));
     c[3] = {{1, 1, 0, 0}};  // viewport: identity
@@ -162,7 +162,10 @@ int compare(const XvsProgram* program, const XvpProgram* gp, int uv_i, int color
     float want_x = cpu_pos[0] / cpu_pos[3], want_y = cpu_pos[1] / cpu_pos[3];
     bool ok = close(out[0].v[0], want_x, 0.01f) && close(out[0].v[1], want_y, 0.01f);
     for (int k = 0; k < 4 && color_i >= 0; ++k) ok &= close(out[3].v[k], interp[color_i][k], 0.01f);
-    for (int k = 0; k < 2 && uv_i >= 0; ++k) ok &= close(out[9].v[k], interp[uv_i][k], 0.01f);
+    for (int k = 0; k < 2 && uv_i >= 0; ++k) {
+      ok &= close(out[9].v[k], interp[uv_i][k] * (k ? 3.0f : 2.0f), 0.01f);  // texture scale (c0.z, c0.w)
+      for (int unit = 10; unit <= 12; ++unit) ok &= out[unit].v[k] == out[9].v[k];
+    }
     if (!ok && bad++ < 3) {
       printf("    vertex %d: pos %.4f %.4f want %.4f %.4f; colour %.3f %.3f %.3f %.3f want %.3f %.3f %.3f %.3f",
              vtx, out[0].v[0], out[0].v[1], want_x, want_y, out[3].v[0], out[3].v[1], out[3].v[2], out[3].v[3],

@@ -38,6 +38,14 @@ u32 g_arena_used;  // bytes
 // Draw with translated NV2A vertex programs (else the CPU interpreter).
 bool g_use_gpu_vertex = true;
 float g_scale_x, g_scale_y;
+// Our own glow over each frame (make GLOW=y; see apply_glow).
+#ifdef GW_GLOW
+constexpr bool kGlow = true;
+#else
+constexpr bool kGlow = false;
+#endif
+constexpr float kGlowStrength = 0.7f;
+constexpr u32 kGlowProgramSlot = 128;  // nv2a_glow_vs.vs.cg (after the translated programs)
 u32 g_frames;
 
 struct Texture {
@@ -248,6 +256,7 @@ void gw_nv2a_init() {
   };
   // 16-bit back buffers to match the video mode set in status.cpp (memory).
   pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5, false);
+  if (kGlow) pb_extra_buffers(2);  // the glow's work buffers
   if (pb_init()) {
     gw_log("nv2a: pb_init failed\n");
     return;
@@ -271,6 +280,21 @@ void gw_nv2a_init() {
   p = pb_begin();
 #include "nv2a_ps.inl"
   pb_end(p);
+  if (kGlow) {
+    u32 glow_vs[] = {
+#include "nv2a_glow_vs.inl"
+    };
+    p = pb_begin();
+    p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_LOAD, kGlowProgramSlot);
+    pb_end(p);
+    for (u32 i = 0; i < sizeof(glow_vs) / 4; i += 4) {
+      p = pb_begin();
+      pb_push(p++, NV097_SET_TRANSFORM_PROGRAM, 4);
+      memcpy(p, glow_vs + i, 16);
+      p += 4;
+      pb_end(p);
+    }
+  }
 
   g_arena = (u8*)MmAllocateContiguousMemoryEx(kArenaBytes, 0, 0x03FFAFFF, 0,
                                                PAGE_READWRITE | PAGE_WRITECOMBINE);
@@ -378,11 +402,46 @@ bool arena_room(u32 bytes) {
   return true;
 }
 
+// Rectangle lists (Xenos primitive 8) give three corners per rectangle; the
+// NV2A has no such primitive. The corner with the right angle is the one
+// opposite the longest edge (by the first attribute, the position); the
+// fourth corner is the sum of its two neighbours minus it, for every float
+// attribute (exact for the affine vertex shaders of full-screen passes).
+// Writes the four corners as a quad, in order around it.
+void rect_to_quad(const u32* v[3], const XvpProgram* gp, u32* out) {
+  const u32 words = gp->stride / 4, pos = gp->attrs[0].offset / 4;
+  auto at = [&](int k, u32 w) { return as_float(v[k][w]); };
+  auto dist2 = [&](int a, int b) {
+    const float dx = at(a, pos) - at(b, pos), dy = at(a, pos + 1) - at(b, pos + 1);
+    return dx * dx + dy * dy;
+  };
+  const float d01 = dist2(0, 1), d12 = dist2(1, 2), d02 = dist2(0, 2);
+  const int r = d12 >= d01 && d12 >= d02 ? 0 : d02 >= d01 ? 1 : 2;  // the right-angle corner
+  const int a = (r + 1) % 3, b = (r + 2) % 3;
+  memcpy(out, v[a], gp->stride);
+  memcpy(out + words, v[r], gp->stride);
+  memcpy(out + 2 * words, v[b], gp->stride);
+  u32* o = out + 3 * words;
+  memcpy(o, v[r], gp->stride);  // non-float attributes: the right-angle corner's
+  for (u32 n = 0; n < gp->attr_count; ++n) {
+    const XvpProgram::Attribute& attr = gp->attrs[n];
+    if (attr.format == 6) continue;
+    for (u32 c = 0; c < attr.components; ++c) {
+      const u32 w = attr.offset / 4 + c;
+      o[w] = float_bits(at(a, w) + at(b, w) - at(r, w));
+    }
+  }
+}
+
 // Draws with the shader translated to an NV2A vertex program: the game's
 // vertices are copied (byte-swapped) into the arena and read by the GPU.
+// 'rects': a rectangle list, drawn as quads. tex_w, tex_h scale the texture
+// coordinates (a linear texture is addressed in texels).
 bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, u32 source, u32 index_base,
-                 u32 index_endian, bool index32, u32 vte) {
-  u32 bytes = count * gp->stride;
+                 u32 index_endian, bool index32, u32 vte, bool rects = false, float tex_w = 1, float tex_h = 1) {
+  if (rects && (count % 3 || !gp->attr_count || gp->stride > 64)) return false;
+  const u32 out_count = rects ? count / 3 * 4 : count;
+  u32 bytes = out_count * gp->stride;
   if (!arena_room(bytes)) return false;
   if (g_loaded_key != gp->key) {
     u32* p = pb_begin();
@@ -403,11 +462,14 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, 
   set_program_start(8);
 
   // Constants: 0-2 fixed, 3 viewport, 4+ the shader's.
-  static const float kFixed[12] = {0, 1, 0, 0,
+  // c0.z, c0.w: texture coordinate scale (1 unless a linear texture is bound).
+  static const float kFixed[12] = {0, 1, 1, 1,
                                    0.15915494f, 0.5f, 6.2831853f, 3.1415927f,
                                    1.2732395f, -0.40528473f, 0.225f, 1.5707963f};
   u32 c[64 * 4];
   memcpy(c, kFixed, sizeof(kFixed));
+  c[2] = float_bits(tex_w);
+  c[3] = float_bits(tex_h);
   float vx_scale = as_float(regs[0x210F]), vx_off = as_float(regs[0x2110]);
   float vy_scale = as_float(regs[0x2111]), vy_off = as_float(regs[0x2112]);
   c[12] = float_bits((vte & 1 ? vx_scale : 1.0f) * g_scale_x);
@@ -422,6 +484,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, 
   u32 stream = gw_gpu_to_guest(f0 & ~3u), endian = f1 & 3;
   u32 words = gp->stride / 4;
   u32* out = (u32*)(g_arena + g_arena_used);
+  u32 corners[3][16];  // a rectangle's three corners, host order
   for (u32 i = 0; i < count; ++i) {
     u32 index = i;
     if (source == 0) {
@@ -436,8 +499,15 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, 
       }
     }
     const u32* in = (const u32*)gw_host(stream + index * gp->stride);
-    for (u32 k = 0; k < words; ++k) out[k] = swap_endian(in[k], endian);
-    out += words;
+    u32* dst = rects ? corners[i % 3] : out;
+    for (u32 k = 0; k < words; ++k) dst[k] = swap_endian(in[k], endian);
+    if (!rects) {
+      out += words;
+    } else if (i % 3 == 2) {
+      const u32* v[3] = {corners[0], corners[1], corners[2]};
+      rect_to_quad(v, gp, out);
+      out += 4 * words;
+    }
   }
 
   u32 formats[16] = {}, offsets[16] = {};
@@ -451,8 +521,152 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, 
   }
   set_arrays(formats, offsets);
   g_arena_used += (bytes + 15) & ~15u;
-  draw_arrays(nv_prim, count);
+  draw_arrays(nv_prim, out_count);
   return true;
+}
+
+// --- Glow --------------------------------------------------------------------------------
+// The game builds its glow from about 80 passes over float render targets
+// (see TODO.md). Until those are reproduced, make GLOW=y adds a glow of our
+// own at the end of each frame: the finished picture shrunk to a quarter
+// (each pixel the average of 4x4), blurred across and down (8 texels each
+// way), and added back over the picture. It uses pbkit's two extra buffers
+// (640x480, 16-bit: 1.2 MB) and the four-texture sum combiner
+// (nv2a_sum_ps.ps.cg).
+
+// A linear R5G6B5 surface as the texture of a unit, addressed in texels.
+void bind_linear(u32 unit, const void* pixels, u32 width, u32 height, u32 pitch) {
+  const u32 o = unit * 64;
+  u32* p = pb_begin();
+  p = pb_push2(p, NV097_SET_TEXTURE_OFFSET + o, (u32)pixels & 0x03FFFFFF,
+               1 | (2 << 4) | NV097_SET_TEXTURE_FORMAT_BORDER_SOURCE |
+                   (NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R5G6B5 << 8) | (1 << 16));
+  p = pb_push1(p, NV097_SET_TEXTURE_ADDRESS + o, 0x00030303);  // clamp
+  p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0 + o, 0x4003FFC0);
+  p = pb_push1(p, NV097_SET_TEXTURE_CONTROL1 + o, pitch << 16);
+  p = pb_push1(p, NV097_SET_TEXTURE_FILTER + o, 0x02022000);  // bilinear
+  p = pb_push1(p, NV097_SET_TEXTURE_IMAGE_RECT + o, (width << 16) | height);
+  pb_end(p);
+}
+
+// Combiner constants for the four-texture sum: stage 0's factors weigh units
+// 0 and 1, stage 1's and stage 2's second factors units 2 and 3 (where
+// fp20compiler put them; each stage keeps its own factors).
+void set_sum_weights(const float w[4]) {
+  auto colour = [](float v) {
+    const u32 b = v <= 0 ? 0 : v >= 1 ? 255 : (u32)(v * 255.0f + 0.5f);
+    return b << 24 | b << 16 | b << 8 | b;
+  };
+  u32* p = pb_begin();
+  p = pb_push1(p, NV097_SET_COMBINER_FACTOR0 + 0 * 4, colour(w[0]));
+  p = pb_push1(p, NV097_SET_COMBINER_FACTOR1 + 0 * 4, colour(w[1]));
+  p = pb_push1(p, NV097_SET_COMBINER_FACTOR1 + 1 * 4, colour(w[2]));
+  p = pb_push1(p, NV097_SET_COMBINER_FACTOR1 + 2 * 4, colour(w[3]));
+  pb_end(p);
+}
+
+void use_sum_combiner() {
+  u32* p = pb_begin();
+#include "nv2a_sum_ps.inl"
+  p = pb_push1(p, NV097_SET_COMBINER_CONTROL,
+               MASK(NV097_SET_COMBINER_CONTROL_FACTOR0, NV097_SET_COMBINER_CONTROL_FACTOR0_EACH_STAGE) |
+                   MASK(NV097_SET_COMBINER_CONTROL_FACTOR1, NV097_SET_COMBINER_CONTROL_FACTOR1_EACH_STAGE) |
+                   MASK(NV097_SET_COMBINER_CONTROL_ITERATION_COUNT, 3));
+  pb_end(p);
+}
+
+void use_default_combiner() {
+  u32* p = pb_begin();
+#include "nv2a_ps.inl"
+  for (u32 unit = 1; unit < 4; ++unit) p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0 + unit * 64, 0);
+  pb_end(p);
+}
+
+// One screen-aligned quad from (x0, y0) to (x1, y1); unit k's texture
+// coordinates run from uv[k][0..1] to uv[k][2..3] across it.
+void glow_quad(float x0, float y0, float x1, float y1, const float uv[4][4]) {
+  constexpr u32 kStride = 40;  // x, y, then u, v for each of the four units
+  if (!arena_room(4 * kStride)) return;
+  float* v = (float*)(g_arena + g_arena_used);
+  const float corner[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+  for (int c = 0; c < 4; ++c) {
+    float* out = v + c * 10;
+    out[0] = corner[c][0] ? x1 : x0;
+    out[1] = corner[c][1] ? y1 : y0;
+    for (int k = 0; k < 4; ++k) {
+      out[2 + k * 2] = corner[c][0] ? uv[k][2] : uv[k][0];
+      out[3 + k * 2] = corner[c][1] ? uv[k][3] : uv[k][1];
+    }
+  }
+  u32 formats[16] = {}, offsets[16] = {};
+  const u32 base = ((u32)g_arena & 0x03FFFFFF) + g_arena_used;
+  formats[0] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (2 << 4) | (kStride << 8);
+  offsets[0] = base;
+  for (int k = 0; k < 4; ++k) {
+    formats[9 + k] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (2 << 4) | (kStride << 8);
+    offsets[9 + k] = base + 8 + k * 8;
+  }
+  set_arrays(formats, offsets);
+  g_arena_used += (4 * kStride + 15) & ~15u;
+  draw_arrays(NV097_SET_BEGIN_END_OP_QUADS, 4);
+}
+
+// A pass sampling 'from' (all four units) at four offsets in texels, into
+// the rectangle (0, 0)-(w, h) of the current target; texel = scale * screen
+// pixel + base, so a texture coordinate runs from base to base + scale * w.
+void glow_pass(const void* from, u32 from_w, u32 from_h, u32 pitch, float w, float h, float scale,
+               const float offsets[4][2], const float weights[4]) {
+  for (u32 unit = 0; unit < 4; ++unit) bind_linear(unit, from, from_w, from_h, pitch);
+  set_sum_weights(weights);
+  float uv[4][4];
+  for (int k = 0; k < 4; ++k) {
+    uv[k][0] = offsets[k][0];
+    uv[k][1] = offsets[k][1];
+    uv[k][2] = offsets[k][0] + scale * w;
+    uv[k][3] = offsets[k][1] + scale * h;
+  }
+  glow_quad(0, 0, w, h, uv);
+}
+
+void apply_glow() {
+  const u32 width = pb_back_buffer_width(), height = pb_back_buffer_height(), pitch = pb_back_buffer_pitch();
+  const float w = (float)(width / 4), h = (float)(height / 4);
+  const void* picture = pb_back_buffer();
+  const void* small = pb_extra_buffer(0);
+  const void* blurred = pb_extra_buffer(1);
+  set_program_start(kGlowProgramSlot);
+  use_sum_combiner();
+  u32* p = pb_begin();
+  p = pb_push1(p, NV097_SET_BLEND_ENABLE, 0);
+  pb_end(p);
+
+  // 1. A quarter of the size: four bilinear taps, each the average of 2x2,
+  // cover the 4x4 block (output pixel x reads around source 4x + 1.5).
+  pb_target_extra_buffer(0);
+  const float quarter[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
+  const float even[4] = {0.25f, 0.25f, 0.25f, 0.25f};
+  glow_pass(picture, width, height, pitch, w, h, 4, quarter, even);
+  // 2, 3. Blur across, then down: four bilinear taps, eight texels.
+  pb_target_extra_buffer(1);
+  const float across[4][2] = {{-2.5f, 0}, {-0.5f, 0}, {1.5f, 0}, {3.5f, 0}};
+  glow_pass(small, width, height, pitch, w, h, 1, across, even);
+  pb_target_extra_buffer(0);
+  const float down[4][2] = {{0, -2.5f}, {0, -0.5f}, {0, 1.5f}, {0, 3.5f}};
+  glow_pass(blurred, width, height, pitch, w, h, 1, down, even);
+
+  // 4. Added back over the picture, enlarged (bilinear).
+  pb_target_back_buffer();
+  p = pb_begin();
+  p = pb_push1(p, NV097_SET_BLEND_ENABLE, 1);
+  p = pb_push1(p, NV097_SET_BLEND_FUNC_SFACTOR, 0x0001);  // one
+  p = pb_push1(p, NV097_SET_BLEND_FUNC_DFACTOR, 0x0001);  // one
+  p = pb_push1(p, NV097_SET_BLEND_EQUATION, 0x8006);      // add
+  pb_end(p);
+  const float none[4][2] = {};
+  const float strength[4] = {kGlowStrength, 0, 0, 0};
+  glow_pass(small, width, height, pitch, (float)width, (float)height, 0.25f, none, strength);
+
+  use_default_combiner();
 }
 
 }  // namespace
@@ -625,6 +839,7 @@ void gw_nv2a_swap() {
     gw_log_memory("census");
     gw_dump_allocations();
   }
+  if (kGlow) apply_glow();
   pb_erase_text_screen();
   pb_print("Geometry Wars RE2 - Xbox  frame %u\n", g_frames);
   pb_draw_text_screen();
