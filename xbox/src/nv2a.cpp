@@ -345,12 +345,28 @@ u32 float_bits(float f) {
   return u;
 }
 
+// Room for 'bytes' more in the vertex arena. When a busy frame fills it, the
+// GPU finishes what it has been given (pb_reset waits for that; render state
+// carries over) and the arena starts again from the beginning: one stall
+// instead of dropping draws or falling back to the CPU interpreter.
+bool arena_room(u32 bytes) {
+  if (g_arena_used + bytes <= kArenaBytes) return true;
+  if (bytes > kArenaBytes) return false;
+  static u32 reported = 0;
+  if (reported++ < 4) gw_log("nv2a: frame %u filled the vertex arena, waiting for the GPU\n", g_frames);
+  const u64 start = gw_wait_begin();
+  pb_reset();
+  gw_wait_end(start, 0, "renderer: vertex arena full mid-frame");
+  g_arena_used = 0;
+  return true;
+}
+
 // Draws with the shader translated to an NV2A vertex program: the game's
 // vertices are copied (byte-swapped) into the arena and read by the GPU.
 bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, u32 source, u32 index_base,
                  u32 index_endian, bool index32, u32 vte) {
   u32 bytes = count * gp->stride;
-  if (g_arena_used + bytes > kArenaBytes) return false;
+  if (!arena_room(bytes)) return false;
   if (g_loaded_key != gp->key) {
     u32* p = pb_begin();
     p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_LOAD, 8);
@@ -511,10 +527,11 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   }
 
   // Fallback: interpret the shader on the CPU, draw pre-transformed vertices.
-  if (g_arena_used + count * 20 > kArenaBytes) {
+  if (!arena_room(count * 20)) {
     static u32 reported = 0;
     if (reported++ < 4) {
-      gw_log("nv2a: frame %u vertex arena full, skipping %u vertices (shader %08X)\n", g_frames, count, vs_hash);
+      gw_log("nv2a: frame %u draw of %u vertices is larger than the vertex arena (shader %08X)\n", g_frames, count,
+             vs_hash);
     }
     return;
   }

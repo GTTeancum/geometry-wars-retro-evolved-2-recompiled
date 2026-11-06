@@ -9,11 +9,11 @@ call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build
 set OUT=%XBOX%\build\native_check
 if not exist "%OUT%" mkdir "%OUT%"
 rem Exact reciprocal square roots by default, to compare like with like.
-if not defined CHECK_FLAGS set CHECK_FLAGS=-DGW_GRID_EXACT_RSQ
-python "%XBOX%\tools\native_check\extract.py" "%XBOX%\build\gen" "%OUT%\original.inc" sub_8205B880 sub_8212E9B0 || exit /b 1
+if not defined CHECK_FLAGS set CHECK_FLAGS=-DGW_GRID_EXACT_RSQ -DGW_PARTICLE_GLOW
+python "%XBOX%\tools\native_check\extract.py" "%XBOX%\build\gen" "%OUT%\original.inc" sub_8205B880 sub_8212E9B0 sub_82063448 || exit /b 1
 "C:\Program Files\LLVM\bin\clang-cl.exe" --target=i686-pc-windows-msvc /nologo /std:c++20 /O2 /EHsc -march=pentium3 -Wno-everything %CHECK_FLAGS% ^
   /I"%XBOX%\include" /I"%XBOX%\src" /I"%OUT%" /I"%XBOX%\..\tools\rexglue\win-amd64\include" ^
-  "%XBOX%\tools\native_check\main.cpp" "%XBOX%\src\grid_native.cpp" "%XBOX%\src\math_native.cpp" ^
+  "%XBOX%\tools\native_check\main.cpp" "%XBOX%\src\grid_native.cpp" "%XBOX%\src\math_native.cpp" "%XBOX%\src\particle_native.cpp" ^
   /Fo"%OUT%\\" /Fe"%OUT%\native_check.exe" /link /LARGEADDRESSAWARE:NO libcmt.lib libucrt.lib libvcruntime.lib kernel32.lib || exit /b 1
 pushd "%XBOX%\.."
 "%OUT%\native_check.exe" %*

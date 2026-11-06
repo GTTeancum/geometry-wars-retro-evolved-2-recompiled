@@ -23,6 +23,7 @@
 
 extern "C" void sub_8205B880(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__sub_8212E9B0(PPCContext& ctx, uint8_t* base) { original_sub_8212E9B0(ctx, base); }
 
 std::atomic<i32> gw_global_lock_count{0};
@@ -272,6 +273,74 @@ int main(int argc, char** argv) {
       free(want[r]);
     }
     free(image);
+  }
+
+  // Particle update (guest 0x82063448): random particles, wells and holes.
+  {
+    constexpr u32 kSystem = kArgs + 0x1000, kIn = kArgs + 0x2000, kOut = kArgs + 0x2100;
+    constexpr u32 kStreak = kArgs + 0x2200, kGlowQuad = kArgs + 0x2300;
+    int bad_words = 0;
+    float worst = 0;
+    for (int n = 0; n < 20000; ++n) {
+      sf(0x821B0000 + 16032 + 32, 1.0f / 60);
+      sf(0x821B0000 + 16120 + 32, frand(1, 20));
+      sf(0x821B0000 + 16172 + 32, frand(0.5f, 4));
+      const u32 system = kSystem + 40;
+      const u32 wells = rand() % 4, holes = rand() % 3;
+      gw_store32(system + 448, wells);
+      gw_store32(system + 452, holes);
+      for (u32 k = 0; k < 4; ++k) {
+        for (u32 c = 0; c < 3; ++c) sf(system + k * 12 + c * 4, frand(-500, 500));
+        for (u32 c = 0; c < 3; ++c) sf(system + 192 + k * 12 + c * 4, frand(-500, 500));
+        sf(system + 384 + k * 4, frand(-3, 3));
+      }
+      for (u32 c = 0; c < 3; ++c) sf(kIn + c * 4, frand(-700, 700) * (c == 2 ? 0.01f : 1.0f));
+      for (u32 c = 0; c < 3; ++c) sf(kIn + 12 + c * 4, frand(-3000, 3000) * (c == 2 ? 0.01f : 1.0f));
+      for (u32 c = 0; c < 3; ++c) sf(kIn + 24 + c * 4, frand(0, 1));
+      sf(kIn + 36, frand(0, 1));
+      sf(kIn + 40, frand(0, 60));
+      u8 want[3][128], got[3][128];
+      for (int pass = 0; pass < 2; ++pass) {
+        memset(gw_host(kOut), 0, 44);
+        memset(gw_host(kStreak), 0, 128);
+        memset(gw_host(kGlowQuad), 0, 112);
+        static PPCContext ctx;
+        ctx = PPCContext{};
+        ctx.r1.u64 = kStack;
+        ctx.r3.u64 = kSystem;
+        ctx.r4.u64 = kIn;
+        ctx.r5.u64 = kOut;
+        ctx.r6.u64 = kStreak;
+        ctx.r7.u64 = kGlowQuad;
+        if (pass == 0) original_sub_82063448(ctx, gw_host(0));
+        else sub_82063448(ctx, gw_host(0));
+        u8(*dst)[128] = pass == 0 ? want : got;
+        memcpy(dst[0], gw_host(kOut), 44);
+        memcpy(dst[1], gw_host(kStreak), 128);
+        memcpy(dst[2], gw_host(kGlowQuad), 112);
+      }
+      const u32 sizes[3] = {44, 128, 112};
+      for (int r = 0; r < 3; ++r) {
+        for (u32 o = 0; o < sizes[r]; o += 4) {
+          u32 a, b;
+          memcpy(&a, want[r] + o, 4);
+          memcpy(&b, got[r] + o, 4);
+          a = __builtin_bswap32(a);
+          b = __builtin_bswap32(b);
+          float fa, fb;
+          memcpy(&fa, &a, 4);
+          memcpy(&fb, &b, 4);
+          const float err = fabsf(fa - fb) / (1.0f + fabsf(fa));
+          if (!(err <= 1e-3f)) {
+            if (bad_words++ < 6) printf("    particle %d %s +%u: original %g, native %g\n", n,
+                                        r == 0 ? "state" : r == 1 ? "streak" : "glow", o, fa, fb);
+          }
+          if (err > worst) worst = err;
+        }
+      }
+    }
+    printf("particle update: %d values off by more than 0.1%% (worst %.2g)\n", bad_words, worst);
+    bad += bad_words;
   }
 
   // Vector load/store byte reversal (prepare_generated.py) against SIMDe.
