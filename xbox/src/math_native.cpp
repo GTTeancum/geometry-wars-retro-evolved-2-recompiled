@@ -11,9 +11,8 @@
 
 extern "C" void __imp__sub_8212E9B0(PPCContext& ctx, uint8_t* base);
 
-namespace {
-
-float sine(float x) {
+// sin(x) in single precision for |x| < 2048 (also used by src/stars_native.cpp).
+float gw_sine(float x) {
   const float ax = __builtin_fabsf(x);
   // Nearest multiple of pi, split in two parts so the reduction stays exact.
   const float k = (float)(int)(ax * 0.318309886f + 0.5f);
@@ -30,8 +29,6 @@ float sine(float x) {
   return x < 0 ? -s : s;
 }
 
-}  // namespace
-
 // sin(f1) -> f1 (guest 0x8212E9B0).
 extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base) {
   const double x = ctx.f1.f64;
@@ -40,5 +37,5 @@ extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base) {
     __imp__sub_8212E9B0(ctx, base);
     return;
   }
-  ctx.f1.f64 = (double)sine((float)x);
+  ctx.f1.f64 = (double)gw_sine((float)x);
 }

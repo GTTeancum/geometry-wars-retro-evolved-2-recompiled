@@ -17,6 +17,11 @@
 #include "runtime.h"
 
 // The recompiled original, renamed so it can sit beside the native one.
+// What the extracted originals call by name.
+extern "C" void sub_820A1800(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_820A1850(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_821303B8(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base);
 #undef DEFINE_REX_FUNC
 #define DEFINE_REX_FUNC(name) extern "C" void original_##name(PPCContext& ctx, uint8_t* base)
 #include "original.inc"
@@ -24,6 +29,16 @@
 extern "C" void sub_8205B880(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82075548(PPCContext& ctx, uint8_t* base);
+
+// Stand-ins for what the starfield calls: the vertex buffer lock returns the
+// buffer address plus kLockedOffset as its data; pow is the C library's.
+constexpr u32 kLockedOffset = 0x100;
+extern "C" void sub_820A1800(PPCContext& ctx, uint8_t*) {
+  ctx.r3.u64 = ctx.r3.u32 + kLockedOffset;
+}
+extern "C" void sub_820A1850(PPCContext&, uint8_t*) {}
+extern "C" void sub_821303B8(PPCContext& ctx, uint8_t*) { ctx.f1.f64 = pow(ctx.f1.f64, ctx.f2.f64); }
 extern "C" void __imp__sub_8212E9B0(PPCContext& ctx, uint8_t* base) { original_sub_8212E9B0(ctx, base); }
 
 std::atomic<i32> gw_global_lock_count{0};
@@ -69,6 +84,7 @@ constexpr u32 kCells = 0x70210000;     // cell table, objects
 constexpr u32 kGrid = 0xC0010000;      // row 0 of the grid (one row above it)
 constexpr u32 kLines = 0xC0200000;     // line vertices (rows start 14784 before)
 constexpr u32 kDisplace = 0xC0600000;  // displacement vertices
+constexpr u32 kStarBuffer = 0xC0700000;  // three starfield vertex buffers
 
 float frand(float lo, float hi) { return lo + (hi - lo) * (float)rand() / (float)RAND_MAX; }
 void sf(u32 a, float f) {
@@ -225,7 +241,7 @@ int main(int argc, char** argv) {
   SetUnhandledExceptionFilter(report_fault);
   u32 seed = argc > 1 ? (u32)atoi(argv[1]) : 1;
   if (!map(0x82000000, 0x220000) || !map(kStack - 0x10000, 0x20000) || !map(kArgs, 0x20000) ||
-      !map(kGrid - kRow, 91 * kRow) || !map(kLines, 88 * 1052 * 28 + 0x1000) || !map(kDisplace, 89 * 133 * 28 + 0x1000)) {
+      !map(kGrid - kRow, 91 * kRow) || !map(kLines, 88 * 1052 * 28 + 0x1000) || !map(kDisplace, 89 * 133 * 28 + 0x1000) || !map(kStarBuffer, 3 * 0x30000)) {
     return 1;
   }
   FILE* f = fopen("..\\game\\analysis\\default.image.bin", "rb");
@@ -341,6 +357,68 @@ int main(int argc, char** argv) {
     }
     printf("particle update: %d values off by more than 0.1%% (worst %.2g)\n", bad_words, worst);
     bad += bad_words;
+  }
+
+  // Starfield (guest 0x82075548), with the vertex buffer lock and pow stubbed.
+  {
+    constexpr u32 kStars = 0x821B0000 + 18288;
+    u8* stars_before = (u8*)malloc(6000 * 20);
+    for (u32 n = 0; n < 6000; ++n) {
+      const u32 s = kStars + n * 20;
+      sf(s + 0, frand(-640, 640));
+      sf(s + 4, frand(-360, 360));
+      sf(s + 8, frand(0, 1));
+      sf(s + 12, frand(-0.1f, 1));
+      sf(s + 16, frand(-1, 1));
+    }
+    sf(0x821B0000 + 18264, 0.7f);
+    sf(D + 9708, 1.25f);
+    sf(D + 9880, 3.14159f);
+    gw_store32(0x821B0000 + 18284, 1);
+    for (u32 i = 0; i < 3; ++i) gw_store32(0x821B0000 + 18268 + i * 4, kStarBuffer + i * 0x30000);
+    memcpy(stars_before, gw_host(kStars), 6000 * 20);
+    u8* image_before = (u8*)malloc(0x220000);
+    memcpy(image_before, gw_host(0x82000000), 0x220000);
+    u8* want = (u8*)malloc(6000 * 24 + 6000 * 20);
+    for (int pass = 0; pass < 2; ++pass) {
+      memcpy(gw_host(0x82000000), image_before, 0x220000);
+      static PPCContext ctx;
+      ctx = PPCContext{};
+      ctx.r1.u64 = kStack;
+      if (pass == 0) original_sub_82075548(ctx, gw_host(0));
+      else sub_82075548(ctx, gw_host(0));
+      const u32 buffer = kStarBuffer + 2 * 0x30000 + kLockedOffset;  // index 1 -> 2
+      if (pass == 0) {
+        memcpy(want, gw_host(buffer), 6000 * 24);
+        memcpy(want + 6000 * 24, gw_host(kStars), 6000 * 20);
+      } else {
+        int differ = 0;
+        float worst = 0;
+        auto cmp = [&](const u8* a8, const u8* b8, u32 size) {
+          for (u32 o = 0; o < size; o += 4) {
+            u32 a, b;
+            memcpy(&a, a8 + o, 4);
+            memcpy(&b, b8 + o, 4);
+            a = __builtin_bswap32(a);
+            b = __builtin_bswap32(b);
+            float fa, fb;
+            memcpy(&fa, &a, 4);
+            memcpy(&fb, &b, 4);
+            const float err = fabsf(fa - fb) / (1.0f + fabsf(fa));
+            if (!(err <= 1e-4f)) ++differ;
+            if (err > worst) worst = err;
+          }
+        };
+        cmp(want, gw_host(buffer), 6000 * 24);
+        cmp(want + 6000 * 24, gw_host(kStars), 6000 * 20);
+        printf("starfield: %d values off by more than 0.01%% (worst %.2g)\n", differ, worst);
+        bad += differ;
+      }
+    }
+    memcpy(gw_host(0x82000000), image_before, 0x220000);
+    free(stars_before);
+    free(image_before);
+    free(want);
   }
 
   // Vector load/store byte reversal (prepare_generated.py) against SIMDe.

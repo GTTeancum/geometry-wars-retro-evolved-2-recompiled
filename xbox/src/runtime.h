@@ -52,7 +52,10 @@ constexpr u32 kDefaultStackSize = 0x40000;
 
 // --- guest memory -----------------------------------------------------------
 
-inline u8* gw_host(u32 guest) { return GW_MEMBASE + guest; }
+// The sum wraps in 32 bits, so it is done on integers: as pointer arithmetic
+// the overflow is undefined, and clang did fold such an address to 0 once it
+// could prove the overflow (a table read in src/stars_native.cpp).
+inline u8* gw_host(u32 guest) { return (u8*)(uintptr_t)(0xA2000000u + guest); }
 inline u32 gw_guest(const void* host) { return (u32)((const u8*)host - GW_MEMBASE); }
 
 inline u8 gw_load8(u32 a) { return *gw_host(a); }
