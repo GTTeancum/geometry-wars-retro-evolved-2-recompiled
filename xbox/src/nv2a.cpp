@@ -802,10 +802,11 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     if (uv_i == -2) return note_skip(kComputedUv, 0);
     if (uv_i >= 0) {
       const Texture* t = texture_from_fetch(&regs[0x4800 + tex_const * 6]);
-      // The in-level grid's lines (vertex shader 8E1A294A) sample one of the
-      // game's float render targets (formats 26, 54), which are not
-      // reproduced yet; drawn with a white texel instead they keep their own
-      // colours (the grid without its glow).
+      // The in-level grid's lines (vertex shader 8E1A294A) are never drawn;
+      // the likely reason (to be confirmed by the census's skip reasons) is
+      // that they sample one of the game's float render targets (formats 26,
+      // 54), which are not reproduced yet. With a white texel instead they
+      // keep their own colours: the grid without its glow.
       const u32 texture_format = regs[0x4800 + tex_const * 6 + 1] & 0x3F;
       if (!t && vs_hash == 0x8E1A294A && (texture_format == 26 || texture_format == 54)) t = &g_white;
       if (!t) return note_skip(kTextureFormat, texture_format);
