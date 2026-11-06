@@ -112,6 +112,7 @@ extern GwStats gw_stats;
 u64 gw_wait_begin();
 void gw_wait_end(u64 start, u32 caller, const char* what);
 void gw_wait_report();
+void gw_fault_report();  // commit-on-touch faults by allocation (src/guest_memory.cpp)
 
 // Controllers (src/input.cpp).
 void gw_input_init();

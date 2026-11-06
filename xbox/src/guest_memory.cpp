@@ -16,6 +16,7 @@ struct Range {
   u32 start;
   u32 size;
   u32 caller;  // guest LR of the system call that made it (memory census)
+  u32 faults;  // commit-on-touch faults since the last fault report
 };
 
 constexpr int kMaxRanges = 4096;
@@ -37,6 +38,7 @@ u32 g_system_next = kGuestSystemBase;
 u32 g_system_committed_end = kGuestSystemBase;
 CRITICAL_SECTION g_system_lock;
 volatile u32 g_committed = 0;
+volatile u32 g_decommits = 0;  // since the last fault report
 // A census is logged (from the swap, gw_census_due) each time the committed
 // total passes another 4 MB above 32 MB.
 u32 g_census_at = 32 << 20;
@@ -87,6 +89,7 @@ void decommit(u32 guest, u32 size) {
     p = region_end;
   }
   VirtualFree(gw_host(guest), size, MEM_DECOMMIT);
+  ++g_decommits;
 }
 
 u32 window_alloc(Window& w, u32 size, u32 align, bool do_commit = true) {
@@ -352,6 +355,7 @@ bool gw_handle_fault(u32 host_address) {
       if (ok && g_disc_lock_ready) fill_from_disc(page);
     }
     ++gw_lazy_faults;
+    ++w->used[i].faults;
   }
   LeaveCriticalSection(&w->lock);
   if (i >= 0 && !ok) {
@@ -375,6 +379,32 @@ u32 gw_current_caller();
 GwDispatchEntry gw_dispatch_table[1u << kGwDispatchBits];
 
 PPCFunc* gw_lookup(u32 guest_address) { return gw_dispatch_find(guest_address); }
+
+// Commit-on-touch faults and decommits since the last call, with the
+// allocations that faulted most (from gw_wait_report, every 10 s).
+void gw_fault_report() {
+  static u32 last_faults = 0;
+  const u32 faults = gw_lazy_faults, decommits = g_decommits;
+  g_decommits = 0;
+  gw_log("memory faults: %u commit-on-touch faults, %u decommits\n", faults - last_faults, decommits);
+  last_faults = faults;
+  Window* windows[3] = {&g_virtual, &g_physical, &g_stack};
+  for (Window* w : windows) {
+    EnterCriticalSection(&w->lock);
+    for (int pass = 0; pass < 4; ++pass) {
+      int best = -1;
+      for (int i = 0; i < w->count; ++i) {
+        if (w->used[i].faults && (best < 0 || w->used[i].faults > w->used[best].faults)) best = i;
+      }
+      if (best < 0 || w->used[best].faults < 8) break;
+      const Range& r = w->used[best];
+      gw_log("  %s %08X size %X: %u faults, requested from %08X\n", w->name, r.start, r.size, r.faults, r.caller);
+      w->used[best].faults = 0;
+    }
+    for (int i = 0; i < w->count; ++i) w->used[i].faults = 0;
+    LeaveCriticalSection(&w->lock);
+  }
+}
 
 bool gw_census_due() {
   if (!g_census_wanted) return false;

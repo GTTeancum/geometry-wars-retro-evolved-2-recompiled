@@ -89,4 +89,5 @@ void gw_wait_report() {
     gw_log("  thread %u at %08X %s: %u waits, %u ms (%u us each)\n", e.thread, e.caller, e.what, e.count, ms,
            (u32)(e.cycles * 1000000 / kHz / e.count));
   }
+  gw_fault_report();
 }
