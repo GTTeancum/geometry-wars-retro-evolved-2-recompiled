@@ -58,7 +58,35 @@ Other fixes on the way:
 - Two GPU waits on memory at 0x20B000 are never released by the game; with
   no rendering they are skipped after a short spin.
 
-Next: milestone 2, the title screen picture.
+## Milestone 2: what the title screen draws
+
+`xbox/src/gpu_capture.cpp` records one frame (swap 120) of the command stream;
+`python xbox/tools/gpu_capture.py` saves it from a running XEMU and writes
+`xbox/test-artifacts/gpu/report.txt` plus every shader's microcode.
+
+One title frame (2026-11-05):
+
+| Part | Draws |
+| --- | --- |
+| Background grid: one indexed quad list, 46,464 indices | 1 |
+| Starfield: 6,000 point sprites (3×3 texture) | 1 |
+| Logo pieces (8 quads) and the 1280×720 title image | 2 |
+| Glow: downsample/blur passes from 640×360 to 2×1, 8-bit targets, then the composite with the float 1280×720 scene | ~54 |
+| EDRAM resolves (copy to texture) | 57 |
+| Clears | 3 |
+
+Only 7 distinct vertex shaders and 12 distinct pixel shaders are used (the
+resolve vertex shaders are inline copies of one program).
+
+Plan for the NV2A renderer (pbkit):
+
+1. Disassemble the 19 shaders (Xenos microcode) and write an NV2A
+   equivalent for each: vertex programs (or a CPU transform) and register
+   combiner setups.
+2. Render targets become NV2A surfaces in memory, so EDRAM resolves turn into
+   no-ops or simple copies; the float scene target becomes 8-bit ARGB.
+3. First picture: grid, stars, logo and title image without the glow. Then the
+   glow chain at reduced resolution.
 
 ## Building and testing
 

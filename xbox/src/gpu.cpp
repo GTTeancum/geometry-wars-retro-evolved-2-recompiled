@@ -12,6 +12,10 @@
 
 #include <windows.h>
 
+void gw_capture_swap(u32 swap_number, u32 frontbuffer, u32 width, u32 height, const u32* regs);
+void gw_capture_shader(u32 type, u32 gpu_address, u32 guest_words, u32 dwords);
+void gw_capture_draw(u32 opcode, const u32* packet, u32 packet_dwords, const u32* regs);
+
 namespace {
 
 constexpr u32 kRegisterCount = 0x6000;
@@ -134,9 +138,42 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
     case 0x64: {  // XE_SWAP (written by VdSwap)
       u32 magic = r.next();
       if (magic == kSwapSignature) {
+        u32 frontbuffer = r.next(), width = r.next(), height = r.next();
         ++g_swap_counter;
+        gw_capture_swap(g_swap_counter, frontbuffer, width, height, g_regs);
         gw_status_frame();
       }
+      break;
+    }
+    case 0x27: {  // IM_LOAD: shader microcode from memory
+      u32 address_type = r.next(), start_size = r.next();
+      u32 address = address_type & ~3u;
+      gw_capture_shader(address_type & 3, address, gw_gpu_to_guest(address), start_size & 0xFFFF);
+      break;
+    }
+    case 0x2B: {  // IM_LOAD_IMMEDIATE: shader microcode inline
+      u32 type = r.next(), start_size = r.next();
+      u32 dwords = start_size & 0xFFFF;
+      // Inline shaders are keyed by their ring position.
+      u32 guest = r.base + (r.pos % r.size) * 4;
+      if (!r.ring || (r.pos % r.size) + dwords <= r.size) {
+        gw_capture_shader(type & 3, 0x80000000u | guest, guest, dwords);
+      }
+      break;
+    }
+    case 0x2F: {  // LOAD_ALU_CONSTANT: constants from memory
+      u32 address = r.next() & 0x3FFFFFFF, offset_type = r.next(), dwords = r.next() & 0xFFF;
+      u32 index = offset_type & 0x7FF, type = (offset_type >> 16) & 0xFF;
+      static const u32 kBases[5] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
+      if (type < 5) {
+        u32 guest = gw_gpu_to_guest(address);
+        for (u32 i = 0; i < dwords; ++i) write_register(kBases[type] + index + i, gw_load32(guest + i * 4));
+      }
+      break;
+    }
+    case 0x56: {  // SET_SHADER_CONSTANTS
+      u32 index = r.next() & 0xFFFF;
+      for (u32 i = 1; i < count; ++i) write_register(index + i - 1, r.next());
       break;
     }
     case 0x3F:
@@ -233,9 +270,14 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
       break;
     }
     case 0x22:
-    case 0x36:  // DRAW_INDX(_2)
+    case 0x36: {  // DRAW_INDX(_2)
       ++gw_stats.gpu_draws;
+      u32 words[16];
+      u32 n = count < 16 ? count : 16;
+      for (u32 i = 0; i < n; ++i) words[i] = r.next();
+      gw_capture_draw(opcode, words, n, g_regs);
       break;
+    }
     case 0x50: {  // SET_BIN_MASK
       u64 v = ((u64)r.next() << 32) | r.next();
       g_bin_mask_hi = (u32)(v >> 32);
