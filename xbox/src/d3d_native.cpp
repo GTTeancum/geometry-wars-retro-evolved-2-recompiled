@@ -71,3 +71,28 @@ extern "C" void sub_820A91A0(PPCContext& ctx, uint8_t* base) {
   }
   gw_store32(device + 48, out);
 }
+
+// Shader constant shadow writes (guest 0x820A6438 vertex, 0x820A6518 pixel):
+// r3 device, r4 first register, r5 source (any alignment), r6 count of
+// 16-byte constants, r7 64-bit dirty bits. The constants are copied into the
+// device's shadow at register 120 (vertex) or 376 (pixel) on, 16-byte
+// aligned (stvx), and the dirty bits ORed into the device's first (vertex)
+// or second (pixel) mask. The original copied through lvlx/lvrx/vor/stvx.
+namespace {
+void set_constants(PPCContext& ctx, u32 shadow_register, u32 mask_offset) {
+  const u32 device = ctx.r3.u32, count = ctx.r6.u32;
+  const u32 dst = (device + ((ctx.r4.u32 + shadow_register) << 4)) & ~15u;
+  memmove(gw_host(dst), gw_host(ctx.r5.u32), count * 16);
+  gw_store64(device + mask_offset, gw_load64(device + mask_offset) | ctx.r7.u64);
+}
+}  // namespace
+
+extern "C" void sub_820A6438(PPCContext& ctx, uint8_t* base) {
+  (void)base;
+  set_constants(ctx, 120, 0);
+}
+
+extern "C" void sub_820A6518(PPCContext& ctx, uint8_t* base) {
+  (void)base;
+  set_constants(ctx, 376, 8);
+}

@@ -54,6 +54,9 @@ extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_82075548(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_820A91A0(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_821308B8(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82096F30(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_820A6438(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_820A6518(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__sub_821308B8(PPCContext& ctx, uint8_t* base) { original_sub_821308B8(ctx, base); }
 // The constant upload's full-buffer helper: never reached (the test buffer has room).
 extern "C" void sub_820A87B0(PPCContext&, uint8_t*) { gw_fatal("sub_820A87B0 reached"); }
@@ -514,6 +517,74 @@ int main(int argc, char** argv) {
       }
     }
     printf("shader constant upload: %d of 2000 differ\n", differ);
+    if (differ) ++bad;
+  }
+
+  // Large-block copy (guest 0x82096F30): 128-aligned destination, any source
+  // alignment, multiples of 128 bytes; the copy and the pointers it returns.
+  {
+    constexpr u32 kSrc = 0xC0700000, kDst = 0xC0760000;
+    int differ = 0;
+    for (int n = 0; n < 500; ++n) {
+      for (u32 i = 0; i < 0x8000; i += 4) gw_store32(kSrc + i, (u32)rand() << 16 ^ (u32)rand());
+      const u32 src = kSrc + (u32)(rand() % 256), dst = kDst + 128 * (u32)(rand() % 8);
+      const u32 len = 128 * (u32)(1 + rand() % 40);
+      u8 want[0x8000];
+      u32 want_r3 = 0, want_r4 = 0;
+      for (int pass = 0; pass < 2; ++pass) {
+        memset(gw_host(kDst), 0xEE, 0x8000);
+        static PPCContext ctx;
+        ctx = PPCContext{};
+        ctx.r1.u64 = kStack;
+        ctx.r3.u64 = dst;
+        ctx.r4.u64 = src;
+        ctx.r5.u64 = len;
+        if (pass == 0) original_sub_82096F30(ctx, gw_host(0));
+        else sub_82096F30(ctx, gw_host(0));
+        if (pass == 0) {
+          memcpy(want, gw_host(kDst), 0x8000);
+          want_r3 = ctx.r3.u32;
+          want_r4 = ctx.r4.u32;
+        } else if (memcmp(want, gw_host(kDst), 0x8000) != 0 || want_r3 != ctx.r3.u32 || want_r4 != ctx.r4.u32) {
+          ++differ;
+        }
+      }
+    }
+    printf("large-block copy: %d of 500 differ\n", differ);
+    if (differ) ++bad;
+  }
+
+  // Shader constant shadows (guest 0x820A6438 vertex, 0x820A6518 pixel).
+  {
+    constexpr u32 kDevice = 0xC0700000, kSrc = 0xC0740000;
+    int differ = 0;
+    for (int n = 0; n < 1000; ++n) {
+      for (u32 i = 0; i < 0x1000; i += 4) gw_store32(kSrc + i, (u32)rand() << 16 ^ (u32)rand());
+      const u32 reg = (u32)(rand() % 128), count = (u32)(rand() % 40), src = kSrc + (u32)(rand() % 64);
+      u64 dirty = 0;
+      for (int b = 0; b < 4; ++b) dirty = dirty << 16 ^ (u64)(rand() & 0xFFFF);
+      static u8 want[0x10000];
+      for (int pass = 0; pass < 4; ++pass) {
+        memset(gw_host(kDevice), 0x5A, 0x10000);
+        static PPCContext ctx;
+        ctx = PPCContext{};
+        ctx.r1.u64 = kStack;
+        ctx.r3.u64 = kDevice;
+        ctx.r4.u64 = reg;
+        ctx.r5.u64 = src;
+        ctx.r6.u64 = count;
+        ctx.r7.u64 = dirty;
+        switch (pass) {
+          case 0: original_sub_820A6438(ctx, gw_host(0)); break;
+          case 1: sub_820A6438(ctx, gw_host(0)); break;
+          case 2: original_sub_820A6518(ctx, gw_host(0)); break;
+          case 3: sub_820A6518(ctx, gw_host(0)); break;
+        }
+        if (pass % 2 == 0) memcpy(want, gw_host(kDevice), 0x10000);
+        else if (memcmp(want, gw_host(kDevice), 0x10000) != 0) ++differ;
+      }
+    }
+    printf("shader constant shadows: %d of 2000 differ\n", differ);
     bad += differ;
   }
 

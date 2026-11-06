@@ -1,7 +1,9 @@
 """Sampling profile of the game on a development Xbox, through its debug
 monitor (xbdm, port 731).
 
-  python xbox/tools/xbdm_profile.py <console address> [seconds] [--top N] [--function NAME]
+  python xbox/tools/xbdm_profile.py <console address> [seconds] [--top N] [--function NAME] [--thread ID]
+
+--thread counts only that thread (xbdm's id, as the by-thread table prints).
 
 --function also prints the sampled addresses inside that function (as
 offsets from its start, for llvm-objdump --disassemble-symbols).
@@ -65,6 +67,8 @@ def main():
     addresses, names = load_symbols()
     x = xbdm_shot.Xbdm(host)
     threads = [int(t) for t in command(x, 'threads')[1:]]
+    if '--thread' in sys.argv:
+        threads = [int(sys.argv[sys.argv.index('--thread') + 1])]
     focus = sys.argv[sys.argv.index('--function') + 1] if '--function' in sys.argv else None
     inside = collections.Counter()
     by_function = collections.Counter()
@@ -72,7 +76,9 @@ def main():
     waiting = collections.Counter()
     rounds = 0
     end = time.time() + seconds
+    idle_rounds = 0  # rounds in which every thread was waiting: the CPU had nothing to do
     while time.time() < end:
+        running_before = sum(by_thread.values())
         for tid in threads:
             reply = command(x, f'getcontext thread={tid} control')
             regs = {l.split('=')[0]: int(l.split('=')[1], 16) for l in reply[1:] if '=' in l}
@@ -99,8 +105,11 @@ def main():
                 inside[eip - addresses[i]] += 1
             by_thread[tid] += 1
         rounds += 1
+        if sum(by_thread.values()) == running_before:
+            idle_rounds += 1
     total = sum(by_function.values())
-    print(f'{rounds} rounds, {total} samples in game code')
+    print(f'{rounds} rounds, {total} samples in game code; every thread waiting in {idle_rounds} rounds '
+          f'({100.0 * idle_rounds / max(rounds, 1):.0f}%)')
     print('by thread (samples running / waiting):')
     for tid in threads:
         print(f'  {tid:4d}: {by_thread[tid]:6d} / {waiting[tid]:6d}')
