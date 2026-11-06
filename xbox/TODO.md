@@ -96,6 +96,19 @@ order. Measurements are from XEMU at 64 MB unless noted.
       offset, size, rate 48000, 16-bit, mono) hold XMA (sizes in 2 KB
       packets), effects and music alike, so nothing plays without a decoder
       or a conversion; the game's sound engine then has to be fed PCM.
+- Plan: the game's XAudio2 decodes through the 360's XMA hardware (imports
+  only XMACreateContext / XMAReleaseContext; the contexts are driven through
+  the audio unit's registers). So:
+  1. the installer converts every WAVE (XMA) to PCM or Xbox ADPCM and writes
+     it next to the banks, with a table of (bank, offset) -> converted data;
+  2. the runtime emulates the XMA unit's registers and contexts: a context's
+     input buffer address lies inside a loaded bank, which names the wave, and
+     "decoding" copies the converted samples to the context's output buffer;
+  3. a render-driver thread calls the game's XAudio callback every 256
+     samples (48 kHz) and sends the mixed frames (6 channels, float) to the
+     AC97 through nxdk, mixed down to stereo 16-bit.
+  The mixer costs CPU every 5.3 ms, so this waits until the frame rate
+  allows it.
 
 ## 7. Windows installer
 
@@ -104,7 +117,7 @@ order. Measurements are from XEMU at 64 MB unless noted.
       extracts the package, writes and checks the game image, and fills the
       folder next to `default.xbe`. Its output matches the staged test disc.
 - [ ] Format conversions for the Xbox (audio) once sound needs them.
-- [ ] The extractor prints every file; quieter output.
+- [x] The extractor prints every file; the installer now hides that list.
 
 ## 8. Housekeeping
 

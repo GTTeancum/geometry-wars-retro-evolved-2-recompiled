@@ -43,7 +43,11 @@ $work = Join-Path ([IO.Path]::GetTempPath()) ('gw2-xbox-' + [Guid]::NewGuid().To
 try {
     Write-Host 'Extracting the package...'
     $extracted = Join-Path $work 'extracted'
-    [StfsExtract]::Run($pkg, $extracted) | Out-Null
+    # The extractor lists every file on the console; keep the installer quiet.
+    $console = [Console]::Out
+    [Console]::SetOut([IO.TextWriter]::Null)
+    try { [StfsExtract]::Run($pkg, $extracted) | Out-Null } finally { [Console]::SetOut($console) }
+    Write-Host ('  {0} files' -f (Get-ChildItem -LiteralPath $extracted -Recurse -File).Count)
 
     Write-Host 'Writing the game image...'
     $image = Join-Path $work 'default.image.bin'
