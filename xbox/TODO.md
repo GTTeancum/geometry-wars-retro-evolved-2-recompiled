@@ -27,6 +27,10 @@ order. Measurements are from XEMU at 64 MB unless noted.
       at every label (`src/gen/pch.h`, `tools/prepare_generated.py`): 27%
       faster recompiled code on the grid in the PC check. Not yet run in
       XEMU; if the game hangs or misbehaves after it, undo this first.
+- [ ] The memory base is a compile-time constant in the generated code
+      (`REX_HOST` in `src/gen/pch.h`): 5-9% faster grid code on the PC check
+      but 0.8 MB more XBE (8.3 -> 9.1 MB). Weigh it against memory once the
+      memory census shows the headroom; measure on the Pentium III.
 - [ ] Measure on real hardware: XEMU's speed is not the Xbox's.
 - [ ] Remaining hot spots after that (last profile): the grid job, now native
       (`src/grid_native.cpp`, about 10%); the particle job
