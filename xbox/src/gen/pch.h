@@ -127,6 +127,52 @@ extern PPCFuncMapping PPCFuncMappings[];
 
 // The Pentium III has no fused multiply-add; std::fma would be a slow exact
 // library routine. prepare_generated.py rewrites std::fma to this.
+// 16 bytes copied in reverse order: a vector register (kept byte-reversed in
+// host order) to or from guest memory. Replaces SIMDe's shuffle_epi8 with the
+// VectorMaskL table (xbox/tools/prepare_generated.py).
+static inline void gw_copy_reversed(void* dst, const void* src) {
+  u64 lo, hi;
+  __builtin_memcpy(&lo, src, 8);
+  __builtin_memcpy(&hi, (const u8*)src + 8, 8);
+  lo = __builtin_bswap64(lo);
+  hi = __builtin_bswap64(hi);
+  __builtin_memcpy(dst, &hi, 8);
+  __builtin_memcpy((u8*)dst + 8, &lo, 8);
+}
+
+// fctiwz/fctidz: double -> integer, truncating, as SSE2's cvttsd would (the
+// callers have already handled NaN and the upper limit). On the Pentium III
+// a C cast switches the x87 rounding mode twice, and the 64-bit one calls a
+// library routine; instead, adding 1.5 * 2^52 makes the FPU round x to an
+// integer held in the low mantissa bits (the volatile store rounds to double
+// precision whatever the x87 precision setting), then the result is moved
+// one towards zero where rounding went the other way.
+static inline i64 gw_round_magic(double x, double* rounded) {
+  constexpr double kMagic = 6755399441055744.0;  // 2^52 + 2^51
+  volatile double m = x + kMagic;
+  const double sum = m;
+  *rounded = sum - kMagic;
+  u64 bits;
+  __builtin_memcpy(&bits, &sum, 8);
+  return (i64)(bits & 0x000FFFFFFFFFFFFFull) - (1ll << 51);
+}
+
+static inline i32 gw_trunc_i32(double x) {
+  if (!(x > -2147483649.0)) return INT32_MIN;
+  double rounded;
+  i64 n = gw_round_magic(x, &rounded);
+  if (x >= 0 ? rounded > x : rounded < x) n += x >= 0 ? -1 : 1;
+  return (i32)n;
+}
+
+static inline i64 gw_trunc_i64(double x) {
+  if (!(__builtin_fabs(x) < 2251799813685248.0)) return simde_mm_cvttsd_si64(simde_mm_load_sd(&x));  // |x| >= 2^51
+  double rounded;
+  i64 n = gw_round_magic(x, &rounded);
+  if (x >= 0 ? rounded > x : rounded < x) n += x >= 0 ? -1 : 1;
+  return n;
+}
+
 static inline double gw_fma(double a, double b, double c) { return a * b + c; }
 static inline float gw_fma(float a, float b, float c) { return a * b + c; }
 

@@ -28,6 +28,11 @@ $(GEN_OBJS): NXDK_CXXFLAGS += -Ibuild/gen -O2
 # shader interpreter) into a call; the runtime gets the builtins back.
 $(RUNTIME_OBJS): NXDK_CXXFLAGS += -fbuiltin -mfpmath=sse
 
+# Compare the native grid update with the original now and then: make GRID_CHECK=y
+ifeq ($(GRID_CHECK),y)
+src/grid_native.obj: NXDK_CXXFLAGS += -DGW_GRID_CHECK
+endif
+
 # One-frame GPU capture buffer (xbox/tools/gpu_capture.py): make CAPTURE=y
 ifeq ($(CAPTURE),y)
 src/gpu_capture.obj: NXDK_CXXFLAGS += -DGW_CAPTURE -DGW_CAPTURE_SWAP=$(or $(CAPTURE_SWAP),120)

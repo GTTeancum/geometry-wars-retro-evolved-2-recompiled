@@ -9,6 +9,12 @@ into xbox/build/gen for nxdk.
   zeroed local r12: ReXGlue spills r14-r31 around those calls but not r12. So
   every function's r12 local starts from ctx.r12, and r12 is spilled with the
   rest before a funclet call.
+- Vector loads and stores (lvx/stvx) reverse the 16 bytes through SIMDe's
+  shuffle_epi8, which the Pentium III (no SSSE3) runs as a byte loop over a
+  mask table; they become gw_copy_reversed (four byte swaps, pch.h).
+- fctiwz/fctidz (SIMDe's emulated cvttsd) become gw_trunc_i32/i64, and
+  std::isnan the compiler builtin (nxdk builds without builtins, so it was a
+  library call).
 - generated *_register.cpp is skipped: the Xbox runtime fills its dispatch
   table from PPCFuncMappings instead.
 
@@ -24,6 +30,17 @@ SRC = ROOT / 'xbox' / 'build' / 'generated'
 DST = ROOT / 'xbox' / 'build' / 'gen'
 PCH = ROOT / 'xbox' / 'src' / 'gen' / 'pch.h'
 NAME = 'geometry_wars_retro_evolved_2'
+
+# store(dst, shuffle_epi8(load(src), VectorMaskL)): a vector register to or
+# from memory with its bytes reversed.
+_OPERAND = r'(REX_RAW_ADDR\(ea\)|(?:ctx\.)?v\d+\.u8)'
+REVERSED_COPY = re.compile(
+    r'simde_mm_store_si128\(\(simde__m128i\*\)' + _OPERAND +
+    r', simde_mm_shuffle_epi8\(simde_mm_load_si128\(\(simde__m128i\*\)' + _OPERAND +
+    r'\), simde_mm_load_si128\(\(simde__m128i\*\)VectorMaskL\)\)\);')
+
+# fctiwz/fctidz through SIMDe's SSE2 emulation -> gw_trunc_i32/i64 (pch.h).
+TRUNCATE = re.compile(r'simde_mm_cvttsd_si(32|64)\(simde_mm_load_sd\(&([\w.]+)\)\)')
 
 CONSTANTS = ('REX_IMAGE_BASE', 'REX_IMAGE_SIZE', 'REX_CODE_BASE', 'REX_CODE_SIZE',
              'REX_THUNK_RESERVE_SIZE', 'REXCRT_HEAP')
@@ -67,6 +84,9 @@ def main():
             text = text.replace('std::fma(', 'gw_fma(')
             text = text.replace('\tPPCRegister r12{};', '\tPPCRegister r12 = ctx.r12;')
             text = re.sub(r'(?m)^(\tctx\.r31 = r31;\n)(\tsub_[0-9A-F]+\(ctx, base\);)', r'\1\tctx.r12 = r12;\n\2', text)
+            text = REVERSED_COPY.sub(r'gw_copy_reversed(\1, \2);', text)
+            text = TRUNCATE.sub(r'gw_trunc_i\1(\2)', text)
+            text = text.replace('std::isnan(', '__builtin_isnan(')
         changed += write_if_changed(DST / src.name, text)
     for stale in DST.iterdir():
         if stale.suffix in ('.cpp', '.h') and stale.name not in wanted:
