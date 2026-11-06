@@ -10,6 +10,8 @@
      dump_image.exe, and checks that it is the supported version.
   3. Copies the game's files next to default.xbe in the output folder, ready
      to copy to the Xbox (or to build a disc image from).
+  4. Converts the sounds from XMA to IMA ADPCM (audio\<bank>.adpcm), with
+     ffmpeg from PATH or ffmpeg.exe next to this script.
 
   The output folder must be new or empty. Nothing is written anywhere else
   except a temporary folder, removed at the end.
@@ -26,7 +28,7 @@ $here = $PSScriptRoot
 $titleId = [uint32]'0x584108FF'
 $imageSha256 = '4168A02A62542D32660E63EFDE3244BB423D593C288402F177BF5E6F8C33B901'
 
-foreach ($file in 'default.xbe', 'StfsExtract.cs', 'dump_image.exe', 'rexruntime.dll') {
+foreach ($file in 'default.xbe', 'StfsExtract.cs', 'SoundConvert.cs', 'dump_image.exe', 'rexruntime.dll') {
     if (-not (Test-Path -LiteralPath (Join-Path $here $file))) { throw "$file is missing from $here; unpack the whole installer first." }
 }
 $pkg = (Resolve-Path -LiteralPath $Package).Path
@@ -63,6 +65,19 @@ try {
     New-Item -ItemType Directory -Force (Join-Path $out 'gw2') | Out-Null
     Copy-Item -LiteralPath $image -Destination (Join-Path $out 'gw2\default.image.bin')
     Copy-Item -LiteralPath (Join-Path $here 'default.xbe') -Destination (Join-Path $out 'default.xbe')
+
+    # The Xbox has no XMA: the sounds become IMA ADPCM, through ffmpeg (on
+    # PATH, or ffmpeg.exe next to this script).
+    $ffmpeg = Join-Path $here 'ffmpeg.exe'
+    if (-not (Test-Path -LiteralPath $ffmpeg)) { $ffmpeg = (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }
+    if ($ffmpeg) {
+        Write-Host 'Converting the sounds (several minutes)...'
+        Add-Type -Path (Join-Path $here 'SoundConvert.cs')
+        $sounds = [SoundConvert]::Run($ffmpeg, (Join-Path $extracted 'audio'), (Join-Path $out 'audio'))
+        Write-Host "  $sounds sounds converted"
+    } else {
+        Write-Warning 'ffmpeg was not found, so the sounds were not converted (the game runs silent). Install ffmpeg (https://ffmpeg.org) or put ffmpeg.exe next to install.ps1, then run the installer again.'
+    }
     Write-Host "Done: copy the contents of $out to a folder on the Xbox and run default.xbe."
 } finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue

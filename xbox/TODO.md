@@ -98,31 +98,28 @@ order. Measurements are from XEMU at 64 MB unless noted.
 
 ## 6. Sound
 
-- [ ] Audio output (XAudio render driver callback) and the game's XMA music
-      and effects: decode XMA on the Xbox or convert in the installer.
-      The banks (`audio\*.baf`: BANK, then 0x5C-byte WAVE records with
-      offset, size, rate 48000, 16-bit, mono) hold XMA (sizes in 2 KB
-      packets), effects and music alike, so nothing plays without a decoder
-      or a conversion; the game's sound engine then has to be fed PCM.
-- Plan: the game's XAudio2 decodes through the 360's XMA hardware (imports
-  only XMACreateContext / XMAReleaseContext; the contexts are driven through
-  the audio unit's registers). So:
-  1. the installer converts every WAVE (XMA) to PCM or Xbox ADPCM and writes
-     it next to the banks, with a table of (bank, offset) -> converted data;
-  2. the runtime emulates the XMA unit's registers and contexts: a context's
-     input buffer address lies inside a loaded bank, which names the wave, and
-     "decoding" copies the converted samples to the context's output buffer;
-  3. a render-driver thread calls the game's XAudio callback every 256
-     samples (48 kHz) and sends the mixed frames (6 channels, float) to the
-     AC97 through nxdk, mixed down to stereo 16-bit.
-  The mixer costs CPU every 5.3 ms, so this waits until the frame rate
-  allows it.
-- Checked: `xbox\tools\bank_to_wav.py` wraps each WAVE as XMA2 RIFF and
-  ffmpeg 8 decodes all of them: 8 banks, 1565 s of 48 kHz mono, 264 MB as
-  16-bit PCM. Too much for memory, so the converted banks stay on disc and
-  play through the disc-backed pages (Xbox ADPCM, 4:1, would be about 66 MB).
-  The music is sequenced from these samples (Song_N.dat + SongNBank.baf).
-  The installer would need ffmpeg (or our own XMA decoder).
+No XMA on the Xbox: the installer converts every sound to IMA ADPCM.
+
+- [x] `installer\SoundConvert.cs` (and `tools\convert_banks.py`, the same for
+      development): each wave of the banks (`audio\*.baf`; WAVE records of
+      0x5C or 0x50 bytes) goes through ffmpeg once into 4-bit IMA ADPCM, written
+      as `audio\<bank>.adpcm` next to the untouched banks, with a table keyed
+      by each wave's place in its bank. 265 sounds, 1846 s, 76 MB (the XMA was
+      38 MB); about 18 dB signal to noise on the noisiest effects. Needs
+      ffmpeg on the player's PC (or ffmpeg.exe next to the installer); takes
+      about 8 minutes.
+- [ ] Runtime: the game's XAudio2 decodes through the 360's XMA unit (only
+      XMACreateContext / XMAReleaseContext are imports; contexts are driven
+      through the audio unit's registers). Emulate the unit: a context's input
+      address lies in a loaded bank, which names the wave; "decoding" writes
+      that wave's ADPCM samples (decoded, 16-bit) to the context's output.
+      The ADPCM files stay on disc and are read as the sounds play.
+- [ ] A render-driver thread calls the game's XAudio callback every 256
+      samples (48 kHz) and sends the mixed frames (6 channels, float) to the
+      AC97 through nxdk, mixed to stereo 16-bit. The mixer costs CPU every
+      5.3 ms, so this waits until the frame rate allows it.
+- [ ] Music is sequenced from the song banks' samples (Song_N.dat), so the
+      same path plays it.
 
 ## 7. Windows installer
 
@@ -130,7 +127,7 @@ order. Measurements are from XEMU at 64 MB unless noted.
       zip): `install.cmd <LIVE package> <new folder>` checks the title,
       extracts the package, writes and checks the game image, and fills the
       folder next to `default.xbe`. Its output matches the staged test disc.
-- [ ] Format conversions for the Xbox (audio) once sound needs them.
+- [x] Sound conversion (section 6).
 - [x] The extractor prints every file; the installer now hides that list.
 
 ## 8. Housekeeping
