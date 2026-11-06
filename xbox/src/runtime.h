@@ -111,6 +111,14 @@ struct GwStats {
 };
 extern GwStats gw_stats;
 
+// The Xbox kernel's current thread (KPCR Prcb.CurrentThread, fs:[0x28]), to
+// match profiler samples to threads.
+inline u32 gw_kthread() {
+  u32 thread;
+  __asm__ volatile("movl %%fs:0x28, %0" : "=r"(thread));
+  return thread;
+}
+
 // Wait timing by call site (src/wait_stats.cpp).
 u64 gw_wait_begin();
 void gw_wait_end(u64 start, u32 caller, const char* what);

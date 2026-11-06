@@ -369,6 +369,7 @@ void execute(Reader& r, u32 end, PPCContext& ctx) {
 }
 
 DWORD WINAPI command_thread(LPVOID) {
+  gw_log("command processor: host thread %u, kernel thread %08X\n", (u32)GetCurrentThreadId(), gw_kthread());
   PPCContext& ctx = *gw_make_callback_context();
   gw_nv2a_init();  // pbkit is driven from this thread only
   for (;;) {
@@ -396,6 +397,7 @@ DWORD WINAPI command_thread(LPVOID) {
 }
 
 DWORD WINAPI vblank_thread(LPVOID) {
+  gw_log("vblank: host thread %u, kernel thread %08X\n", (u32)GetCurrentThreadId(), gw_kthread());
   PPCContext& ctx = *gw_make_callback_context();
   LARGE_INTEGER frequency, next, now;
   QueryPerformanceFrequency(&frequency);
