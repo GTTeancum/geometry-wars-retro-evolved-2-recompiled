@@ -14,9 +14,27 @@ namespace {
 
 constexpr int kMaxInstructions = 64;
 
+// Instructions decoded once at load; the per-vertex loop only does maths.
+struct Source {
+  bool temp;     // temporary register, else constant
+  bool absolute;
+  bool negate;
+  u8 index;
+  u8 swizzle[4];  // component read for each result component
+};
+
 struct Instruction {
   bool fetch;
-  u32 w[3];
+  // vertex fetch
+  bool mini, is_signed, normalized;
+  u8 dst, src, src_component, format;
+  u16 slot;
+  u32 stride, offset;
+  u8 dst_select[4];  // 0-3 component, 4 zero, 5 one, 7 keep
+  // ALU
+  bool predicated, pred_condition, export_data, vclamp, sclamp;
+  u8 vop, sop, vdst, sdst, vmask, smask;
+  Source s[3];
 };
 
 struct Program {
@@ -115,7 +133,61 @@ int fetch_element(u32 address, u32 endian, u32 format, bool is_signed, bool norm
   }
 }
 
+// floorf without the library call (|v| < 2^31 here).
+inline float fast_floor(float v) {
+  float f = (float)(int)v;
+  return f > v ? f - 1.0f : f;
+}
+
 inline float swz(const float* v, u32 sw, int i) { return v[(bits(sw, i * 2, 2) + i) & 3]; }
+
+void decode(Instruction& in, bool fetch, const u32* w) {
+  in = {};
+  in.fetch = fetch;
+  if (fetch) {
+    if (bits(w[0], 0, 5) != 0) {  // texture fetch: unused in vertex shaders
+      in.format = 0xFF;
+      return;
+    }
+    in.dst = (u8)bits(w[0], 12, 6);
+    in.src = (u8)bits(w[0], 5, 6);
+    in.src_component = (u8)bits(w[0], 30, 2);
+    in.mini = bits(w[1], 30, 1);
+    in.format = (u8)bits(w[1], 16, 6);
+    in.is_signed = bits(w[1], 13, 1);
+    in.normalized = !bits(w[1], 12, 1);
+    in.offset = bits(w[2], 8, 23) * 4;
+    in.stride = bits(w[2], 0, 8) * 4;
+    in.slot = (u16)(bits(w[0], 20, 5) * 3 + bits(w[0], 25, 2));
+    for (int c = 0; c < 4; ++c) in.dst_select[c] = (u8)bits(w[1], c * 3, 3);
+    return;
+  }
+  u32 d0 = w[0], d1 = w[1], d2 = w[2];
+  in.predicated = bits(d1, 27, 1);
+  in.pred_condition = bits(d1, 28, 1);
+  in.vdst = (u8)bits(d0, 0, 6);
+  in.sdst = (u8)bits(d0, 8, 6);
+  in.export_data = bits(d0, 15, 1);
+  in.vmask = (u8)bits(d0, 16, 4);
+  in.smask = (u8)bits(d0, 20, 4);
+  in.vclamp = bits(d0, 24, 1);
+  in.sclamp = bits(d0, 25, 1);
+  in.sop = (u8)bits(d0, 26, 6);
+  in.vop = (u8)bits(d2, 24, 5);
+  bool abs_const = bits(d0, 7, 1);
+  const u32 swz[3] = {bits(d1, 16, 8), bits(d1, 8, 8), bits(d1, 0, 8)};
+  const bool neg[3] = {(bool)bits(d1, 26, 1), (bool)bits(d1, 25, 1), (bool)bits(d1, 24, 1)};
+  const u32 reg[3] = {bits(d2, 16, 8), bits(d2, 8, 8), bits(d2, 0, 8)};
+  const bool sel[3] = {(bool)bits(d2, 31, 1), (bool)bits(d2, 30, 1), (bool)bits(d2, 29, 1)};
+  for (int s = 0; s < 3; ++s) {
+    Source& src = in.s[s];
+    src.temp = sel[s];
+    src.index = (u8)(sel[s] ? (reg[s] & 0x3F) : reg[s]);
+    src.absolute = sel[s] ? (reg[s] & 0x80) != 0 : abs_const;
+    src.negate = neg[s];
+    for (int c = 0; c < 4; ++c) src.swizzle[c] = (u8)((bits(swz[s], c * 2, 2) + c) & 3);
+  }
+}
 
 }  // namespace
 
@@ -130,7 +202,7 @@ const XvsProgram* xvs_load(u32 hash, u32 guest_words, u32 dwords) {
   p.hash = hash;
   p.count = 0;
   walk(words, dwords, [&](bool fetch, const u32* w) {
-    if (p.count < kMaxInstructions) p.ins[p.count++] = {fetch, {w[0], w[1], w[2]}};
+    if (p.count < kMaxInstructions) decode(p.ins[p.count++], fetch, w);
   });
   ++g_program_count;
   return (const XvsProgram*)&p;
@@ -170,83 +242,55 @@ bool xps_info(u32 hash, int* uv_interpolator, int* texture_const) {
 
 bool xvs_run(const XvsProgram* program, const u32* regs, u32 vertex_index, float pos[4], float interp[8][4]) {
   const Program& p = *(const Program*)program;
+  typedef float __attribute__((__may_alias__)) alias_float;
+  const alias_float* consts = (const alias_float*)&regs[0x4000];
   // Shaders write a temporary before reading it; only r0 (the vertex index)
-  // needs a value. Clearing all 64 per vertex cost a quarter of the frame.
+  // needs a value.
   float r[64][4];
   r[0][0] = (float)vertex_index;
   r[0][1] = r[0][2] = r[0][3] = 0;
   float prev_scalar = 0;
   bool predicate = false;
-  u32 last_fetch_address = 0, last_fetch_stride = 0, last_fetch_endian = 0;
+  u32 fetch_address = 0, fetch_endian = 0;
   pos[0] = pos[1] = pos[2] = 0;
   pos[3] = 1;
   for (int i = 0; i < 8; ++i) interp[i][0] = interp[i][1] = interp[i][2] = 0, interp[i][3] = 1;
 
   for (int n = 0; n < p.count; ++n) {
-    const u32* w = p.ins[n].w;
-    if (p.ins[n].fetch) {
-      if (bits(w[0], 0, 5) != 0) continue;  // texture fetch in a vertex shader
-      u32 dst = bits(w[0], 12, 6), src = bits(w[0], 5, 6);
-      bool mini = bits(w[1], 30, 1);
-      u32 format = bits(w[1], 16, 6);
-      bool is_signed = bits(w[1], 13, 1), normalized = !bits(w[1], 12, 1);
-      u32 offset = bits(w[2], 8, 23) * 4;
-      if (!mini) {
-        u32 slot = bits(w[0], 20, 5) * 3 + bits(w[0], 25, 2);
-        u32 f0 = regs[0x4800 + slot * 2], f1 = regs[0x4800 + slot * 2 + 1];
-        last_fetch_address = gw_gpu_to_guest(f0 & ~3u);
-        last_fetch_endian = f1 & 3;
-        last_fetch_stride = bits(w[2], 0, 8) * 4;
-        u32 index = (u32)r[src][bits(w[0], 30, 2)];
-        last_fetch_address += index * last_fetch_stride;
+    const Instruction& in = p.ins[n];
+    if (in.fetch) {
+      if (in.format == 0xFF) continue;
+      if (!in.mini) {
+        u32 f0 = regs[0x4800 + in.slot * 2], f1 = regs[0x4800 + in.slot * 2 + 1];
+        fetch_endian = f1 & 3;
+        u32 index = (u32)r[in.src][in.src_component];
+        fetch_address = gw_gpu_to_guest(f0 & ~3u) + index * in.stride;
       }
       float v[4];
-      fetch_element(last_fetch_address + offset, last_fetch_endian, format, is_signed, normalized, v);
-      u32 dst_swz = bits(w[1], 0, 12);
+      fetch_element(fetch_address + in.offset, fetch_endian, in.format, in.is_signed, in.normalized, v);
       for (int c = 0; c < 4; ++c) {
-        u32 s = bits(dst_swz, c * 3, 3);
+        u8 s = in.dst_select[c];
         if (s == 7) continue;  // keep
-        r[dst][c] = s < 4 ? v[s] : s == 4 ? 0.0f : 1.0f;
+        r[in.dst][c] = s < 4 ? v[s] : s == 4 ? 0.0f : 1.0f;
       }
       continue;
     }
 
-    // ALU
-    u32 d0 = w[0], d1 = w[1], d2 = w[2];
-    bool predicated = bits(d1, 27, 1);
-    if (predicated && predicate != (bool)bits(d1, 28, 1)) continue;
-    u32 vdst = bits(d0, 0, 6), sdst = bits(d0, 8, 6);
-    bool export_data = bits(d0, 15, 1);
-    u32 vmask = bits(d0, 16, 4), smask = bits(d0, 20, 4);
-    bool vclamp = bits(d0, 24, 1), sclamp = bits(d0, 25, 1);
-    u32 sop = bits(d0, 26, 6), vop = bits(d2, 24, 5);
-    bool abs_const = bits(d0, 7, 1);
-    u32 swz_bits[3] = {bits(d1, 16, 8), bits(d1, 8, 8), bits(d1, 0, 8)};
-    bool neg[3] = {(bool)bits(d1, 26, 1), (bool)bits(d1, 25, 1), (bool)bits(d1, 24, 1)};
-    u32 reg[3] = {bits(d2, 16, 8), bits(d2, 8, 8), bits(d2, 0, 8)};
-    bool sel[3] = {(bool)bits(d2, 31, 1), (bool)bits(d2, 30, 1), (bool)bits(d2, 29, 1)};
+    if (in.predicated && predicate != in.pred_condition) continue;
     float src[3][4];
     for (int s = 0; s < 3; ++s) {
-      float raw[4];
-      bool absolute;
-      if (sel[s]) {
-        memcpy(raw, r[reg[s] & 0x3F], 16);
-        absolute = reg[s] & 0x80;
-      } else {
-        for (int c = 0; c < 4; ++c) raw[c] = as_float(regs[0x4000 + reg[s] * 4 + c]);
-        absolute = abs_const;
-      }
+      const Source& so = in.s[s];
+      const float* raw = so.temp ? r[so.index] : (const float*)&consts[so.index * 4];
       for (int c = 0; c < 4; ++c) {
-        float v = swz(raw, swz_bits[s], c);
-        if (absolute) v = fabsf(v);
-        if (neg[s]) v = -v;
-        src[s][c] = v;
+        float v = raw[so.swizzle[c]];
+        if (so.absolute) v = fabsf(v);
+        src[s][c] = so.negate ? -v : v;
       }
     }
     // Vector op
     float vr[4] = {0, 0, 0, 0};
     const float *a = src[0], *b = src[1], *c3 = src[2];
-    switch (vop) {
+    switch (in.vop) {
       case 0: for (int c = 0; c < 4; ++c) vr[c] = a[c] + b[c]; break;
       case 1: for (int c = 0; c < 4; ++c) vr[c] = a[c] * b[c]; break;
       case 2: for (int c = 0; c < 4; ++c) vr[c] = a[c] >= b[c] ? a[c] : b[c]; break;
@@ -255,9 +299,9 @@ bool xvs_run(const XvsProgram* program, const u32* regs, u32 vertex_index, float
       case 5: for (int c = 0; c < 4; ++c) vr[c] = a[c] > b[c] ? 1.0f : 0.0f; break;
       case 6: for (int c = 0; c < 4; ++c) vr[c] = a[c] >= b[c] ? 1.0f : 0.0f; break;
       case 7: for (int c = 0; c < 4; ++c) vr[c] = a[c] != b[c] ? 1.0f : 0.0f; break;
-      case 8: for (int c = 0; c < 4; ++c) vr[c] = a[c] - floorf(a[c]); break;
+      case 8: for (int c = 0; c < 4; ++c) vr[c] = a[c] - fast_floor(a[c]); break;
       case 9: for (int c = 0; c < 4; ++c) vr[c] = truncf(a[c]); break;
-      case 10: for (int c = 0; c < 4; ++c) vr[c] = floorf(a[c]); break;
+      case 10: for (int c = 0; c < 4; ++c) vr[c] = fast_floor(a[c]); break;
       case 11: for (int c = 0; c < 4; ++c) vr[c] = a[c] * b[c] + c3[c]; break;
       case 12: for (int c = 0; c < 4; ++c) vr[c] = a[c] == 0.0f ? b[c] : c3[c]; break;
       case 13: for (int c = 0; c < 4; ++c) vr[c] = a[c] >= 0.0f ? b[c] : c3[c]; break;
@@ -271,17 +315,14 @@ bool xvs_run(const XvsProgram* program, const u32* regs, u32 vertex_index, float
         vr[0] = vr[1] = vr[2] = vr[3] = m;
         break;
       }
-      case 20: case 21: case 22: case 23: break;  // setp_*_push: predicates unused here
-      default: break;
+      default: break;  // setp_*_push and kill ops: unused by the vertex shaders
     }
-    if (vclamp) for (int c = 0; c < 4; ++c) vr[c] = vr[c] < 0 ? 0 : vr[c] > 1 ? 1 : vr[c];
+    if (in.vclamp) for (int c = 0; c < 4; ++c) vr[c] = vr[c] < 0 ? 0 : vr[c] > 1 ? 1 : vr[c];
 
-    // Scalar op: one operand is src3's swizzled .w (component 3); two
-    // operands are .w and .x.
+    // Scalar op: one operand is src3's swizzled .w; two operands are .w, .x.
     float sa = src[2][3], sb = src[2][0];
     float sr = prev_scalar;
-    bool scalar_write = smask != 0;
-    switch (sop) {
+    switch (in.sop) {
       case 0: sr = sa + sb; break;
       case 1: sr = sa + prev_scalar; break;
       case 2: sr = sa * sb; break;
@@ -292,9 +333,9 @@ bool xvs_run(const XvsProgram* program, const u32* regs, u32 vertex_index, float
       case 8: sr = sa > 0.0f ? 1.0f : 0.0f; break;
       case 9: sr = sa >= 0.0f ? 1.0f : 0.0f; break;
       case 10: sr = sa != 0.0f ? 1.0f : 0.0f; break;
-      case 11: sr = sa - floorf(sa); break;
+      case 11: sr = sa - fast_floor(sa); break;
       case 12: sr = truncf(sa); break;
-      case 13: sr = floorf(sa); break;
+      case 13: sr = fast_floor(sa); break;
       case 14: sr = exp2f(sa); break;
       case 15: case 16: sr = log2f(sa); break;
       case 17: case 18: case 19: sr = 1.0f / sa; break;
@@ -308,29 +349,29 @@ bool xvs_run(const XvsProgram* program, const u32* regs, u32 vertex_index, float
       case 40: sr = sqrtf(sa); break;
       case 48: sr = sinf(sa); break;
       case 49: sr = cosf(sa); break;
-      case 50: sr = prev_scalar; break;  // retain_prev
-      default: break;
+      default: break;  // retain_prev and the rest keep the previous result
     }
-    if (sclamp) sr = sr < 0 ? 0 : sr > 1 ? 1 : sr;
+    if (in.sclamp) sr = sr < 0 ? 0 : sr > 1 ? 1 : sr;
     prev_scalar = sr;
 
-    auto write = [&](u32 dst, u32 mask, const float* value) {
-      float* out;
-      if (export_data) {
-        if (dst == 62) out = pos;
-        else if (dst < 8) out = interp[dst];
-        else return;
-      } else {
-        out = r[dst];
-      }
-      for (int c = 0; c < 4; ++c) {
-        if (mask & (1u << c)) out[c] = value[c];
-      }
+    auto target = [&](u32 dst) -> float* {
+      if (!in.export_data) return r[dst];
+      if (dst == 62) return pos;
+      return dst < 8 ? interp[dst] : nullptr;
     };
-    if (vmask) write(vdst, vmask, vr);
-    if (scalar_write) {
-      float s4[4] = {sr, sr, sr, sr};
-      write(sdst, smask, s4);
+    if (in.vmask) {
+      if (float* out = target(in.vdst)) {
+        for (int c = 0; c < 4; ++c) {
+          if (in.vmask & (1u << c)) out[c] = vr[c];
+        }
+      }
+    }
+    if (in.smask) {
+      if (float* out = target(in.sdst)) {
+        for (int c = 0; c < 4; ++c) {
+          if (in.smask & (1u << c)) out[c] = sr;
+        }
+      }
     }
   }
   return true;

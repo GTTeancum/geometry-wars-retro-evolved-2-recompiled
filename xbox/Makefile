@@ -25,7 +25,7 @@ $(GEN_OBJS): NXDK_CXXFLAGS += -Ibuild/gen -Os
 
 # nxdk passes -fno-builtin, which turns every small memcpy (gw_load32, the
 # shader interpreter) into a call; the runtime gets the builtins back.
-$(RUNTIME_OBJS): NXDK_CXXFLAGS += -fbuiltin
+$(RUNTIME_OBJS): NXDK_CXXFLAGS += -fbuiltin -mfpmath=sse
 
 # One-frame GPU capture buffer (xbox/tools/gpu_capture.py): make CAPTURE=y
 ifeq ($(CAPTURE),y)
