@@ -117,6 +117,12 @@ order. Measurements are from XEMU at 64 MB unless noted.
      AC97 through nxdk, mixed down to stereo 16-bit.
   The mixer costs CPU every 5.3 ms, so this waits until the frame rate
   allows it.
+- Checked: `xbox\tools\bank_to_wav.py` wraps each WAVE as XMA2 RIFF and
+  ffmpeg 8 decodes all of them: 8 banks, 1565 s of 48 kHz mono, 264 MB as
+  16-bit PCM. Too much for memory, so the converted banks stay on disc and
+  play through the disc-backed pages (Xbox ADPCM, 4:1, would be about 66 MB).
+  The music is sequenced from these samples (Song_N.dat + SongNBank.baf).
+  The installer would need ffmpeg (or our own XMA decoder).
 
 ## 7. Windows installer
 
