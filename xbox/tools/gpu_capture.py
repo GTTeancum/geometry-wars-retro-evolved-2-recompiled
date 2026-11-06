@@ -1,6 +1,7 @@
 """Save and decode the one-frame GPU capture (xbox/src/gpu_capture.cpp).
 
   python xbox/tools/gpu_capture.py [--port 9257] [--out xbox/test-artifacts/gpu]
+  python xbox/tools/gpu_capture.py --xbdm 10.0.0.231 --out ...   (a development Xbox)
 
 Writes capture.bin, one shader_<type>_<address>.bin per shader, and
 report.txt (one line per draw with the state that matters for rendering).
@@ -11,6 +12,7 @@ import pathlib
 import re
 import socket
 import struct
+import sys
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -58,6 +60,24 @@ class Monitor:
         return int(found[0], 16) if found else None  # None until the XBE is loaded
 
 
+class XbdmMonitor:
+    """The same reads through a development Xbox's debug monitor."""
+
+    def __init__(self, host):
+        sys.path.insert(0, str(ROOT / 'xbox' / 'tools'))
+        import xbdm_shot
+        self.xbdm = xbdm_shot.Xbdm(host)
+
+    def word(self, address):
+        return struct.unpack('<I', self.xbdm.getmem(address, 4))[0]
+
+    def save(self, address, size, target):
+        data = bytearray()
+        for offset in range(0, size, 0x8000):
+            data += self.xbdm.getmem(address + offset, min(0x8000, size - offset))
+        target.write_bytes(bytes(data))
+
+
 def decode(words, out):
     regs = {}
     shaders = {}
@@ -101,6 +121,10 @@ def decode(words, out):
             surface = regs.get(0x2000, 0)
             color = regs.get(0x2001, 0)
             blend = regs.get(0x2201, 0)
+            extra = ''
+            if mode == 6:  # resolve: where the copy goes
+                extra = (f' copy_ctl={regs.get(0x2318, 0):08X} dest={regs.get(0x2319, 0):08X} '
+                         f'dest_pitch={regs.get(0x231A, 0):08X} dest_info={regs.get(0x231B, 0):08X}')
             textures = []
             for slot in range(16):
                 f = [regs.get(0x4800 + slot * 6 + j, 0) for j in range(6)]
@@ -112,7 +136,7 @@ def decode(words, out):
             lines.append(
                 f'{draws:4d} {PRIMS.get(prim, prim)!s:10} {SOURCES.get(source, source):9} n={count:5d} '
                 f'vs={vs:08X} ps={ps:08X} mode={mode} surf={surface:08X} color={color:08X} '
-                f'blend={blend:08X} {" ".join(textures)}')
+                f'blend={blend:08X} {" ".join(textures)}{extra}')
             stats[(vs, ps)] += 1
             draws += 1
         elif tag == 0x50415753:  # SWAP
@@ -148,6 +172,7 @@ def save_shaders(mon, base, out):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=9257)
+    parser.add_argument('--xbdm', help='a development Xbox address instead of XEMU')
     parser.add_argument('--out', type=pathlib.Path, default=ROOT / 'xbox' / 'test-artifacts' / 'gpu')
     parser.add_argument('--shaders', action='store_true',
                         help='save every distinct shader loaded so far (gw_shader_dump), named by hash')
@@ -158,7 +183,7 @@ def main():
         save_shaders(Monitor(args.port), symbol(map_text, 'gw_shader_dump'), args.out)
         return
     base = symbol(map_text, 'gw_capture')
-    mon = Monitor(args.port)
+    mon = XbdmMonitor(args.xbdm) if args.xbdm else Monitor(args.port)
     for _ in range(180):
         if mon.word(base) == 0x50414347 and mon.word(base + 4) == 2:
             break
@@ -167,8 +192,11 @@ def main():
         raise SystemExit(f'capture not finished (state {mon.word(base + 4)})')
     used = mon.word(base + 8)
     target = (args.out / 'capture.bin').resolve()
-    mon.command(f'memsave 0x{base + 12:x} {used * 4} "{target.as_posix()}"')
-    time.sleep(1)
+    if args.xbdm:
+        mon.save(base + 12, used * 4, target)
+    else:
+        mon.command(f'memsave 0x{base + 12:x} {used * 4} "{target.as_posix()}"')
+        time.sleep(1)
     data = target.read_bytes()
     words = list(struct.unpack(f'<{len(data) // 4}I', data))
     decode(words, args.out)

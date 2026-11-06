@@ -224,9 +224,10 @@ Variant g_variants[48];
 
 }  // namespace
 
-const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool divide, int line_i) {
+const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool divide, int line_i, bool scale_colour) {
   const Program& p = *(const Program*)xvs;
-  u32 key = p.hash ^ (u32)(uv_i + 2) << 4 ^ (u32)(color_i + 2) << 8 ^ (u32)divide << 12 ^ (u32)(line_i + 2) << 16;
+  u32 key = p.hash ^ (u32)(uv_i + 2) << 4 ^ (u32)(color_i + 2) << 8 ^ (u32)divide << 12 ^ (u32)(line_i + 2) << 16 ^
+            (u32)scale_colour << 20;
   for (Variant& v : g_variants) {
     if (v.used && v.program.key == key) return v.program.ok ? &v.program : nullptr;
   }
@@ -436,23 +437,34 @@ const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool div
         d = b.to_temp(dst, mask);
       }
       if (dst == line_i && in.export_data) {
-        // A grid line's (u, v, brightness, edge): colour 1 holds the line
-        // colour (rgb) and 0.5. Diffuse rgb = min((colour * brightness)^2,
-        // 1), the game's pixel shader with its colour map held constant;
-        // diffuse alpha = edge / 2 + 1/2 (edge runs -1 to 1 across the
-        // line), turned into the soft line profile per pixel by the line
-        // combiner in src/nv2a.cpp. Needs brightness and edge in one write.
+        // A grid line's (u, v, brightness, edge), u and v the line's place in
+        // the colour field (0-1). Constant 1 holds the brightness scale (rgb)
+        // and 0.5: diffuse rgb = brightness * scale, diffuse alpha = edge / 2
+        // + 1/2 (edge runs -1 to 1 across the line); texture coordinate 0 =
+        // (u, v) times constant 0's z, w (the field's size in texels), with
+        // q = 1. The line combiner in src/nv2a.cpp does the game's pixel
+        // shader with those. Needs brightness and edge in one write.
         if ((mask & 0xC) != 0xC) return;
-        b.mac(MUL, replicate(value, 2), cnst(1, "xyzw"), Op(), b.to_temp(kS0));
-        b.mac(MUL, temp(kS0), temp(kS0), Op(), b.to_temp(kS0));
         Builder::Dest rgb;
         rgb.output = kOutD0;
         rgb.out_mask = 7;
-        b.mac(MIN, temp(kS0), cnst(0, "yyyy"), Op(), rgb);
+        b.mac(MUL, replicate(value, 2), cnst(1, "xyzw"), Op(), rgb);
         Builder::Dest alpha;
         alpha.output = kOutD0;
         alpha.out_mask = 8;
         b.mac(MAD, replicate(value, 3), cnst(1, "wwww"), cnst(1, "wwww"), alpha);
+        if ((mask & 3) == 3) {
+          Builder::Dest uv;
+          uv.output = kOutT0;
+          uv.out_mask = 3;
+          b.mac(MUL, value, cnst(0, "zwyy"), Op(), uv);
+        }
+        return;
+      }
+      if (d.output == kOutD0 && scale_colour) {
+        // Colours brighter than 1 (the grid's colour field) scaled by
+        // constant 1 before the NV2A clamps them.
+        b.mac(MUL, value, cnst(1, "xyzw"), Op(), d);
         return;
       }
       if (d.output == kOutT0) {

@@ -65,6 +65,9 @@ void blk_end(u32* p) {
 // Draw with translated NV2A vertex programs (else the CPU interpreter).
 bool g_use_gpu_vertex = true;
 float g_scale_x, g_scale_y;
+// Viewport scale for the current target: g_scale_x/y for the screen, the
+// colour field's own size for its splats (see the colour field below).
+float g_target_scale_x, g_target_scale_y;
 // Our own glow over each frame (on unless make GLOW=n; see apply_glow).
 #ifdef GW_GLOW
 constexpr bool kGlow = true;
@@ -141,7 +144,8 @@ u32 nv_format(u32 w, u32 h, u32 colour = NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G
 // which keeps their full resolution in a quarter of the memory.
 Texture* texture_from_fetch(const u32* f) {
   u32 format = f[1] & 0x3F;
-  if (format != 6) {
+  // 6: k_8_8_8_8; 2: k_8 (one byte, e.g. the grid colour field's light spot).
+  if (format != 6 && format != 2) {
     static u32 reported[8];
     bool seen = false;
     for (u32 r : reported) seen |= r == (format | 0x100);
@@ -159,7 +163,7 @@ Texture* texture_from_fetch(const u32* f) {
   }
   u32 base = f[1] & 0xFFFFF000;
   u32 width = (f[2] & 0x1FFF) + 1, height = ((f[2] >> 13) & 0x1FFF) + 1;
-  u32 key = base ^ (width << 1) ^ (height << 17);
+  u32 key = base ^ (width << 1) ^ (height << 17) ^ (format << 26);
   for (Texture& t : g_textures) {
     if (t.pixels && t.key == key) return &t;
   }
@@ -183,8 +187,22 @@ Texture* texture_from_fetch(const u32* f) {
   u32 endian = (f[1] >> 6) & 3;
   const u8* src = gw_host(gw_gpu_to_guest(base));
   // The source pixel for (x, y) of the converted texture (nearest).
+  // k_8: the fetch constant's swizzle (3 bits for each of x, y, z, w: 0 the
+  // byte, 1-2 absent channels (0), 3 absent alpha (1), 4 zero, 5 one) gives
+  // the A8R8G8B8 texel; the endian swap moves bytes within each word.
+  const u32 swizzle = (f[3] >> 1) & 0xFFF;
+  const u32 byte_flip = endian == 1 ? 1 : endian == 2 ? 3 : endian == 3 ? 2 : 0;
   auto texel = [&](u32 x, u32 y) {
     const u32 sx = x * width / tw, sy = y * height / th;
+    if (format == 2) {
+      const u32 offset = tiled ? tiled_column(sx, sy, 0, tiled_row(sy, pitch, 0)) : sy * pitch + sx;
+      const u32 v = src[offset ^ byte_flip];
+      auto channel = [&](u32 c) -> u32 {
+        const u32 sel = (swizzle >> (3 * c)) & 7;
+        return sel == 0 ? v : sel == 3 || sel == 5 ? 255 : 0;
+      };
+      return channel(3) << 24 | channel(0) << 16 | channel(1) << 8 | channel(2);
+    }
     const u32 offset = tiled ? (tiled_column(sx, sy, 2, tiled_row(sy, pitch, 2)) >> 2) * 4 : (sy * pitch + sx) * 4;
     u32 raw;
     memcpy(&raw, src + offset, 4);
@@ -337,6 +355,9 @@ void begin_frame() {
   p = pb_push1(p, NV097_SET_ALPHA_TEST_ENABLE, 0);
   p = pb_push1(p, NV097_SET_CULL_FACE_ENABLE, 0);
   p = pb_push1(p, NV097_SET_BLEND_ENABLE, 1);
+  // 16-bit targets: dithered, so the glow's and the colour field's soft
+  // gradients don't band.
+  p = pb_push1(p, NV097_SET_DITHER_ENABLE, 1);
   blk_end(p);
   g_arena_used = 0;
   g_in_frame = true;
@@ -371,7 +392,9 @@ void gw_nv2a_init() {
   };
   // 16-bit back buffers to match the video mode set in status.cpp (memory).
   pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5, false);
-  if (kGlow) pb_extra_buffers(2);  // the glow's work buffers
+  // Work buffers: 0 and 1 for the glow (end of frame) and the grid's colour
+  // field (start of frame), 2 holds the field from frame to frame.
+  pb_extra_buffers(3);
   if (pb_init()) {
     gw_log("nv2a: pb_init failed\n");
     return;
@@ -395,7 +418,7 @@ void gw_nv2a_init() {
   p = blk_begin();
 #include "nv2a_ps.inl"
   blk_end(p);
-  if (kGlow) {
+  {
     u32 glow_vs[] = {
 #include "nv2a_glow_vs.inl"
     };
@@ -424,6 +447,8 @@ void gw_nv2a_init() {
 
   g_scale_x = (float)pb_back_buffer_width() / 1280.0f;
   g_scale_y = (float)pb_back_buffer_height() / 720.0f;
+  g_target_scale_x = g_scale_x;
+  g_target_scale_y = g_scale_y;
   blk_flush();
   pb_show_front_screen();
   g_ready = true;
@@ -566,11 +591,11 @@ void rect_to_quad(const u32* v[3], const XvpProgram* gp, u32* out) {
 // vertices are copied (byte-swapped) into the arena and read by the GPU.
 // Vertices first .. first + count - 1 of the draw. 'rects': a rectangle
 // list, drawn as quads. tex_w, tex_h scale the texture coordinates (a linear
-// texture is addressed in texels). line_colour: constant 1 for a grid line
-// program (xvp_get's line_i).
+// texture is addressed in texels). constant1: constant 1 for the programs
+// that use it (xvp_get's line_i and scale_colour).
 bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, u32 count, u32 source,
                  u32 index_base, u32 index_endian, bool index32, u32 vte, bool rects = false, float tex_w = 1,
-                 float tex_h = 1, const float* line_colour = nullptr) {
+                 float tex_h = 1, const float* constant1 = nullptr) {
   if (rects && (count % 3 || !gp->attr_count || gp->stride > 64)) return false;
   const u32 out_count = rects ? count / 3 * 4 : count;
   u32 bytes = out_count * gp->stride;
@@ -601,13 +626,13 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
   memcpy(c, kFixed, sizeof(kFixed));
   c[2] = float_bits(tex_w);
   c[3] = float_bits(tex_h);
-  if (line_colour) memcpy(&c[4], line_colour, 16);  // in place of the sine constants
+  if (constant1) memcpy(&c[4], constant1, 16);  // in place of the sine constants
   float vx_scale = as_float(regs[0x210F]), vx_off = as_float(regs[0x2110]);
   float vy_scale = as_float(regs[0x2111]), vy_off = as_float(regs[0x2112]);
-  c[12] = float_bits((vte & 1 ? vx_scale : 1.0f) * g_scale_x);
-  c[13] = float_bits((vte & 4 ? vy_scale : 1.0f) * g_scale_y);
-  c[14] = float_bits((vte & 2 ? vx_off : 0.0f) * g_scale_x);
-  c[15] = float_bits((vte & 8 ? vy_off : 0.0f) * g_scale_y);
+  c[12] = float_bits((vte & 1 ? vx_scale : 1.0f) * g_target_scale_x);
+  c[13] = float_bits((vte & 4 ? vy_scale : 1.0f) * g_target_scale_y);
+  c[14] = float_bits((vte & 2 ? vx_off : 0.0f) * g_target_scale_x);
+  c[15] = float_bits((vte & 8 ? vy_off : 0.0f) * g_target_scale_y);
   for (u32 i = 0; i < gp->const_count; ++i) memcpy(&c[(4 + i) * 4], &regs[0x4000 + gp->const_xenos[i] * 4], 16);
   upload_constants(0, c, 4 + gp->const_count);
 
@@ -768,29 +793,34 @@ void use_default_combiner() {
   g_combiner = kTextureTimesColour;
 }
 
-// The grid's line colour: the game reads it per screen region from an 18x12
-// colour map it renders on the GPU (not reproduced yet), so one colour
-// stands in for all of it, with 0.5 for the edge mapping in xenos_vp.cpp.
-// Squared by the brightness (1.5 for every eighth line, down to 0.075).
-const float kGridLineColour[4] = {0.30f, 0.28f, 0.85f, 0.5f};
-
 // The grid lines' pixel shader (B16AAC17) is
-//   colour = min((map * brightness)^2, 1) * (1 - |edge|)^3
-// with edge running from -1 to 1 across the thin quad of each line. The
-// vertex program (xvp_get's line_i) puts the first factor in the diffuse
-// colour and edge / 2 + 1/2 in its alpha (a); the combiners do the rest:
-//   stage 0: spare0.a = a
-//   stage 1: spare0.a = 2 * (spare0.a >= 1/2 ? 1 - a : a) = 1 - |edge|
+//   colour = min((field * brightness)^2, 1) * (1 - |edge|)^3
+// with the colour field (below) sampled at the line's place and edge running
+// from -1 to 1 across the thin quad of each line. The vertex program
+// (xvp_get's line_i) gives texture coordinate 0 into the field, diffuse rgb =
+// brightness / 2 (constant 1 below) and diffuse alpha a = edge / 2 + 1/2.
+// The field is stored divided by kFieldScale (4), so field * brightness =
+// 8 * t0 * diffuse = x; the combiners, each clamping to 1 (harmless: x >= 1
+// saturates the result anyway):
+//   stage 0: spare1.rgb = 4 (t0 + floor) diffuse = x / 2      spare0.a = a
+//   stage 1: spare1.rgb = 4 spare1^2  = x^2         spare0.a = 2 (a < 1/2 ? a : 1 - a) = 1 - |edge|
 //            (the mux picks CD when spare0's alpha is at least 1/2)
-//   stage 2: spare1.a = spare0.a^2
-//   stage 3: spare0.a = spare1.a * spare0.a = (1 - |edge|)^3
-//   stage 4: spare0.rgb = diffuse.rgb * spare0.a
+//   stage 2:                                         spare1.a = spare0.a^2
+//   stage 3:                                         spare0.a = spare1.a * spare0.a = (1 - |edge|)^3
+//   stage 4: spare0.rgb = spare1.rgb * spare0.a
 // and the final combiner outputs spare0 (alpha too, for blends that use it).
+// floor (combiner factor 0): a dim blue under the field, the plain grid
+// colour of before (0.3, 0.28, 0.85) / kFieldScale. The field comes out
+// dimmer than the game's (smaller blurs, no movement with the distortion),
+// and without it the grid went dark away from explosions.
+const float kLineConstant1[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+constexpr u32 kGridFloor = 0x00131236;  // A8R8G8B8
+
 void use_line_combiner() {
   if (g_combiner == kGridLine) return;
-  // Combiner registers: 0 zero, 4 diffuse, 0xC spare0, 0xD spare1. Input
-  // mappings: 0 as is, 1 inverted (1 - x); 1 is zero inverted.
-  constexpr u32 kZero = 0, kDiffuse = 4, kSpare0 = 0xC, kSpare1 = 0xD, kInvert = 1;
+  // Combiner registers: 0 zero, 4 diffuse, 8 texture 0, 0xC spare0, 0xD
+  // spare1. Input mappings: 0 as is, 1 inverted (1 - x); 1 is zero inverted.
+  constexpr u32 kZero = 0, kDiffuse = 4, kTexture0 = 8, kSpare0 = 0xC, kSpare1 = 0xD, kInvert = 1;
   auto alpha_in = [](u32 a, u32 a_map, u32 b, u32 b_map, u32 c, u32 c_map, u32 d, u32 d_map) {
     return MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, a) | MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) |
            MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, a_map) | MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, b) |
@@ -803,30 +833,47 @@ void use_line_combiner() {
     return MASK(NV097_SET_COMBINER_ALPHA_OCW_AB_DST, ab) | MASK(NV097_SET_COMBINER_ALPHA_OCW_SUM_DST, sum) |
            MASK(NV097_SET_COMBINER_ALPHA_OCW_MUX_ENABLE, mux ? 1 : 0) | MASK(NV097_SET_COMBINER_ALPHA_OCW_OP, op);
   };
+  // Colour: A * B into spare1, times 4.
+  auto colour_in = [](u32 a, u32 a_map, u32 b, u32 b_map) {
+    return MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, a) | MASK(NV097_SET_COMBINER_COLOR_ICW_A_MAP, a_map) |
+           MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, b) | MASK(NV097_SET_COMBINER_COLOR_ICW_B_MAP, b_map);
+  };
+  const u32 times4 = MASK(NV097_SET_COMBINER_COLOR_OCW_AB_DST, kSpare1) |
+                     MASK(NV097_SET_COMBINER_COLOR_OCW_OP, NV097_SET_COMBINER_COLOR_OCW_OP_SHIFTLEFTBY2);
+  // Stage 0: t0 * diffuse + floor * diffuse into spare1, times 4.
+  constexpr u32 kFactor0 = 1;
+  const u32 field_in = colour_in(kTexture0, 0, kDiffuse, 0) | MASK(NV097_SET_COMBINER_COLOR_ICW_C_SOURCE, kFactor0) |
+                       MASK(NV097_SET_COMBINER_COLOR_ICW_D_SOURCE, kDiffuse);
+  const u32 field_out = MASK(NV097_SET_COMBINER_COLOR_OCW_SUM_DST, kSpare1) |
+                        MASK(NV097_SET_COMBINER_COLOR_OCW_OP, NV097_SET_COMBINER_COLOR_OCW_OP_SHIFTLEFTBY2);
   u32* p = blk_begin();
+  p = pb_push1(p, NV097_SET_COMBINER_FACTOR0, kGridFloor);
   p = pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT, 0);
-  p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM, 0);  // no texture stages
+  p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM,
+               MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE0, NV097_SET_SHADER_STAGE_PROGRAM_STAGE0_2D_PROJECTIVE));
   blk_end(p);
-  // Alpha parts of stages 0-3; their colour parts discard (all outputs 0).
-  const u32 alpha[4][2] = {
-      {alpha_in(kDiffuse, 0, kZero, kInvert, kZero, 0, kZero, 0), alpha_out(kSpare0, 0, false, 0)},
-      {alpha_in(kDiffuse, 0, kZero, kInvert, kDiffuse, kInvert, kZero, kInvert),
+  // Stages 0-3: {colour in, colour out, alpha in, alpha out}.
+  const u32 stages[4][4] = {
+      {field_in, field_out, alpha_in(kDiffuse, 0, kZero, kInvert, kZero, 0, kZero, 0),
+       alpha_out(kSpare0, 0, false, 0)},
+      {colour_in(kSpare1, 0, kSpare1, 0), times4,
+       alpha_in(kDiffuse, 0, kZero, kInvert, kDiffuse, kInvert, kZero, kInvert),
        alpha_out(0, kSpare0, true, NV097_SET_COMBINER_ALPHA_OCW_OP_SHIFTLEFTBY1)},
-      {alpha_in(kSpare0, 0, kSpare0, 0, kZero, 0, kZero, 0), alpha_out(kSpare1, 0, false, 0)},
-      {alpha_in(kSpare1, 0, kSpare0, 0, kZero, 0, kZero, 0), alpha_out(kSpare0, 0, false, 0)},
+      {0, 0, alpha_in(kSpare0, 0, kSpare0, 0, kZero, 0, kZero, 0), alpha_out(kSpare1, 0, false, 0)},
+      {0, 0, alpha_in(kSpare1, 0, kSpare0, 0, kZero, 0, kZero, 0), alpha_out(kSpare0, 0, false, 0)},
   };
   for (u32 stage = 0; stage < 4; ++stage) {
     p = blk_begin();
-    p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + stage * 4, 0);
-    p = pb_push1(p, NV097_SET_COMBINER_COLOR_OCW + stage * 4, 0);
-    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + stage * 4, alpha[stage][0]);
-    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_OCW + stage * 4, alpha[stage][1]);
+    p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + stage * 4, stages[stage][0]);
+    p = pb_push1(p, NV097_SET_COMBINER_COLOR_OCW + stage * 4, stages[stage][1]);
+    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + stage * 4, stages[stage][2]);
+    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_OCW + stage * 4, stages[stage][3]);
     blk_end(p);
   }
-  // Stage 4: spare0.rgb = diffuse.rgb * spare0.a; its alpha part discards.
+  // Stage 4: spare0.rgb = spare1.rgb * spare0.a; its alpha part discards.
   p = blk_begin();
   p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + 4 * 4,
-               MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, kDiffuse) |
+               MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, kSpare1) |
                    MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, kSpare0) |
                    MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, 1));
   p = pb_push1(p, NV097_SET_COMBINER_COLOR_OCW + 4 * 4, MASK(NV097_SET_COMBINER_COLOR_OCW_AB_DST, kSpare0));
@@ -889,6 +936,149 @@ void glow_pass(const void* from, u32 from_w, u32 from_h, u32 pitch, float w, flo
     uv[k][3] = offsets[k][1] + scale * h;
   }
   glow_quad(0, 0, w, h, uv);
+}
+
+// --- The grid's colour field ----------------------------------------------------------------
+// The game colours its grid from a 150x100 field of light it keeps on the GPU
+// (from a level capture on hardware): each frame
+//   1. every light-giving object splats a soft blob (vertex shader C5C713E2,
+//      a 31x31 8-bit spot times the object's colour, brighter than 1: the
+//      big ambient lights are colours like (5, 2.6, 21)), added up;
+//   2. the splats are shrunk to 75x50, 37x25, 18x12, 9x6, 4x3 and 2x1;
+//   3. field = 0.75 * (0.25 splats + 0.1875 * each smaller level, enlarged)
+//      + 0.5 * last frame's field (moved along with the grid's distortion);
+// and the grid lines read it (use_line_combiner). The widest levels spread
+// an average tint over the whole arena: the grid's general colour.
+//
+// Here at half size (75x50, in the corners of pbkit's extra buffers, 16-bit,
+// divided by kFieldScale to fit), without the distortion's movement. Each
+// level is one bilinear shrink of the one before, then (levels 1-4) blurred
+// across and down with four bilinear taps, eight texels wide (the game uses
+// 15-tap blurs):
+//   extra 0: splats (0,0) 75x50, level 2 at (100,0), level 4 at (130,0),
+//            blur scratch for levels 1 and 3 at (0,64) and (100,64)
+//   extra 1: level 1 at (0,0), level 3 at (100,0), level 5 at (140,0),
+//            last frame's field at (0,64), blur scratch for levels 2 and 4
+//            at (100,64) and (130,64)
+//   extra 2: the field at (0,0), the step-3 part sum at (0,64)
+// Each pass reads a region another pass finished (WAIT_FOR_IDLE between).
+constexpr float kFieldScale = 4;
+constexpr u32 kFieldW = 75, kFieldH = 50;
+const float kSplatConstant1[4] = {1 / kFieldScale, 1 / kFieldScale, 1 / kFieldScale, 1};
+bool g_field_open = false;   // this frame's splats are being drawn
+bool g_field_ready = false;  // extra buffer 2 holds a field
+
+struct FieldTap {
+  int buffer;            // extra buffer
+  float x0, y0, x1, y1;  // its region, read across the destination
+  float weight;
+};
+
+// One pass into extra buffer 'target', rectangle (x0, y0)-(x1, y1), the sum
+// of up to four taps (bilinear).
+void field_pass(int target, float x0, float y0, float x1, float y1, const FieldTap* taps, int n) {
+  const u32 width = pb_back_buffer_width(), height = pb_back_buffer_height(), pitch = pb_back_buffer_pitch();
+  glow_target(target);
+  float uv[4][4] = {}, weights[4] = {};
+  for (int k = 0; k < 4; ++k) {
+    const FieldTap& t = taps[k < n ? k : 0];
+    bind_linear((u32)k, pb_extra_buffer(t.buffer), width, height, pitch);
+    uv[k][0] = t.x0;
+    uv[k][1] = t.y0;
+    uv[k][2] = t.x1;
+    uv[k][3] = t.y1;
+    weights[k] = k < n ? t.weight : 0;
+  }
+  set_sum_weights(weights);
+  glow_quad(x0, y0, x1, y1, uv);
+}
+
+void field_pass_state(bool on) {
+  if (on) {
+    set_program_start(kGlowProgramSlot);
+    use_sum_combiner();
+    g_combiner = kOther;
+  }
+  u32* p = blk_begin();
+  p = pb_push1(p, NV097_SET_BLEND_ENABLE, on ? 0 : 1);
+  blk_end(p);
+}
+
+// Before the frame's first splat: last frame's field put aside, the work
+// regions cleared, the splats' target set.
+void field_begin() {
+  if (g_field_open) return;
+  field_pass_state(true);
+  if (!g_field_ready) {
+    glow_target(2);
+    pb_fill(0, 0, 160, 120, 0);
+    g_field_ready = true;
+  }
+  glow_target(1);
+  pb_fill(0, 0, 160, 120, 0);
+  const FieldTap last = {2, 0, 0, (float)kFieldW, (float)kFieldH, 1};
+  field_pass(1, 0, 64, kFieldW, 64 + kFieldH, &last, 1);
+  glow_target(0);
+  pb_fill(0, 0, 160, 120, 0);
+  field_pass_state(false);
+  // The splats: viewport 150x100 in the game's units, drawn at half that.
+  g_target_scale_x = (float)kFieldW / 150;
+  g_target_scale_y = (float)kFieldH / 100;
+  g_field_open = true;
+}
+
+// Blurs the w x h level at (x, y) of extra buffer 'buffer' across into the
+// scratch at (x, y + 64) of the other buffer, and down back into place.
+void field_blur(int buffer, float x, float y, float w, float h) {
+  const int other = 1 - buffer;
+  const float sy = y + 64;
+  FieldTap across[4], down[4];
+  const float offsets[4] = {-2.5f, -0.5f, 1.5f, 3.5f};  // texel pairs (-3,-2) ... (3,4)
+  for (int k = 0; k < 4; ++k) {
+    across[k] = {buffer, x + offsets[k], y, x + w + offsets[k], y + h, 0.25f};
+    down[k] = {other, x, sy - offsets[k], x + w, sy + h - offsets[k], 0.25f};
+  }
+  field_pass(other, x, sy, x + w, sy + h, across, 4);
+  field_pass(buffer, x, y, x + w, y + h, down, 4);
+}
+
+// After the last splat: the levels and the field, then back to the screen.
+void field_end() {
+  if (!g_field_open) return;
+  g_field_open = false;
+  g_target_scale_x = g_scale_x;
+  g_target_scale_y = g_scale_y;
+  field_pass_state(true);
+  // Each level a bilinear sample between 2x2 texels of the one before.
+  const FieldTap l1 = {0, 0, 0, 74, 50, 1};
+  field_pass(1, 0, 0, 37, 25, &l1, 1);
+  field_blur(1, 0, 0, 37, 25);
+  const FieldTap l2 = {1, 0, 0, 36, 24, 1};
+  field_pass(0, 100, 0, 118, 12, &l2, 1);
+  field_blur(0, 100, 0, 18, 12);
+  const FieldTap l3 = {0, 100, 0, 118, 12, 1};
+  field_pass(1, 100, 0, 109, 6, &l3, 1);
+  field_blur(1, 100, 0, 9, 6);
+  const FieldTap l4 = {1, 100, 0, 108, 6, 1};
+  field_pass(0, 130, 0, 134, 3, &l4, 1);
+  field_blur(0, 130, 0, 4, 3);
+  const FieldTap l5 = {0, 130, 0, 134, 2, 1};
+  field_pass(1, 140, 0, 142, 1, &l5, 1);
+  const float w = (float)kFieldW, h = (float)kFieldH;
+  // 0.25 splats + 0.1875 (levels 1-3), then 0.75 of that + 0.75 * 0.1875
+  // (levels 4, 5) + 0.5 last frame's field.
+  const FieldTap part[4] = {{0, 0, 0, w, h, 0.25f},
+                            {1, 0, 0, 37, 25, 0.1875f},
+                            {0, 100, 0, 118, 12, 0.1875f},
+                            {1, 100, 0, 109, 6, 0.1875f}};
+  field_pass(2, 0, 64, w, 64 + h, part, 4);
+  const FieldTap field[4] = {{2, 0, 64, w, 64 + h, 0.75f},
+                             {0, 130, 0, 134, 3, 0.140625f},
+                             {1, 140, 0, 142, 1, 0.140625f},
+                             {1, 0, 64, w, 64 + h, 0.5f}};
+  field_pass(2, 0, 0, w, h, field, 4);
+  glow_target(-1);
+  field_pass_state(false);
 }
 
 void apply_glow() {
@@ -956,11 +1146,15 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     }
   }
   if (!vs || count == 0) return;
-  // Colour draws into the main 1280-wide scene only: the glow chain, the
-  // grid's own target, resolves (mode 6) and clears (mode 5) wait.
-  if ((regs[0x2208] & 7) != 4 || (regs[0x2000] & 0x3FFF) != 1280) {
+  // Colour draws into the main 1280-wide scene, and the light splats of the
+  // grid's colour field (its 160-pitch target, vertex shader C5C713E2). The
+  // rest of the field (its moving with the distortion), the glow chain,
+  // resolves (mode 6) and clears (mode 5) are not reproduced.
+  const u32 mode = regs[0x2208] & 7, pitch = regs[0x2000] & 0x3FFF;
+  const bool field_splat = mode == 4 && pitch == 160 && vs_hash == 0xC5C713E2;
+  if (!field_splat && (mode != 4 || pitch != 1280)) {
     // detail: mode << 16 | surface pitch
-    return note_skip(kNotMainTarget, (regs[0x2208] & 7) << 16 | (regs[0x2000] & 0x3FFF));
+    return note_skip(kNotMainTarget, mode << 16 | pitch);
   }
   u32 nv_prim = prim == 1 ? NV097_SET_BEGIN_END_OP_POINTS
               : prim == 2 ? NV097_SET_BEGIN_END_OP_LINES
@@ -984,6 +1178,11 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     return;
   }
   if (!g_in_frame) begin_frame();
+  if (field_splat) {
+    field_begin();
+  } else {
+    field_end();
+  }
 
   float vx_scale = as_float(regs[0x210F]), vx_off = as_float(regs[0x2110]);
   float vy_scale = as_float(regs[0x2111]), vy_off = as_float(regs[0x2112]);
@@ -1010,10 +1209,11 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   }
   if (uv_i < 0 || grid_lines) uv_i = -1;
   int color_i = grid_lines ? -1 : uv_i == 0 ? 1 : 0;
-  bind_texture(texture);
   if (grid_lines) {
+    bind_linear(0, pb_extra_buffer(2), kFieldW, kFieldH, pb_back_buffer_pitch());  // the colour field
     use_line_combiner();
   } else {
+    bind_texture(texture);
     use_default_combiner();
   }
 
@@ -1033,14 +1233,15 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   // whole quads, triangles, lines and rectangles); the grid's lines are a
   // 65528-vertex draw.
   if (g_use_gpu_vertex) {
-    const XvpProgram* gp = xvp_get(vs, uv_i, color_i, !(vte & 0x100), grid_lines ? 0 : -1);
+    const XvpProgram* gp = xvp_get(vs, uv_i, color_i, !(vte & 0x100), grid_lines ? 0 : -1, field_splat);
     if (gp) {
       const u32 piece = gp->stride ? (kArenaBytes / 2 / gp->stride) / 12 * 12 : count;
       bool drawn = true;
       for (u32 first = 0; first < count && drawn; first += piece) {
         const u32 n = count - first < piece ? count - first : piece;
-        drawn = draw_on_gpu(gp, regs, nv_prim, first, n, source, index_base, index_endian, index32, vte, false, 1,
-                            1, grid_lines ? kGridLineColour : nullptr);
+        drawn = draw_on_gpu(gp, regs, nv_prim, first, n, source, index_base, index_endian, index32, vte, false,
+                            grid_lines ? (float)kFieldW : 1, grid_lines ? (float)kFieldH : 1,
+                            grid_lines ? kLineConstant1 : field_splat ? kSplatConstant1 : nullptr);
       }
       if (drawn) {
         if (g_census_entry) g_census_entry->gpu += count;
@@ -1048,7 +1249,7 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
       }
     }
   }
-  if (grid_lines) return;  // no CPU path for the line combiner's colours
+  if (grid_lines || field_splat) return;  // no CPU path for these
 
   // Fallback: interpret the shader on the CPU, draw pre-transformed vertices.
   if (!arena_room(count * 20)) {
@@ -1133,6 +1334,7 @@ void gw_nv2a_swap() {
     gw_log_memory("census");
     gw_dump_allocations();
   }
+  field_end();
   if (kGlow) apply_glow();
   blk_flush();
 #ifdef GW_OVERLAY

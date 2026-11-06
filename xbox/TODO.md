@@ -116,9 +116,20 @@ order. Measurements are from XEMU at 64 MB unless noted.
       every eighth line bright, bending around the ship and shots. The grid
       job writes the lines straight into a contiguous host mirror in the
       NV2A's order (`gw_grid_line_host`), drawn in place: copying them cost
-      19 -> 8 fps; in place a level runs at 25 fps. Still to do: the game's
-      colour map, and a second mirror if the one shared by the frames in
-      flight shows tearing. `make GRID_CHECK=y` compares the guest buffer,
+      19 -> 8 fps; in place a level runs at 25 fps. Still to do: a second
+      mirror if the one shared by the frames in flight shows tearing.
+- [ ] Grid colour field (`field_begin` / `field_end` in `src/nv2a.cpp`, from
+      a level capture on hardware, `tools/gpu_capture.py --xbdm`): the game
+      splats a light per object into a 150x100 field (vertex shader
+      C5C713E2, HDR colours up to about 20), shrinks and blurs it to 2x1,
+      sums the levels and keeps half of last frame's field; the grid lines
+      read it. Reproduced at 75x50 in pbkit's extra buffers (16-bit, a
+      quarter of the true value), 4-tap blurs, no movement with the
+      distortion. It comes out dimmer than the game's, so a dim blue floor
+      keeps the grid visible; tints show near explosions. Costs about 3 fps
+      (25 -> 22). To match the game: brighter/wider blurs (its are 15-tap),
+      the distortion's movement (needs the grid displacements, now not
+      written), and checking against the original on a 360 or in a capture. `make GRID_CHECK=y` compares the guest buffer,
       which the native code no longer writes.
 - [ ] Vertex arena overflows on some menu frames ("vertex arena full").
 
