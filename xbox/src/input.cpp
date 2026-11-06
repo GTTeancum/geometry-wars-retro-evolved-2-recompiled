@@ -4,6 +4,7 @@
 #include "runtime.h"
 
 #include <SDL.h>
+#include <windows.h>
 
 // Test pad, one record per player: [0] magic, [1] XInput button mask,
 // [2] left stick X | Y<<16, [3] right stick X | Y<<16, [4] left | right
@@ -20,6 +21,13 @@ SDL_GameController* g_controllers[kPads];
 bool g_sdl_ok;
 
 void update_controllers() {
+  // The game reads the pad several times a frame; SDL's update also polls
+  // the USB hubs, so it runs at most every 8 ms (reads in between see the
+  // last state).
+  static DWORD last = 0;
+  const DWORD now = GetTickCount();
+  if (last && now - last < 8) return;
+  last = now;
   SDL_Event event;
   while (SDL_PollEvent(&event)) {
     if (event.type == SDL_CONTROLLERDEVICEADDED) {
@@ -70,7 +78,11 @@ bool gw_input_read(u32 user, u32 gamepad) {
     return true;
   }
   if (!g_sdl_ok) return false;
-  if (user == 0) update_controllers();
+  if (user == 0) {
+    const u64 start = gw_wait_begin();
+    update_controllers();
+    gw_wait_end(start, 0, "input: SDL controller update");
+  }
   SDL_GameController* c = g_controllers[user];
   if (!c) return false;
   static const struct {
