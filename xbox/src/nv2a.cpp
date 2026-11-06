@@ -320,9 +320,20 @@ namespace {
 // draws that make up whatever screen is showing.
 struct CensusEntry {
   u32 hash, draws, prim, vertices, gpu, cpu;  // gpu/cpu: vertices drawn by each path
+  u32 skip;  // why the last skipped draw was skipped (SkipReason), with its detail
+  u32 skip_detail;
 };
 CensusEntry g_census[32];
 CensusEntry* g_census_entry;
+
+enum SkipReason : u32 { kDrawn, kNotMainTarget, kPrimitive, kComputedUv, kTextureFormat };
+const char* const kSkipNames[] = {"", "target", "primitive", "computed texture coordinates", "texture format"};
+
+void note_skip(SkipReason reason, u32 detail) {
+  if (!g_census_entry) return;
+  g_census_entry->skip = reason;
+  g_census_entry->skip_detail = detail;
+}
 }  // namespace
 
 namespace {
@@ -690,7 +701,10 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   if (!vs || count == 0) return;
   // Colour draws into the main 1280-wide scene only: the glow chain, the
   // grid's own target, resolves (mode 6) and clears (mode 5) wait.
-  if ((regs[0x2208] & 7) != 4 || (regs[0x2000] & 0x3FFF) != 1280) return;
+  if ((regs[0x2208] & 7) != 4 || (regs[0x2000] & 0x3FFF) != 1280) {
+    // detail: mode << 16 | surface pitch
+    return note_skip(kNotMainTarget, (regs[0x2208] & 7) << 16 | (regs[0x2000] & 0x3FFF));
+  }
   u32 nv_prim = prim == 1 ? NV097_SET_BEGIN_END_OP_POINTS
               : prim == 2 ? NV097_SET_BEGIN_END_OP_LINES
               : prim == 3 ? NV097_SET_BEGIN_END_OP_LINE_STRIP
@@ -699,7 +713,7 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
               : prim == 6 ? NV097_SET_BEGIN_END_OP_TRIANGLE_STRIP
               : prim == 13 ? NV097_SET_BEGIN_END_OP_QUADS
               : 0;
-  if (!nv_prim) return;
+  if (!nv_prim) return note_skip(kPrimitive, prim);
   if ((prim == 3 || prim == 5 || prim == 6) && count > 252) return;  // strips/fans aren't split
   // Index source: 0 = index buffer (DRAW_INDX: viz, initiator, base, size),
   // 2 = auto (0..count-1).
@@ -726,10 +740,10 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     // A draw whose texture can't be reproduced yet (render targets, float
     // formats, computed coordinates) is skipped: many use replace blending
     // and would paint flat shapes over the scene.
-    if (uv_i == -2) return;
+    if (uv_i == -2) return note_skip(kComputedUv, 0);
     if (uv_i >= 0) {
       const Texture* t = texture_from_fetch(&regs[0x4800 + tex_const * 6]);
-      if (!t) return;
+      if (!t) return note_skip(kTextureFormat, regs[0x4800 + tex_const * 6 + 1] & 0x3F);
       texture = t;
     }
   }
@@ -829,8 +843,9 @@ void gw_nv2a_swap() {
     gw_log("nv2a: frame %u vertex shaders:\n", g_frames);
     for (const CensusEntry& e : g_census) {
       if (e.hash) {
-        gw_log("  %08X: %u draws, prim %u, %u vertices (%u on the GPU, %u on the CPU)\n", e.hash, e.draws,
-               e.prim, e.vertices, e.gpu, e.cpu);
+        gw_log("  %08X: %u draws, prim %u, %u vertices (%u on the GPU, %u on the CPU)%s%s %X\n", e.hash, e.draws,
+               e.prim, e.vertices, e.gpu, e.cpu, e.skip ? "; skipped: " : "", kSkipNames[e.skip],
+               e.skip_detail);
       }
     }
   }
