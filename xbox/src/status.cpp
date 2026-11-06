@@ -58,7 +58,7 @@ DWORD WINAPI status_thread(LPVOID) {
     u32 swaps = gw_stats.swaps;
     fps = (swaps - last_swaps) * 1000 / (now - last_tick ? now - last_tick : 1);
     if (swaps == last_swaps && ++stalled_seconds % 10 == 0) {
-      gw_log("no frame for %u s; threads:\n", stalled_seconds);
+      gw_log("no frame for %u s; renderer stage %u; threads:\n", stalled_seconds, gw_nv2a_stage);
       gw_dump_threads();
     }
     if (swaps != last_swaps) stalled_seconds = 0;
@@ -79,6 +79,7 @@ DWORD WINAPI status_thread(LPVOID) {
       *out = 0;
     }
     LeaveCriticalSection(&g_log_lock);
+    if (gw_nv2a_active) continue;  // pbkit owns the screen
     debugClearScreen();
     debugPrint("Geometry Wars: Retro Evolved 2 - Xbox bring-up\n");
     debugPrint("frames %u (%u/s)  interrupts %u  gpu packets %u  draws %u\n", swaps, fps,
@@ -118,7 +119,8 @@ void gw_fatal(const char* fmt, ...) {
 void gw_status_init() {
   InitializeCriticalSection(&g_log_lock);
   g_log_ready = true;
-  XVideoSetMode(640, 480, 32, REFRESH_DEFAULT);
+  // 16-bit: pbkit sizes its back buffers from this mode (memory is tight).
+  XVideoSetMode(640, 480, 16, REFRESH_DEFAULT);
   CreateThread(nullptr, 0, status_thread, nullptr, 0, nullptr);
 }
 

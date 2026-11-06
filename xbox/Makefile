@@ -19,8 +19,18 @@ GEN_OBJS = $(addsuffix .obj,$(basename $(GEN_SRCS)))
 $(PROJECT_OBJS): NXDK_CXXFLAGS += -std=c++20 -O2 -Iinclude -Isrc -isystem $(REXGLUE_INCLUDE) \
 	-ffunction-sections -fdata-sections -Wno-unused-label -Wno-unused-variable \
 	-Wno-pass-failed -Wno-unused-but-set-variable -Wno-deprecated-volatile
-$(GEN_OBJS): NXDK_CXXFLAGS += -Ibuild/gen
+# Size over speed for the generated code: memory is the tighter limit.
+$(GEN_OBJS): NXDK_CXXFLAGS += -Ibuild/gen -Os
+
+# One-frame GPU capture buffer (xbox/tools/gpu_capture.py): make CAPTURE=y
+ifeq ($(CAPTURE),y)
+src/gpu_capture.obj: NXDK_CXXFLAGS += -DGW_CAPTURE
+endif
 
 NXDK_LDFLAGS += /opt:ref /map:build/gw2.map
 
 include $(NXDK_DIR)/Makefile
+
+# After the include, so the XBE stays the default target.
+# NV2A shaders (nxdk's Cg rules): pass-through vertex program, combiners.
+src/nv2a.obj: src/nv2a_vs.inl src/nv2a_ps.inl

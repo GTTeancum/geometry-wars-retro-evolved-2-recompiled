@@ -297,7 +297,7 @@ u32 gw_thread_create(u32 stack_size, u32 xapi_startup, u32 start_address, u32 st
   t->xapi_startup = xapi_startup;
   bool suspended = creation_flags & 1;
   // Host stack: recompiled code keeps its frames on the host stack.
-  t->host = CreateThread(nullptr, 256 * 1024, thread_proc, t, CREATE_SUSPENDED, nullptr);
+  t->host = CreateThread(nullptr, 128 * 1024, thread_proc, t, CREATE_SUSPENDED, nullptr);
   if (!t->host) gw_fatal("CreateThread failed");
   t->object->host = t->host;
   t->handle = handle_add(t->object);

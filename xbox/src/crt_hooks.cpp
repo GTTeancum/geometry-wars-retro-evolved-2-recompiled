@@ -68,6 +68,25 @@ extern "C" void sub_82095188(PPCContext& ctx, uint8_t* base) {
   ctx.r3.u64 = dest;
 }
 
+// The game's pool of 256 dynamic vertex buffers of 128 KiB (sub_8206A518
+// fills the table at 0x821B4120 with sub_8206A480(0x20000) results). It
+// rotates through them slowly, so over minutes all 32 MiB get touched. On
+// the Xbox the table cycles through 32 real buffers instead (4 MiB at most);
+// the GPU side consumes each buffer long before the rotation comes back.
+extern "C" void sub_8206A480(PPCContext& ctx, uint8_t* base);
+
+extern "C" void sub_8206A518(PPCContext& ctx, uint8_t* base) {
+  constexpr u32 kTable = 0x821B4120, kEntries = 256, kReal = 32;
+  u32 buffers[kReal];
+  for (u32 i = 0; i < kReal; ++i) {
+    ctx.r3.u64 = 0x20000;
+    sub_8206A480(ctx, base);
+    buffers[i] = ctx.r3.u32;
+  }
+  for (u32 i = 0; i < kEntries; ++i) gw_store32(kTable + i * 4, buffers[i % kReal]);
+  gw_log("vertex buffer pool: %u entries share %u buffers\n", kEntries, kReal);
+}
+
 // memset: r3 destination, r4 fill byte, r5 size; returns the destination.
 extern "C" void sub_82130E10(PPCContext& ctx, uint8_t* base) {
   u32 dest = ctx.r3.u32, size = ctx.r5.u32;

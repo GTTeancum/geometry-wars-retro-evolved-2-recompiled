@@ -122,6 +122,8 @@ void gw_write_video_mode(u32 mode);
 // --- GPU --------------------------------------------------------------------
 
 void gw_gpu_init();
+extern volatile bool gw_nv2a_active;  // pbkit owns the screen once set
+extern volatile u32 gw_nv2a_stage;
 void gw_gpu_write_register(u32 addr, u32 value);
 u32 gw_gpu_read_register(u32 addr);
 

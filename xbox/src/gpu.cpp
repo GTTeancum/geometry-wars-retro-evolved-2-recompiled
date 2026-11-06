@@ -15,6 +15,10 @@
 void gw_capture_swap(u32 swap_number, u32 frontbuffer, u32 width, u32 height, const u32* regs);
 void gw_capture_shader(u32 type, u32 gpu_address, u32 guest_words, u32 dwords);
 void gw_capture_draw(u32 opcode, const u32* packet, u32 packet_dwords, const u32* regs);
+void gw_note_shader(u32 type, u32 hash, u32 guest_words, u32 dwords);
+void gw_nv2a_init();
+void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_hash);
+void gw_nv2a_swap();
 
 namespace {
 
@@ -40,6 +44,16 @@ HANDLE g_work_event;
 u32 g_interrupt_callback;
 u32 g_interrupt_data;
 CRITICAL_SECTION g_interrupt_lock;
+
+// FNV-1a of the current vertex shader's microcode: identifies the draw for
+// the NV2A renderer (inline shaders move around the ring every frame).
+u32 g_vs_hash;
+
+u32 shader_hash(u32 guest, u32 dwords) {
+  u32 h = 0x811C9DC5;
+  for (u32 i = 0; i < dwords; ++i) h = (h ^ gw_load32(guest + i * 4)) * 0x01000193;
+  return h;
+}
 
 u32 g_bin_mask_lo = 0xFFFFFFFF, g_bin_mask_hi = 0xFFFFFFFF;
 u32 g_bin_select_lo = 0xFFFFFFFF, g_bin_select_hi = 0xFFFFFFFF;
@@ -141,6 +155,7 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
         u32 frontbuffer = r.next(), width = r.next(), height = r.next();
         ++g_swap_counter;
         gw_capture_swap(g_swap_counter, frontbuffer, width, height, g_regs);
+        gw_nv2a_swap();
         gw_status_frame();
       }
       break;
@@ -149,6 +164,9 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
       u32 address_type = r.next(), start_size = r.next();
       u32 address = address_type & ~3u;
       gw_capture_shader(address_type & 3, address, gw_gpu_to_guest(address), start_size & 0xFFFF);
+      u32 hash = shader_hash(gw_gpu_to_guest(address), start_size & 0xFFFF);
+      gw_note_shader(address_type & 3, hash, gw_gpu_to_guest(address), start_size & 0xFFFF);
+      if ((address_type & 3) == 0) g_vs_hash = hash;
       break;
     }
     case 0x2B: {  // IM_LOAD_IMMEDIATE: shader microcode inline
@@ -158,6 +176,9 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
       u32 guest = r.base + (r.pos % r.size) * 4;
       if (!r.ring || (r.pos % r.size) + dwords <= r.size) {
         gw_capture_shader(type & 3, 0x80000000u | guest, guest, dwords);
+        u32 hash = shader_hash(guest, dwords);
+        gw_note_shader(type & 3, hash, guest, dwords);
+        if ((type & 3) == 0) g_vs_hash = hash;
       }
       break;
     }
@@ -276,6 +297,7 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
       u32 n = count < 16 ? count : 16;
       for (u32 i = 0; i < n; ++i) words[i] = r.next();
       gw_capture_draw(opcode, words, n, g_regs);
+      gw_nv2a_draw(opcode, words, n, g_regs, g_vs_hash);
       break;
     }
     case 0x50: {  // SET_BIN_MASK
@@ -332,6 +354,7 @@ void execute(Reader& r, u32 end, PPCContext& ctx) {
 
 DWORD WINAPI command_thread(LPVOID) {
   PPCContext& ctx = *gw_make_callback_context();
+  gw_nv2a_init();  // pbkit is driven from this thread only
   for (;;) {
     WaitForSingleObject(g_work_event, 16);
     if (!g_ring_size) continue;
@@ -346,7 +369,10 @@ DWORD WINAPI command_thread(LPVOID) {
       gw_fatal("GPU command processor crashed (see log)");
     }
     g_read_index = write;
-    if (g_rptr_writeback) gpu_store(g_rptr_writeback, g_read_index);
+    // The CPU reads the read pointer as a big-endian word (as on the 360,
+    // where the CP swaps it); a host-order store looked like garbage and
+    // eventually told the game the ring was full forever (frame 453).
+    if (g_rptr_writeback) gw_store32(gw_gpu_to_guest(g_rptr_writeback), g_read_index);
   }
   return 0;
 }

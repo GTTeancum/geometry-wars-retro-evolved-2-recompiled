@@ -128,13 +128,35 @@ def decode(words, out):
     print('\n'.join(summary))
 
 
+def save_shaders(mon, base, out):
+    count, used = mon.word(base + 4), mon.word(base + 8)
+    target = (out / 'shaders.bin').resolve()
+    mon.command(f'memsave 0x{base + 12:x} {used * 4} "{target.as_posix()}"')
+    time.sleep(1)
+    data = target.read_bytes()
+    words = struct.unpack(f'<{len(data) // 4}I', data)
+    i = 0
+    while i < len(words) and words[i] == 0x52444853:
+        kind, h, n = words[i + 1:i + 4]
+        blob = words[i + 4:i + 4 + n]
+        name = f"hash_{'vs' if kind == 0 else 'ps'}_{h:08X}.bin"
+        (out / name).write_bytes(struct.pack(f'>{n}I', *blob))
+        i += 4 + n
+    print(f'{count} shaders saved to {out}')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=9257)
     parser.add_argument('--out', type=pathlib.Path, default=ROOT / 'xbox' / 'test-artifacts' / 'gpu')
+    parser.add_argument('--shaders', action='store_true',
+                        help='save every distinct shader loaded so far (gw_shader_dump), named by hash')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     map_text = (ROOT / 'xbox' / 'build' / 'gw2.map').read_text(errors='replace')
+    if args.shaders:
+        save_shaders(Monitor(args.port), symbol(map_text, 'gw_shader_dump'), args.out)
+        return
     base = symbol(map_text, 'gw_capture')
     mon = Monitor(args.port)
     for _ in range(180):

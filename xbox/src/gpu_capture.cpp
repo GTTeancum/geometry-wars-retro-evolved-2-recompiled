@@ -12,10 +12,17 @@
 //   'SWAP' frontbuffer, width, height
 #include "runtime.h"
 
+// The 1.5 MB buffer is only built with `CAPTURE=y` (memory is tight).
+#ifdef GW_CAPTURE
+constexpr u32 kCaptureWords = 384 * 1024;
+#else
+constexpr u32 kCaptureWords = 1;
+#endif
+
 extern "C" {
 // Read by xbox/tools/gpu_capture.py: magic, state (0 waiting, 1 capturing,
 // 2 done), words used, then the stream.
-u32 gw_capture[3 + 384 * 1024];
+u32 gw_capture[3 + kCaptureWords];
 }
 
 namespace {
@@ -65,6 +72,33 @@ void gw_capture_swap(u32 swap_number, u32 frontbuffer, u32 width, u32 height, co
     state() = 2;
     gw_log("gpu capture: done, %u words\n", used());
   }
+}
+
+// Every distinct shader the game loads (by microcode hash), always on:
+// 'SHDR' type, hash, dwords, microcode. xbox/tools/gpu_capture.py --shaders.
+extern "C" {
+u32 gw_shader_dump[3 + 16384];  // magic 'GSHD', shader count, words used
+}
+
+void gw_note_shader(u32 type, u32 hash, u32 guest_words, u32 dwords) {
+  static u32 seen[96];
+  static u32 seen_count;
+  for (u32 i = 0; i < seen_count; ++i) {
+    if (seen[i] == hash) return;
+  }
+  if (seen_count >= 96) return;
+  u32& used_words = gw_shader_dump[2];
+  if (used_words + 4 + dwords > 16384) return;
+  seen[seen_count++] = hash;
+  gw_shader_dump[0] = 0x44485347;  // 'GSHD'
+  u32* out = gw_shader_dump + 3 + used_words;
+  out[0] = 0x52444853;  // 'SHDR'
+  out[1] = type;
+  out[2] = hash;
+  out[3] = dwords;
+  for (u32 i = 0; i < dwords; ++i) out[4 + i] = gw_load32(guest_words + i * 4);
+  used_words += 4 + dwords;
+  ++gw_shader_dump[1];
 }
 
 // Shader microcode as loaded by IM_LOAD / IM_LOAD_IMMEDIATE.

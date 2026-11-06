@@ -51,3 +51,4 @@ __pycache__/
 /xbox/test-artifacts/
 *.cpp.d
 *.c.d
+/xbox/src/*.inl

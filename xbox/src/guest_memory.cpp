@@ -346,6 +346,15 @@ bool gw_handle_fault(u32 host_address) {
     ++gw_lazy_faults;
   }
   LeaveCriticalSection(&w->lock);
+  if (i >= 0 && !ok) {
+    static bool reported = false;
+    if (!reported) {
+      reported = true;
+      gw_log("commit-on-touch at %08X failed: out of memory\n", guest);
+      gw_log_memory("at failure");
+      gw_dump_allocations();
+    }
+  }
   return ok;
 }
 
