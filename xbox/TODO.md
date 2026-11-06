@@ -77,9 +77,12 @@ order. Measurements are from XEMU at 64 MB unless noted.
 
 ## 7. Windows installer
 
-- [ ] Extract the LIVE container, prepare the files (converted formats where
-      that helps the Xbox), and write them to a folder that already holds
-      `default.xbe`.
+- [x] `xbox	ools\make_installer.ps1` builds `xboxuild\installer` (and a
+      zip): `install.cmd <LIVE package> <new folder>` checks the title,
+      extracts the package, writes and checks the game image, and fills the
+      folder next to `default.xbe`. Its output matches the staged test disc.
+- [ ] Format conversions for the Xbox (audio) once sound needs them.
+- [ ] The extractor prints every file; quieter output.
 
 ## 8. Housekeeping
 
