@@ -35,10 +35,12 @@ constexpr u32 C = 0x82000000, D = 0x82180000, K = 0x821A0000;
 constexpr u32 kCounter = K + 5892;
 constexpr u32 kRows = 88, kCols = 133, kPoint = 40, kRow = kCols * kPoint;  // 5320
 constexpr u32 kLineVertices = 4 + 131 * 8, kVertex = 28;
+// The displacements feed only the grid's distortion pass, which src/nv2a.cpp
+// does not draw yet: until it does they are not written.
 #ifdef GW_GRID_VERTICES
-constexpr bool kWriteVertices = true;
+constexpr bool kWriteDisplacements = true;
 #else
-constexpr bool kWriteVertices = false;  // nothing draws them yet (see update_row)
+constexpr bool kWriteDisplacements = false;
 #endif
 
 inline float lf(u32 a) {
@@ -243,11 +245,6 @@ void update_row(u32 args, u32 j, const Constants& k) {
     sf(p + 12 + write, y);
   }
 
-  // The lines and displacements feed only the glow layer and the grid's
-  // distortion pass, which src/nv2a.cpp does not draw yet: until it does
-  // they are not written (over half the work, and 2.6 MB of writes a frame).
-  if (!kWriteVertices) return;
-
   // 2. The row's lines: thin quads along each segment.
   const float thickness = lf(K + 6964) * lf(K + 5900);
   const u32 z = raw(K + 7016);
@@ -287,6 +284,7 @@ void update_row(u32 args, u32 j, const Constants& k) {
   }
 
   // 3. Displacements for the distortion pass.
+  if (!kWriteDisplacements) return;
   const u32 displacement = lw(K + 5884);
   const u32 zero_word = raw(C + 1740);
   auto displacements = [&](u32 out, u32 from) {
