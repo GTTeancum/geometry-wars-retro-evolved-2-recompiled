@@ -29,6 +29,43 @@ float gw_sine(float x) {
   return x < 0 ? -s : s;
 }
 
+namespace {
+
+// e^x in single precision for |x| < 80: x = k ln 2 + r, e^r from a degree-6
+// polynomial, times 2^k through the exponent bits.
+float exponential(float x) {
+  const float k = __builtin_floorf(x * 1.44269504f + 0.5f);
+  float r = x - k * 0.693359375f;
+  r -= k * -2.12194440e-4f;
+  float p = 1.0f / 720;
+  p = p * r + 1.0f / 120;
+  p = p * r + 1.0f / 24;
+  p = p * r + 1.0f / 6;
+  p = p * r + 0.5f;
+  p = p * r + 1.0f;
+  p = p * r + 1.0f;
+  const int e = (int)k + 127;
+  u32 bits = (u32)e << 23;
+  float scale;
+  memcpy(&scale, &bits, 4);
+  return p * scale;
+}
+
+}  // namespace
+
+extern "C" void __imp__sub_821308B8(PPCContext& ctx, uint8_t* base);
+
+// exp(f1) -> f1 (guest 0x821308B8); outside +-80 (near the float limits,
+// infinities, NaN) the original's double-precision path.
+extern "C" void sub_821308B8(PPCContext& ctx, uint8_t* base) {
+  const double x = ctx.f1.f64;
+  if (!(__builtin_fabs(x) < 80.0)) {
+    __imp__sub_821308B8(ctx, base);
+    return;
+  }
+  ctx.f1.f64 = (double)exponential((float)x);
+}
+
 // sin(f1) -> f1 (guest 0x8212E9B0).
 extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base) {
   const double x = ctx.f1.f64;

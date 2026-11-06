@@ -53,6 +53,8 @@ extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_82075548(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_820A91A0(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_821308B8(PPCContext& ctx, uint8_t* base);
+extern "C" void __imp__sub_821308B8(PPCContext& ctx, uint8_t* base) { original_sub_821308B8(ctx, base); }
 // The constant upload's full-buffer helper: never reached (the test buffer has room).
 extern "C" void sub_820A87B0(PPCContext&, uint8_t*) { gw_fatal("sub_820A87B0 reached"); }
 
@@ -444,6 +446,31 @@ int main(int argc, char** argv) {
     free(stars_before);
     free(image_before);
     free(want);
+  }
+
+  // Exponential (guest 0x821308B8): relative error over the game's range.
+  {
+    static PPCContext ctx;
+    double worst = 0, worst_x = 0;
+    for (int n = 0; n < 200000; ++n) {
+      const double x = (double)(float)((double)frand(-90, 90) * (n & 1 ? 1.0 : 0.05));
+      ctx = PPCContext{};
+      ctx.r1.u64 = kStack;
+      ctx.f1.f64 = x;
+      original_sub_821308B8(ctx, gw_host(0));
+      const double want = ctx.f1.f64;
+      ctx = PPCContext{};
+      ctx.r1.u64 = kStack;
+      ctx.f1.f64 = x;
+      sub_821308B8(ctx, gw_host(0));
+      const double err = fabs(want - ctx.f1.f64) / (fabs(want) > 1e-30 ? fabs(want) : 1.0);
+      if (err > worst) {
+        worst = err;
+        worst_x = x;
+      }
+    }
+    printf("exp: worst relative difference %.2g (at x = %g)\n", worst, worst_x);
+    if (worst > 1e-5) ++bad;
   }
 
   // Shader constant upload (guest 0x820A91A0): random dirty masks into a
