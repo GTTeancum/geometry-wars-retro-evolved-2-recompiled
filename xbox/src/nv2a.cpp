@@ -7,6 +7,7 @@
 // texture-times-colour combiner. Everything else (the glow chain, resolves,
 // clears, the grid) is skipped for now.
 #include "runtime.h"
+#include "xenos_vs.h"
 
 #include <hal/video.h>
 #include <pbkit/pbkit.h>
@@ -18,27 +19,6 @@
 #endif
 
 namespace {
-
-// Vertex shader fingerprints (FNV-1a of the microcode dwords), from
-// xbox/tools/gpu_capture.py captures.
-constexpr u32 kVsStars = 0xA1E03FA2;   // points: float3 pos, float3 colour (stride 24)
-constexpr u32 kVsQuads = 0xADB9F3EC;   // quads: float3 pos, float4 colour (stride 28)
-constexpr u32 kVsImage = 0x9DD94822;   // quads: float2 pos, float2 uv, float3 colour (stride 28)
-
-struct Layout {
-  u32 hash;
-  u32 stride;
-  u32 pos_count;    // floats at offset 0
-  int uv_offset;    // -1: none
-  int color_offset;
-  u32 color_count;
-};
-
-const Layout kLayouts[] = {
-    {kVsStars, 24, 3, -1, 12, 3},
-    {kVsQuads, 28, 3, -1, 12, 4},
-    {kVsImage, 28, 2, 8, 16, 3},
-};
 
 bool g_ready = false;
 }  // namespace
@@ -118,7 +98,22 @@ u32 nv_format(u32 w, u32 h) {
 // most 512x512 (the screen is 640x480), cached by address.
 Texture* texture_from_fetch(const u32* f) {
   u32 format = f[1] & 0x3F;
-  if (format != 6) return nullptr;
+  if (format != 6) {
+    static u32 reported[8];
+    bool seen = false;
+    for (u32 r : reported) seen |= r == (format | 0x100);
+    if (!seen) {
+      for (u32& r : reported) {
+        if (!r) {
+          r = format | 0x100;
+          break;
+        }
+      }
+      gw_log("nv2a: texture format %u not converted yet (%ux%u at %08X)\n", format, (f[2] & 0x1FFF) + 1,
+             ((f[2] >> 13) & 0x1FFF) + 1, f[1] & 0xFFFFF000);
+    }
+    return nullptr;
+  }
   u32 base = f[1] & 0xFFFFF000;
   u32 width = (f[2] & 0x1FFF) + 1, height = ((f[2] >> 13) & 0x1FFF) + 1;
   u32 key = base ^ (width << 1) ^ (height << 17);
@@ -266,33 +261,44 @@ struct CensusEntry {
 CensusEntry g_census[32];
 }  // namespace
 
-void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_hash) {
+void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_hash, const XvsProgram* vs,
+                  u32 ps_hash) {
   if (!g_ready) return;
-  {
-    u32 init = opcode == 0x22 ? words[1] : words[0];
-    for (CensusEntry& e : g_census) {
-      if (!e.hash || e.hash == vs_hash) {
-        e.hash = vs_hash;
-        ++e.draws;
-        e.prim = init & 0x3F;
-        e.vertices += init >> 16;
-        break;
-      }
-    }
-  }
-  const Layout* layout = nullptr;
-  for (const Layout& l : kLayouts) {
-    if (l.hash == vs_hash) layout = &l;
-  }
-  if (!layout) return;
   u32 initiator = opcode == 0x22 ? words[1] : words[0];
   u32 prim = initiator & 0x3F, source = (initiator >> 6) & 3, count = initiator >> 16;
-  if (source != 2 || count == 0) return;  // auto-indexed only for now
+  for (CensusEntry& e : g_census) {
+    if (!e.hash || e.hash == vs_hash) {
+      e.hash = vs_hash;
+      ++e.draws;
+      e.prim = prim;
+      e.vertices += count;
+      break;
+    }
+  }
+  if (!vs || count == 0) return;
+  // Colour draws into the main 1280-wide scene only: the glow chain, the
+  // grid's own target, resolves (mode 6) and clears (mode 5) wait.
+  if ((regs[0x2208] & 7) != 4 || (regs[0x2000] & 0x3FFF) != 1280) return;
   u32 nv_prim = prim == 1 ? NV097_SET_BEGIN_END_OP_POINTS
+              : prim == 2 ? NV097_SET_BEGIN_END_OP_LINES
+              : prim == 3 ? NV097_SET_BEGIN_END_OP_LINE_STRIP
               : prim == 4 ? NV097_SET_BEGIN_END_OP_TRIANGLES
+              : prim == 5 ? NV097_SET_BEGIN_END_OP_TRIANGLE_FAN
+              : prim == 6 ? NV097_SET_BEGIN_END_OP_TRIANGLE_STRIP
               : prim == 13 ? NV097_SET_BEGIN_END_OP_QUADS
               : 0;
   if (!nv_prim) return;
+  // Index source: 0 = index buffer (DRAW_INDX: viz, initiator, base, size),
+  // 2 = auto (0..count-1).
+  u32 index_base = 0, index_endian = 0;
+  bool index32 = (initiator >> 11) & 1;
+  if (source == 0) {
+    if (opcode != 0x22 || n < 4) return;
+    index_base = gw_gpu_to_guest(words[2]);
+    index_endian = words[3] >> 30;
+  } else if (source != 2) {
+    return;
+  }
   if (!g_in_frame) begin_frame();
   // pbkit's push buffer only empties at pb_reset (frame start): keep each
   // frame within it. A vertex costs 15 dwords, a draw's state ~30.
@@ -306,42 +312,57 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   }
   g_frame_bytes += cost;
 
-  // Stream 0 is vertex fetch slot 95.
-  u32 vf0 = regs[0x48BE], vf1 = regs[0x48BF];
-  u32 vbase = gw_gpu_to_guest(vf0 & ~3u), endian = vf1 & 3;
-  float m[16];
-  for (int i = 0; i < 16; ++i) m[i] = as_float(regs[0x4000 + i]);
   float vx_scale = as_float(regs[0x210F]), vx_off = as_float(regs[0x2110]);
   float vy_scale = as_float(regs[0x2111]), vy_off = as_float(regs[0x2112]);
   u32 vte = regs[0x2206];
 
+  // Pixel shader: which interpolator is the texture coordinate.
+  int uv_i = -1, tex_const = 0;
+  xps_info(ps_hash, &uv_i, &tex_const);
   const Texture* texture = &g_white;
-  if (layout->uv_offset >= 0) {
-    const Texture* t = texture_from_fetch(&regs[0x4800]);
-    if (t) texture = t;
+  if (prim != 1) {
+    // A draw whose texture can't be reproduced yet (render targets, float
+    // formats, computed coordinates) is skipped: many use replace blending
+    // and would paint flat shapes over the scene.
+    if (uv_i == -2) return;
+    if (uv_i >= 0) {
+      const Texture* t = texture_from_fetch(&regs[0x4800 + tex_const * 6]);
+      if (!t) return;
+      texture = t;
+    }
   }
+  if (uv_i < 0) uv_i = -1;
+  int color_i = uv_i == 0 ? 1 : 0;
   bind_texture(texture);
 
   u32 blend = regs[0x2201];
   u32* p = pb_begin();
   p = pb_push1(p, NV097_SET_BLEND_FUNC_SFACTOR, blend_factor(blend & 0x1F));
   p = pb_push1(p, NV097_SET_BLEND_FUNC_DFACTOR, blend_factor((blend >> 8) & 0x1F));
+  // Xenos BlendOp (add, subtract, min, max, reverse subtract) -> GL equation.
+  static const u32 kEquations[5] = {0x8006, 0x800A, 0x8007, 0x8008, 0x800B};
+  u32 op = (blend >> 5) & 7;
+  p = pb_push1(p, NV097_SET_BLEND_EQUATION, op < 5 ? kEquations[op] : 0x8006);
   if (prim == 1) p = pb_push1(p, NV097_SET_POINT_SIZE, 16);  // 2 px (units of 1/8)
   p = pb_push1(p, NV097_SET_BEGIN_END, nv_prim);
   pb_end(p);
 
   for (u32 i = 0; i < count; ++i) {
-    u32 v = vbase + i * layout->stride;
-    auto read = [&](u32 offset) {
+    u32 index = i;
+    if (source == 0) {
       u32 raw;
-      memcpy(&raw, gw_host(v + offset), 4);
-      return as_float(swap_endian(raw, endian));
-    };
-    float pos[4] = {read(0), read(4), layout->pos_count > 2 ? read(8) : 0.0f, 1.0f};
-    float clip[4];
-    for (int r = 0; r < 4; ++r) {
-      clip[r] = m[r * 4 + 0] * pos[0] + m[r * 4 + 1] * pos[1] + m[r * 4 + 2] * pos[2] + m[r * 4 + 3] * pos[3];
+      if (index32) {
+        memcpy(&raw, gw_host(index_base + i * 4), 4);
+        index = swap_endian(raw, index_endian);
+      } else {
+        u16 h;
+        memcpy(&h, gw_host(index_base + i * 2), 2);
+        raw = h;
+        index = index_endian ? (u16)((raw << 8) | (raw >> 8)) : raw;
+      }
     }
+    float clip[4], interp[8][4];
+    xvs_run(vs, regs, index, clip, interp);
     // PA_CL_VTE_CNTL: bit 8 = xy already divided, bits 0-3 = viewport
     // x/y scale and offset enables (off when the game sends pixels).
     float x = clip[0], y = clip[1];
@@ -354,21 +375,24 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     if (vte & 4) y *= vy_scale;
     if (vte & 8) y += vy_off;
     float sx = x * g_scale_x, sy = y * g_scale_y;
-    float w = clip[3];
-    float c[4] = {1, 1, 1, 1};
-    for (u32 k = 0; k < layout->color_count; ++k) c[k] = read(layout->color_offset + k * 4);
-    float u = 0, t = 0;
-    if (layout->uv_offset >= 0) {
-      u = read(layout->uv_offset);
-      t = read(layout->uv_offset + 4);
+    const float* c = interp[color_i];
+    {
+      static u32 logged_hashes[16];
+      static u32 logged_count;
+      bool seen = false;
+      for (u32 k = 0; k < logged_count; ++k) seen |= logged_hashes[k] == vs_hash;
+      if (!seen && logged_count < 16 && i == 0) {
+        logged_hashes[logged_count++] = vs_hash;
+        gw_log("nv2a: vs %08X ps %08X blend %08X colorcontrol %08X prim %u count %u\n", vs_hash, ps_hash,
+               regs[0x2201], regs[0x2202], prim, count);
+        gw_log("nv2a: vs %08X v%u clip %d %d %d %d -> %d,%d i0 %d %d %d %d i1 %d %d %d %d (x1000) uv%d\n", vs_hash,
+               index, (int)(clip[0] * 1000), (int)(clip[1] * 1000), (int)(clip[2] * 1000), (int)(clip[3] * 1000),
+               (int)sx, (int)sy, (int)(interp[0][0] * 1000), (int)(interp[0][1] * 1000), (int)(interp[0][2] * 1000),
+               (int)(interp[0][3] * 1000), (int)(interp[1][0] * 1000), (int)(interp[1][1] * 1000),
+               (int)(interp[1][2] * 1000), (int)(interp[1][3] * 1000), uv_i);
+      }
     }
-    static u32 logged = 0;
-    if (layout->hash == kVsImage && logged < 8) {
-      ++logged;
-      gw_log("nv2a: vte %X image v%u pos %d,%d clip %d,%d,%d w*1000=%d uv %d,%d colour*1000 %d,%d,%d\n", vte, i, (int)sx,
-             (int)sy, (int)(clip[0] * 1000), (int)(clip[1] * 1000), (int)(clip[2] * 1000), (int)(w * 1000),
-             (int)(u * 1000), (int)(t * 1000), (int)(c[0] * 1000), (int)(c[1] * 1000), (int)(c[2] * 1000));
-    }
+    float u = uv_i >= 0 ? interp[uv_i][0] : 0, t = uv_i >= 0 ? interp[uv_i][1] : 0;
     p = pb_begin();
     p = pb_push4f(p, NV097_SET_VERTEX_DATA4F_M + 3 * 16, c[0], c[1], c[2], c[3]);
     p = pb_push4f(p, NV097_SET_VERTEX_DATA4F_M + 9 * 16, u, t, 0, 1);

@@ -9,6 +9,7 @@
 //
 // A vblank thread raises the 60 Hz graphics interrupt.
 #include "runtime.h"
+#include "xenos_vs.h"
 
 #include <windows.h>
 
@@ -17,7 +18,8 @@ void gw_capture_shader(u32 type, u32 gpu_address, u32 guest_words, u32 dwords);
 void gw_capture_draw(u32 opcode, const u32* packet, u32 packet_dwords, const u32* regs);
 void gw_note_shader(u32 type, u32 hash, u32 guest_words, u32 dwords);
 void gw_nv2a_init();
-void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_hash);
+void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_hash, const XvsProgram* vs,
+                  u32 ps_hash);
 void gw_nv2a_swap();
 
 namespace {
@@ -48,6 +50,8 @@ CRITICAL_SECTION g_interrupt_lock;
 // FNV-1a of the current vertex shader's microcode: identifies the draw for
 // the NV2A renderer (inline shaders move around the ring every frame).
 u32 g_vs_hash;
+u32 g_ps_hash;
+const XvsProgram* g_vs_program;
 
 u32 shader_hash(u32 guest, u32 dwords) {
   u32 h = 0x811C9DC5;
@@ -166,7 +170,13 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
       gw_capture_shader(address_type & 3, address, gw_gpu_to_guest(address), start_size & 0xFFFF);
       u32 hash = shader_hash(gw_gpu_to_guest(address), start_size & 0xFFFF);
       gw_note_shader(address_type & 3, hash, gw_gpu_to_guest(address), start_size & 0xFFFF);
-      if ((address_type & 3) == 0) g_vs_hash = hash;
+      if ((address_type & 3) == 0) {
+        g_vs_hash = hash;
+        g_vs_program = xvs_load(hash, gw_gpu_to_guest(address), start_size & 0xFFFF);
+      } else {
+        g_ps_hash = hash;
+        xps_analyse(hash, gw_gpu_to_guest(address), start_size & 0xFFFF);
+      }
       break;
     }
     case 0x2B: {  // IM_LOAD_IMMEDIATE: shader microcode inline
@@ -178,7 +188,13 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
         gw_capture_shader(type & 3, 0x80000000u | guest, guest, dwords);
         u32 hash = shader_hash(guest, dwords);
         gw_note_shader(type & 3, hash, guest, dwords);
-        if ((type & 3) == 0) g_vs_hash = hash;
+        if ((type & 3) == 0) {
+          g_vs_hash = hash;
+          g_vs_program = xvs_load(hash, guest, dwords);
+        } else {
+          g_ps_hash = hash;
+          xps_analyse(hash, guest, dwords);
+        }
       }
       break;
     }
@@ -297,7 +313,7 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
       u32 n = count < 16 ? count : 16;
       for (u32 i = 0; i < n; ++i) words[i] = r.next();
       gw_capture_draw(opcode, words, n, g_regs);
-      gw_nv2a_draw(opcode, words, n, g_regs, g_vs_hash);
+      gw_nv2a_draw(opcode, words, n, g_regs, g_vs_hash, g_vs_program, g_ps_hash);
       break;
     }
     case 0x50: {  // SET_BIN_MASK

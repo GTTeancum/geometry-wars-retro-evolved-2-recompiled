@@ -78,6 +78,24 @@ One title frame (2026-11-05):
 Only 7 distinct vertex shaders and 12 distinct pixel shaders are used (the
 resolve vertex shaders are inline copies of one program).
 
+### Progress (2026-11-06)
+
+`src/nv2a.cpp` draws with pbkit. Vertex shaders run on the CPU through a
+small Xenos interpreter (`src/xenos_vs.cpp`), so every vertex shader works,
+including the title screen's sin/cos warps; pixel shaders are only analysed
+for which interpolator feeds the texture. Draws into the main 1280×720 scene
+are drawn: the starfield and the warped vector effects show in XEMU. The
+title logo area is masked black by the game (a min-blend pass) and filled by
+the glow/composite passes, which are not drawn yet.
+
+Still missing: the background grid (its own small target), render targets and
+resolves (the glow chain and composite, which bring the logo and colours),
+float texture formats, point sprites, and an efficient vertex path (per-vertex
+immediate data exceeds the push buffer on busy frames).
+
+Fixed on the way: the CP's read-pointer writeback was little-endian (hang at
+frame 453); the 256-buffer vertex pool now cycles through 32 buffers.
+
 Plan for the NV2A renderer (pbkit):
 
 1. Disassemble the 19 shaders (Xenos microcode) and write an NV2A
