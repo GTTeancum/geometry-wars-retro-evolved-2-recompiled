@@ -184,7 +184,9 @@ float as_float(u32 bits) {
 
 void begin_frame() {
   gw_nv2a_stage = 1;
-  pb_reset();
+  const u64 start = gw_wait_begin();
+  pb_reset();  // waits for the GPU to finish the previous frame
+  gw_wait_end(start, 0, "renderer: GPU finishing the previous frame");
   gw_nv2a_stage = 2;
   pb_target_back_buffer();
   pb_erase_depth_stencil_buffer(0, 0, pb_back_buffer_width(), pb_back_buffer_height());
@@ -592,23 +594,21 @@ void gw_nv2a_swap() {
   pb_erase_text_screen();
   pb_print("Geometry Wars RE2 - Xbox  frame %u\n", g_frames);
   pb_draw_text_screen();
-  // Bounded waits: a stuck NV2A is reported instead of freezing the game.
-  gw_nv2a_stage = 3;
-  DWORD start = GetTickCount();
-  while (pb_busy()) {
-    if (GetTickCount() - start > 1000) {
-      gw_log("nv2a: GPU still busy after 1 s at frame %u\n", g_frames);
-      break;
-    }
-  }
+  // The GPU draws this frame while the game builds the next one: the next
+  // frame's pb_reset (begin_frame) is what waits for it, so the vertex arena
+  // is only reused once the GPU is done with it. Here the flip is queued,
+  // which only waits while all three buffers are still on their way to the
+  // screen. Bounded: a stuck NV2A is reported instead of freezing the game.
   gw_nv2a_stage = 4;
-  start = GetTickCount();
+  const u64 queued = gw_wait_begin();
+  DWORD start = GetTickCount();
   while (pb_finished()) {
     if (GetTickCount() - start > 1000) {
       gw_log("nv2a: swap not accepted after 1 s at frame %u\n", g_frames);
       break;
     }
   }
+  gw_wait_end(queued, 0, "renderer: flip queue full");
   gw_nv2a_stage = 0;
   g_in_frame = false;
 }

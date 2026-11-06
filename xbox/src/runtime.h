@@ -108,6 +108,11 @@ struct GwStats {
 };
 extern GwStats gw_stats;
 
+// Wait timing by call site (src/wait_stats.cpp).
+u64 gw_wait_begin();
+void gw_wait_end(u64 start, u32 caller, const char* what);
+void gw_wait_report();
+
 // Controllers (src/input.cpp).
 void gw_input_init();
 bool gw_input_read(u32 user, u32 gamepad);

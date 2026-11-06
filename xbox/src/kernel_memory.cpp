@@ -76,43 +76,30 @@ GW_EXPORT(NtQueryVirtualMemory) {
 // MmAllocatePhysicalMemoryEx(flags, size, protect, min, max, alignment)
 // The spark particles' vertex buffers (92048 vertices of 28 bytes) are
 // triple-buffered and rewritten in full every frame: 7.5 MB that does not fit
-// in 64 MB with the rest of a level. The third buffer shares the first one's
-// memory, as the draws read a buffer before the game comes back to it two
-// frames later.
+// in 64 MB with the rest of a level. Only the glow pass draws them (shader
+// 8E1A294A), which src/nv2a.cpp does not draw yet, so all three share one
+// buffer. Give them their own memory again once the glow is drawn.
 namespace {
 constexpr u32 kSparkBufferSize = 0x2753C0;
 struct SharedBuffer {
   u32 address, users;
 };
-SharedBuffer g_spark_buffers[2];
+SharedBuffer g_sparks;
 
 u32 alloc_spark_buffer(u32 alignment) {
-  for (SharedBuffer& b : g_spark_buffers) {
-    if (!b.address) {
-      b.address = gw_physical_alloc(kSparkBufferSize, alignment);
-      b.users = b.address ? 1 : 0;
-      return b.address;
-    }
-  }
-  SharedBuffer& first = g_spark_buffers[0];
-  if (first.users == 1) {
-    first.users = 2;
-    return first.address;
-  }
-  return gw_physical_alloc(kSparkBufferSize, alignment);
+  if (!g_sparks.address) g_sparks.address = gw_physical_alloc(kSparkBufferSize, alignment);
+  if (g_sparks.address) ++g_sparks.users;
+  return g_sparks.address;
 }
 
-// True when the free was of a shared spark buffer (released on its last user).
+// True when the free was of the shared spark buffer (released on its last user).
 bool free_spark_buffer(u32 address) {
-  for (SharedBuffer& b : g_spark_buffers) {
-    if (!b.address || b.address != address) continue;
-    if (--b.users == 0) {
-      gw_physical_free(address);
-      b.address = 0;
-    }
-    return true;
+  if (!g_sparks.address || address != g_sparks.address) return false;
+  if (--g_sparks.users == 0) {
+    gw_physical_free(address);
+    g_sparks.address = 0;
   }
-  return false;
+  return true;
 }
 }  // namespace
 

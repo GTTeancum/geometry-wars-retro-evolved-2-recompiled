@@ -409,11 +409,17 @@ u32 wait_one(GwObject* obj, DWORD ms) {
 }  // namespace
 
 GW_EXPORT(KeWaitForSingleObject) {
-  GW_RETURN(wait_one(gw_object_from_guest(GW_ARG(3)), timeout_ms(GW_ARG(7))));
+  const u64 start = gw_wait_begin();
+  u32 r = wait_one(gw_object_from_guest(GW_ARG(3)), timeout_ms(GW_ARG(7)));
+  gw_wait_end(start, (u32)ctx.lr, "KeWaitForSingleObject");
+  GW_RETURN(r);
 }
 
 GW_EXPORT(NtWaitForSingleObjectEx) {
-  GW_RETURN(wait_one(gw_object_from_handle(GW_ARG(3)), timeout_ms(GW_ARG(6))));
+  const u64 start = gw_wait_begin();
+  u32 r = wait_one(gw_object_from_handle(GW_ARG(3)), timeout_ms(GW_ARG(6)));
+  gw_wait_end(start, (u32)ctx.lr, "NtWaitForSingleObjectEx");
+  GW_RETURN(r);
 }
 
 GW_EXPORT(KeWaitForMultipleObjects) {
@@ -424,7 +430,10 @@ GW_EXPORT(KeWaitForMultipleObjects) {
     GwObject* obj = gw_object_from_guest(gw_load32(objects + i * 4));
     hosts[i] = obj ? obj->host : nullptr;
   }
-  GW_RETURN(wait_result(WaitForMultipleObjects(count, hosts, wait_all, timeout_ms(GW_ARG(9)))));
+  const u64 start = gw_wait_begin();
+  u32 r = wait_result(WaitForMultipleObjects(count, hosts, wait_all, timeout_ms(GW_ARG(9))));
+  gw_wait_end(start, (u32)ctx.lr, "KeWaitForMultipleObjects");
+  GW_RETURN(r);
 }
 
 GW_EXPORT(NtSignalAndWaitForSingleObjectEx) {
@@ -435,12 +444,17 @@ GW_EXPORT(NtSignalAndWaitForSingleObjectEx) {
     else if (signal->type == ObjType::Semaphore) ReleaseSemaphore(signal->host, 1, nullptr);
     else if (signal->type == ObjType::Mutant) ReleaseMutex(signal->host);
   }
-  GW_RETURN(wait_one(wait, timeout_ms(GW_ARG(7))));
+  const u64 start = gw_wait_begin();
+  u32 r = wait_one(wait, timeout_ms(GW_ARG(7)));
+  gw_wait_end(start, (u32)ctx.lr, "NtSignalAndWaitForSingleObjectEx");
+  GW_RETURN(r);
 }
 
 GW_EXPORT(KeDelayExecutionThread) {
   DWORD ms = timeout_ms(GW_ARG(5));
+  const u64 start = gw_wait_begin();
   Sleep(ms == INFINITE ? 0xFFFFFFFE : ms);
+  gw_wait_end(start, (u32)ctx.lr, ms == 0 ? "KeDelayExecutionThread(0)" : "KeDelayExecutionThread");
   GW_RETURN(X_STATUS_SUCCESS);
 }
 

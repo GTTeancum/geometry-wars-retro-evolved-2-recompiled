@@ -372,7 +372,9 @@ DWORD WINAPI command_thread(LPVOID) {
   PPCContext& ctx = *gw_make_callback_context();
   gw_nv2a_init();  // pbkit is driven from this thread only
   for (;;) {
+    const u64 idle = gw_wait_begin();
     WaitForSingleObject(g_work_event, 16);
+    gw_wait_end(idle, 0, "command processor: waiting for commands");
     if (!g_ring_size) continue;
     u32 dwords = g_ring_size / 4;
     u32 write = g_write_index % dwords;
@@ -401,12 +403,16 @@ DWORD WINAPI vblank_thread(LPVOID) {
   const i64 period = frequency.QuadPart / 60;
   for (;;) {
     next.QuadPart += period;
+    // Sleep whole milliseconds and fire up to 1 ms early rather than spin
+    // (Sleep(0) at this priority would keep the game's threads off the CPU);
+    // 'next' advances by exact periods, so the rate stays 60 Hz.
     for (;;) {
       QueryPerformanceCounter(&now);
-      i64 left = next.QuadPart - now.QuadPart;
-      if (left <= 0) break;
-      Sleep((DWORD)(left * 1000 / frequency.QuadPart) > 1 ? 1 : 0);
+      const i64 left_ms = (next.QuadPart - now.QuadPart) * 1000 / frequency.QuadPart;
+      if (left_ms <= 0) break;
+      Sleep((DWORD)left_ms);
     }
+    gw_wait_report();
     __try {
       dispatch_interrupt(ctx, 0);
     } __except (gw_fault_filter(GetExceptionInformation())) {
