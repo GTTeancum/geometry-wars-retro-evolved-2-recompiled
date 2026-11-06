@@ -120,7 +120,15 @@ void gw_status_init() {
   InitializeCriticalSection(&g_log_lock);
   g_log_ready = true;
   // 16-bit: pbkit sizes its back buffers from this mode (memory is tight).
+  // make VIDEO=720p asks for 1280x720 (the game's own resolution; needs a
+  // component or HDMI connection with 720p enabled in the console settings)
+  // and falls back to 640x480. It costs about 6 MB more than 640x480: three
+  // 1280x720 colour buffers and pbkit's 32-bit depth buffer.
+#ifdef GW_VIDEO_720P
+  if (!XVideoSetMode(1280, 720, 16, REFRESH_DEFAULT)) XVideoSetMode(640, 480, 16, REFRESH_DEFAULT);
+#else
   XVideoSetMode(640, 480, 16, REFRESH_DEFAULT);
+#endif
   CreateThread(nullptr, 0, status_thread, nullptr, 0, nullptr);
 }
 

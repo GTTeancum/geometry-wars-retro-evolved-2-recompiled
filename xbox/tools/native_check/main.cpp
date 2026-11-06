@@ -15,6 +15,7 @@
 #include <windows.h>
 
 #include "runtime.h"
+#include "dxt.h"
 
 // The recompiled original, renamed so it can sit beside the native one.
 // What the extracted originals call by name.
@@ -419,6 +420,49 @@ int main(int argc, char** argv) {
     free(stars_before);
     free(image_before);
     free(want);
+  }
+
+  // DXT5 texture compression: round trip of a text-like image (white glyphs,
+  // alpha 0/255), a smooth gradient and noise. Text and gradient must come
+  // back close; noise only shows the worst case.
+  {
+    struct Case {
+      const char* name;
+      int kind;
+      float mean_limit;
+    } cases[] = {{"text", 0, 4.0f}, {"gradient", 1, 3.0f}, {"noise", 2, 1000.0f}};
+    for (const Case& c : cases) {
+      double total = 0;
+      int worst = 0;
+      const int blocks = 4096;
+      for (int n = 0; n < blocks; ++n) {
+        u32 px[16], back[16];
+        for (int i = 0; i < 16; ++i) {
+          const int x = (n % 64) * 4 + (i & 3), y = (n / 64) * 4 + (i >> 2);
+          if (c.kind == 0) {
+            const bool ink = ((x * 7 + y * 13) % 11 < 4) ^ ((x / 3 + y / 5) & 1);
+            px[i] = ink ? 0xFFFFFFFFu : 0x00FFFFFFu;
+          } else if (c.kind == 1) {
+            px[i] = 0xFF000000u | (u32)(x & 255) << 16 | (u32)(y & 255) << 8 | (u32)((x + y) / 2 & 255);
+          } else {
+            px[i] = (u32)rand() << 16 ^ (u32)rand();
+          }
+        }
+        u8 block[16];
+        gw_dxt5_block(px, block);
+        gw_dxt5_decode_block(block, back);
+        for (int i = 0; i < 16; ++i) {
+          for (int s = 0; s < 32; s += 8) {
+            const int e = abs((int)((px[i] >> s) & 255) - (int)((back[i] >> s) & 255));
+            total += e;
+            if (e > worst) worst = e;
+          }
+        }
+      }
+      const double mean = total / (blocks * 16 * 4);
+      printf("DXT5 %-8s: mean error %.2f, worst %d (of 255)\n", c.name, mean, worst);
+      if (mean > c.mean_limit) ++bad;
+    }
   }
 
   // Vector load/store byte reversal (prepare_generated.py) against SIMDe.

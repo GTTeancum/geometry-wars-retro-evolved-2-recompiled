@@ -7,6 +7,7 @@
 // texture-times-colour combiner. Everything else (the glow chain, resolves,
 // clears, the grid) is skipped for now.
 #include "runtime.h"
+#include "dxt.h"
 #include "xenos_vs.h"
 
 #include <hal/video.h>
@@ -92,14 +93,16 @@ u32 swap_endian(u32 v, u32 endian) {
   }
 }
 
-u32 nv_format(u32 w, u32 h) {
-  return 1 | (2 << 4) | NV097_SET_TEXTURE_FORMAT_BORDER_SOURCE |
-         (NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8 << 8) | (1 << 16) | (log2_ceil(w) << 20) |
+u32 nv_format(u32 w, u32 h, u32 colour = NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8) {
+  return 1 | (2 << 4) | NV097_SET_TEXTURE_FORMAT_BORDER_SOURCE | (colour << 8) | (1 << 16) | (log2_ceil(w) << 20) |
          (log2_ceil(h) << 24);
 }
 
-// Converts a k_8_8_8_8 texture to a swizzled A8R8G8B8 NV2A texture of at
-// most 512x512 (the screen is 640x480), cached by address.
+// Converts a k_8_8_8_8 texture to an NV2A texture, cached by address: sides
+// rounded to powers of two (down where up would grow them by over half), at
+// most 1024. Up to 256x256 as swizzled A8R8G8B8; larger ones (fonts, title
+// art) as DXT5, which keeps their full resolution, and so the text sharp, in
+// a quarter of the memory.
 Texture* texture_from_fetch(const u32* f) {
   u32 format = f[1] & 0x3F;
   if (format != 6) {
@@ -137,29 +140,43 @@ Texture* texture_from_fetch(const u32* f) {
   // (300 -> 256, not 512): converted textures are a large share of memory.
   if (tw > width + width / 2) tw >>= 1;
   if (th > height + height / 2) th >>= 1;
-  if (tw > 512) tw = 512;
-  if (th > 512) th = 512;
-  u32* pixels = (u32*)MmAllocateContiguousMemoryEx(tw * th * 4, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
+  if (tw > 1024) tw = 1024;
+  if (th > 1024) th = 1024;
+  const bool compressed = (tw > 256 || th > 256) && tw >= 4 && th >= 4;
+  const u32 bytes = compressed ? tw * th : tw * th * 4;
+  u32* pixels = (u32*)MmAllocateContiguousMemoryEx(bytes, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
   if (!pixels) return nullptr;
   bool tiled = f[0] >> 31;
   u32 pitch = ((f[0] >> 22) & 0x1FF) * 32;
   u32 endian = (f[1] >> 6) & 3;
   const u8* src = gw_host(gw_gpu_to_guest(base));
-  for (u32 y = 0; y < th; ++y) {
-    u32 sy = y * height / th;
-    u32 row = tiled ? tiled_row(sy, pitch, 2) : 0;
-    for (u32 x = 0; x < tw; ++x) {
-      u32 sx = x * width / tw;
-      u32 offset = tiled ? (tiled_column(sx, sy, 2, row) >> 2) * 4 : (sy * pitch + sx) * 4;
-      u32 raw;
-      memcpy(&raw, src + offset, 4);
-      pixels[swizzle_offset(x, y, tw, th)] = swap_endian(raw, endian);
+  // The source pixel for (x, y) of the converted texture (nearest).
+  auto texel = [&](u32 x, u32 y) {
+    const u32 sx = x * width / tw, sy = y * height / th;
+    const u32 offset = tiled ? (tiled_column(sx, sy, 2, tiled_row(sy, pitch, 2)) >> 2) * 4 : (sy * pitch + sx) * 4;
+    u32 raw;
+    memcpy(&raw, src + offset, 4);
+    return swap_endian(raw, endian);
+  };
+  if (compressed) {
+    u8* out = (u8*)pixels;
+    for (u32 by = 0; by < th; by += 4) {
+      for (u32 bx = 0; bx < tw; bx += 4, out += 16) {
+        u32 block[16];
+        for (u32 i = 0; i < 16; ++i) block[i] = texel(bx + (i & 3), by + (i >> 2));
+        gw_dxt5_block(block, out);
+      }
+    }
+  } else {
+    for (u32 y = 0; y < th; ++y) {
+      for (u32 x = 0; x < tw; ++x) pixels[swizzle_offset(x, y, tw, th)] = texel(x, y);
     }
   }
   slot->key = key;
   slot->pixels = pixels;
-  slot->format = nv_format(tw, th);
-  gw_log("nv2a: texture %08X %ux%u%s -> %ux%u\n", base, width, height, tiled ? " tiled" : "", tw, th);
+  slot->format = compressed ? nv_format(tw, th, NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8) : nv_format(tw, th);
+  gw_log("nv2a: texture %08X %ux%u%s -> %ux%u%s\n", base, width, height, tiled ? " tiled" : "", tw, th,
+         compressed ? " DXT5" : "");
   // Large images (the title screens) are only read by the GPU: once
   // converted, the 360-format original gives its memory back. A later touch
   // recommits it as zeros.

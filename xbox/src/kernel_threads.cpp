@@ -231,7 +231,8 @@ void run_guest(GwThread* t) {
   }
   PPCFunc* func = gw_lookup(address);
   if (!func) gw_fatal("thread start %08X is not a known function", address);
-  gw_log("thread %u starts at %08X (host thread %u, kernel thread %08X)\n", t->thread_id, address, (u32)GetCurrentThreadId(), gw_kthread());
+  gw_log("thread %u starts at %08X (host thread %u, kernel thread %08X)\n", t->thread_id, address,
+         (u32)GetCurrentThreadId(), gw_kthread());
   __try {
     func(ctx, GW_MEMBASE);
   } __except (gw_fault_filter(GetExceptionInformation())) {

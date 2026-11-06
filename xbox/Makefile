@@ -28,6 +28,11 @@ $(GEN_OBJS): NXDK_CXXFLAGS += -Ibuild/gen -O2
 # shader interpreter) into a call; the runtime gets the builtins back.
 $(RUNTIME_OBJS): NXDK_CXXFLAGS += -fbuiltin -mfpmath=sse
 
+# 1280x720 output instead of 640x480: make VIDEO=720p
+ifeq ($(VIDEO),720p)
+src/status.obj: NXDK_CXXFLAGS += -DGW_VIDEO_720P
+endif
+
 # Compare the native grid update with the original now and then: make GRID_CHECK=y
 ifeq ($(GRID_CHECK),y)
 src/grid_native.obj: NXDK_CXXFLAGS += -DGW_GRID_CHECK

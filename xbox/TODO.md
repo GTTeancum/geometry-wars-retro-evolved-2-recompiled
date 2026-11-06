@@ -18,7 +18,9 @@ order. Measurements are from XEMU at 64 MB unless noted.
       the 360's 6 hardware threads; the Xbox has one core, so every hand-off
       is a context switch. Try running the jobs inline on the calling thread.
 - [ ] **Output 1280x720.** The back buffer is 640x480 today (`nv2a: ready,
-      640x480`), the game's 1280x720 scene scaled down. 720p needs the
+      640x480`), the game's 1280x720 scene scaled down. `make VIDEO=720p`
+      (touch `src/status.cpp` first) asks for 1280x720 and falls back to
+      640x480; try it once the memory census shows 6 MB to spare. 720p needs the
       component/HDMI video modes on hardware and about 1.8 MB per 16-bit
       buffer (three buffers plus depth); budget it against memory (section 4).
 - [ ] Measure on real hardware: XEMU's speed is not the Xbox's.
@@ -28,10 +30,10 @@ order. Measurements are from XEMU at 64 MB unless noted.
 
 ## 2. Readable text
 
-- [ ] Fonts and UI art are converted at 512x512 at most (`texture_from_fetch`
-      in `src/nv2a.cpp`); the 1024x1024 atlas loses half its resolution.
-      Allow 1024 (or keep the original size), possibly in a 16-bit or DXT
-      format to hold memory.
+- [ ] Fonts and UI art were converted at 512x512 at most, halving the
+      1024x1024 atlas. Now (not yet seen in XEMU): up to 1024, and textures
+      larger than 256 as DXT5 (`src/dxt.cpp`), so full resolution costs less
+      memory than before. Check the text on screen.
 - [ ] Texture filtering and the 640x480 output also soften text; 720p helps.
 - [ ] Texture format 26 (seen as 18x12) is not converted yet.
 - [ ] Remove the debug overlay ("Geometry Wars RE2 - Xbox frame N") once
