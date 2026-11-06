@@ -27,7 +27,10 @@ u32 gw_capture[3 + kCaptureWords];
 
 namespace {
 
-constexpr u32 kCaptureSwap = 120;
+#ifndef GW_CAPTURE_SWAP
+#define GW_CAPTURE_SWAP 120
+#endif
+constexpr u32 kCaptureSwap = GW_CAPTURE_SWAP;
 constexpr u32 kCapacity = sizeof(gw_capture) / 4 - 3;
 
 constexpr u32 kContextBase = 0x2000, kContextCount = 0x400;

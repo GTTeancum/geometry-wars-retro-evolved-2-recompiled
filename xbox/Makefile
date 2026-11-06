@@ -24,7 +24,7 @@ $(GEN_OBJS): NXDK_CXXFLAGS += -Ibuild/gen -Os
 
 # One-frame GPU capture buffer (xbox/tools/gpu_capture.py): make CAPTURE=y
 ifeq ($(CAPTURE),y)
-src/gpu_capture.obj: NXDK_CXXFLAGS += -DGW_CAPTURE
+src/gpu_capture.obj: NXDK_CXXFLAGS += -DGW_CAPTURE -DGW_CAPTURE_SWAP=$(or $(CAPTURE_SWAP),120)
 endif
 
 NXDK_LDFLAGS += /opt:ref /map:build/gw2.map

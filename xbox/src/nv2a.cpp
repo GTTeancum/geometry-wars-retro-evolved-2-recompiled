@@ -30,8 +30,10 @@ volatile u32 gw_nv2a_stage = 0;
 
 namespace {
 bool g_in_frame = false;
-constexpr u32 kFrameBudget = 448 * 1024;  // of pbkit's default 512 KiB
-u32 g_frame_bytes;
+// Per-frame vertex arena, 20 bytes a vertex.
+constexpr u32 kArenaVertices = 768 * 1024 / 20;
+u32* g_arena;
+u32 g_arena_used;
 float g_scale_x, g_scale_y;
 u32 g_frames;
 
@@ -162,6 +164,12 @@ Texture* texture_from_fetch(const u32* f) {
   return slot;
 }
 
+// Colour as D3DCOLOR (A8R8G8B8); HDR values above 1 saturate.
+u32 pack_color(const float* c) {
+  auto byte = [](float v) -> u32 { return v <= 0 ? 0 : v >= 1 ? 255 : (u32)(v * 255.0f + 0.5f); };
+  return (byte(c[3]) << 24) | (byte(c[0]) << 16) | (byte(c[1]) << 8) | byte(c[2]);
+}
+
 float as_float(u32 bits) {
   float f;
   memcpy(&f, &bits, 4);
@@ -182,8 +190,24 @@ void begin_frame() {
   p = pb_push1(p, NV097_SET_CULL_FACE_ENABLE, 0);
   p = pb_push1(p, NV097_SET_BLEND_ENABLE, 1);
   pb_end(p);
+  // Vertex arrays in the arena: position (2 floats), diffuse (D3DCOLOR),
+  // texcoord 0 (2 floats), 20 bytes a vertex; every other attribute off.
+  u32 arena = (u32)g_arena & 0x03FFFFFF;
+  for (u32 attr = 0; attr < 16; attr += 4) {
+    p = pb_begin();
+    for (u32 a = attr; a < attr + 4; ++a) {
+      u32 format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F;
+      u32 offset = 0;
+      if (a == 0) format |= (2 << 4) | (20 << 8), offset = 0;
+      if (a == 3) format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D | (4 << 4) | (20 << 8), offset = 8;
+      if (a == 9) format |= (2 << 4) | (20 << 8), offset = 12;
+      p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_FORMAT + a * 4, format);
+      if (a == 0 || a == 3 || a == 9) p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + a * 4, arena + offset);
+    }
+    pb_end(p);
+  }
+  g_arena_used = 0;
   g_in_frame = true;
-  g_frame_bytes = 0;
 }
 
 void bind_texture(const Texture* t) {
@@ -239,6 +263,12 @@ void gw_nv2a_init() {
 #include "nv2a_ps.inl"
   pb_end(p);
 
+  g_arena = (u32*)MmAllocateContiguousMemoryEx(kArenaVertices * 20, 0, 0x03FFAFFF, 0,
+                                               PAGE_READWRITE | PAGE_WRITECOMBINE);
+  if (!g_arena) {
+    gw_log("nv2a: no memory for the vertex arena\n");
+    return;
+  }
   g_white.pixels = (u32*)MmAllocateContiguousMemoryEx(16, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
   for (int i = 0; i < 4; ++i) g_white.pixels[i] = 0xFFFFFFFF;
   g_white.format = nv_format(2, 2);
@@ -300,17 +330,16 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     return;
   }
   if (!g_in_frame) begin_frame();
-  // pbkit's push buffer only empties at pb_reset (frame start): keep each
-  // frame within it. A vertex costs 15 dwords, a draw's state ~30.
-  u32 cost = count * 15 * 4 + 160;
-  if (g_frame_bytes + cost > kFrameBudget) {
+  // Vertices go to this frame's arena (read by the NV2A); it is reused each
+  // frame because the swap waits for the GPU to finish.
+  if (g_arena_used + count > kArenaVertices) {
     static u32 reported = 0;
     if (reported++ < 4) {
-      gw_log("nv2a: frame %u over budget, skipping %u vertices (shader %08X)\n", g_frames, count, vs_hash);
+      gw_log("nv2a: frame %u vertex arena full, skipping %u vertices (shader %08X)\n", g_frames, count, vs_hash);
     }
     return;
   }
-  g_frame_bytes += cost;
+  if ((prim == 3 || prim == 5 || prim == 6) && count > 256) return;  // strips/fans aren't split
 
   float vx_scale = as_float(regs[0x210F]), vx_off = as_float(regs[0x2110]);
   float vy_scale = as_float(regs[0x2111]), vy_off = as_float(regs[0x2112]);
@@ -344,8 +373,8 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   u32 op = (blend >> 5) & 7;
   p = pb_push1(p, NV097_SET_BLEND_EQUATION, op < 5 ? kEquations[op] : 0x8006);
   if (prim == 1) p = pb_push1(p, NV097_SET_POINT_SIZE, 16);  // 2 px (units of 1/8)
-  p = pb_push1(p, NV097_SET_BEGIN_END, nv_prim);
   pb_end(p);
+  u32 first = g_arena_used;
 
   for (u32 i = 0; i < count; ++i) {
     u32 index = i;
@@ -381,8 +410,11 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
       static u32 logged_count;
       bool seen = false;
       for (u32 k = 0; k < logged_count; ++k) seen |= logged_hashes[k] == vs_hash;
-      if (!seen && logged_count < 16 && i == 0) {
-        logged_hashes[logged_count++] = vs_hash;
+      // Each shader's first vertex is logged once; every 600 frames the
+      // first two vertices of every draw are logged again.
+      bool periodic = g_frames % 600 == 599 && i < 2;
+      if (periodic || (!seen && logged_count < 16 && i == 0)) {
+        if (!seen && logged_count < 16) logged_hashes[logged_count++] = vs_hash;
         gw_log("nv2a: vs %08X ps %08X blend %08X colorcontrol %08X prim %u count %u\n", vs_hash, ps_hash,
                regs[0x2201], regs[0x2202], prim, count);
         gw_log("nv2a: vs %08X v%u clip %d %d %d %d -> %d,%d i0 %d %d %d %d i1 %d %d %d %d (x1000) uv%d\n", vs_hash,
@@ -393,15 +425,26 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
       }
     }
     float u = uv_i >= 0 ? interp[uv_i][0] : 0, t = uv_i >= 0 ? interp[uv_i][1] : 0;
-    p = pb_begin();
-    p = pb_push4f(p, NV097_SET_VERTEX_DATA4F_M + 3 * 16, c[0], c[1], c[2], c[3]);
-    p = pb_push4f(p, NV097_SET_VERTEX_DATA4F_M + 9 * 16, u, t, 0, 1);
-    p = pb_push4f(p, NV097_SET_VERTEX_DATA4F_M, sx, sy, 0, 1);
-    pb_end(p);
+    // Packed vertex: x, y, D3DCOLOR, u, v (layout set in begin_frame).
+    u32* out = &g_arena[(first + i) * 5];
+    memcpy(&out[0], &sx, 4);
+    memcpy(&out[1], &sy, 4);
+    out[2] = pack_color(c);
+    memcpy(&out[3], &u, 4);
+    memcpy(&out[4], &t, 4);
   }
-  p = pb_begin();
-  p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
-  pb_end(p);
+  g_arena_used += count;
+  // DRAW_ARRAYS takes at most 256 vertices; 252 keeps quads and triangles
+  // whole. pbkit blocks stay well under its 128-dword limit.
+  for (u32 start = 0; start < count;) {
+    u32 n = count - start > 252 ? 252 : count - start;
+    p = pb_begin();
+    p = pb_push1(p, NV097_SET_BEGIN_END, nv_prim);
+    p = pb_push1(p, 0x40000000 | NV097_DRAW_ARRAYS, ((n - 1) << 24) | (first + start));
+    p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
+    pb_end(p);
+    start += n;
+  }
 }
 
 // Called on each guest swap: shows the frame drawn since the last one.
