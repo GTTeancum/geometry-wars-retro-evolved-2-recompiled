@@ -41,12 +41,27 @@ order. Measurements are from XEMU at 64 MB unless noted.
 
 ## 3. Glow
 
+- [ ] Our own glow (`apply_glow` in `src/nv2a.cpp`, on by default, `make
+      GLOW=n` without): the finished picture shrunk 4x, blurred, added back.
+      Not yet seen in XEMU. Stand-in until the game's own chain below.
+- The game's chain (from the menu capture): the grid and the scene are
+  drawn into float targets, resolved, shrunk and blurred through about 80
+  small passes down to 2x1, summed per pyramid and composited with a tone
+  curve. Its pixel shaders read as weighted texture sums
+  (`xps_sum_of`, checked by `tools\vp_check.cmd` on `_ps_` captures), and
+  `nv2a_sum_ps.ps.cg` sums four textures; what is missing is render targets
+  other than the screen (pbkit only renders to the screen and its extra
+  buffers) and resolves into textures.
+
 - [ ] Render targets and resolves: the 360 draws the glow chain and the
       composite into EDRAM targets and resolves them to textures. On the NV2A
       they become surfaces in memory; resolves become no-ops or copies.
-- [ ] Draw the glow pass (vertex shaders C5C713E2 for particles, 8E1A294A for
-      sparks, plus the blur/composite passes), likely at reduced resolution.
-- [ ] Then give the glow-pass particle buffers and the spark buffers their
+- [ ] Draw the glow-layer draws (vertex shader C5C713E2 for particles,
+      8E1A294A for the in-level grid lines, whose three line buffers
+      src/kernel_memory.cpp took for spark buffers), plus the blur and
+      composite passes, likely at reduced resolution. The frame census now
+      says why each skipped draw was skipped.
+- [ ] Then give the glow-pass particle buffers and the grid-line buffers their
       own memory again (`src/particle_buffers.cpp`, `src/kernel_memory.cpp`
       share them while nothing draws them): about 10 MB that section 4 must
       find first.
@@ -74,6 +89,10 @@ order. Measurements are from XEMU at 64 MB unless noted.
 
 - [ ] Audio output (XAudio render driver callback) and the game's XMA music
       and effects: decode XMA on the Xbox or convert in the installer.
+      The banks (`audio\*.baf`: BANK, then 0x5C-byte WAVE records with
+      offset, size, rate 48000, 16-bit, mono) hold XMA (sizes in 2 KB
+      packets), effects and music alike, so nothing plays without a decoder
+      or a conversion; the game's sound engine then has to be fed PCM.
 
 ## 7. Windows installer
 

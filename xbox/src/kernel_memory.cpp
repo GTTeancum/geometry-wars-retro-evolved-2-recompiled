@@ -74,30 +74,31 @@ GW_EXPORT(NtQueryVirtualMemory) {
 }
 
 // MmAllocatePhysicalMemoryEx(flags, size, protect, min, max, alignment)
-// The spark particles' vertex buffers (92048 vertices of 28 bytes) are
-// triple-buffered and rewritten in full every frame: 7.5 MB that does not fit
-// in 64 MB with the rest of a level. Only the glow pass draws them (shader
-// 8E1A294A), which src/nv2a.cpp does not draw yet, so all three share one
-// buffer. Give them their own memory again once the glow is drawn.
+// The in-level grid's line vertex buffers (92048 vertices of 28 bytes,
+// written by the grid job in src/grid_native.cpp, drawn by vertex shader
+// 8E1A294A into the glow layer) are triple-buffered and rewritten in full
+// every frame: 7.5 MB that does not fit in 64 MB with the rest of a level.
+// src/nv2a.cpp does not draw the glow layer yet, so all three share one
+// buffer. Give them their own memory again once the grid is drawn.
 namespace {
-constexpr u32 kSparkBufferSize = 0x2753C0;
+constexpr u32 kGridLineBufferSize = 0x2753C0;
 struct SharedBuffer {
   u32 address, users;
 };
-SharedBuffer g_sparks;
+SharedBuffer g_grid_lines;
 
-u32 alloc_spark_buffer(u32 alignment) {
-  if (!g_sparks.address) g_sparks.address = gw_physical_alloc(kSparkBufferSize, alignment);
-  if (g_sparks.address) ++g_sparks.users;
-  return g_sparks.address;
+u32 alloc_grid_line_buffer(u32 alignment) {
+  if (!g_grid_lines.address) g_grid_lines.address = gw_physical_alloc(kGridLineBufferSize, alignment);
+  if (g_grid_lines.address) ++g_grid_lines.users;
+  return g_grid_lines.address;
 }
 
-// True when the free was of the shared spark buffer (released on its last user).
-bool free_spark_buffer(u32 address) {
-  if (!g_sparks.address || address != g_sparks.address) return false;
-  if (--g_sparks.users == 0) {
+// True when the free was of the shared grid line buffer (released on its last user).
+bool free_grid_line_buffer(u32 address) {
+  if (!g_grid_lines.address || address != g_grid_lines.address) return false;
+  if (--g_grid_lines.users == 0) {
     gw_physical_free(address);
-    g_sparks.address = 0;
+    g_grid_lines.address = 0;
   }
   return true;
 }
@@ -106,7 +107,7 @@ bool free_spark_buffer(u32 address) {
 GW_EXPORT(MmAllocatePhysicalMemoryEx) {
   u32 size = GW_ARG(4), alignment = GW_ARG(8);
   alignment = alignment > 0x1000 ? alignment : 0x1000;
-  u32 result = size == kSparkBufferSize ? alloc_spark_buffer(alignment) : gw_physical_alloc(size, alignment);
+  u32 result = size == kGridLineBufferSize ? alloc_grid_line_buffer(alignment) : gw_physical_alloc(size, alignment);
   gw_log("MmAllocatePhysicalMemoryEx(%X, align %X) -> %08X lr %08X\n", size, alignment, result, (u32)ctx.lr);
   static int traced_128k = 0;
   if (size >= 0x100000 || (size == 0x20000 && traced_128k++ % 50 == 0)) gw_log_backtrace(ctx);
@@ -114,7 +115,7 @@ GW_EXPORT(MmAllocatePhysicalMemoryEx) {
 }
 
 GW_EXPORT(MmFreePhysicalMemory) {
-  if (!free_spark_buffer(GW_ARG(4))) gw_physical_free(GW_ARG(4));
+  if (!free_grid_line_buffer(GW_ARG(4))) gw_physical_free(GW_ARG(4));
 }
 
 GW_EXPORT(MmGetPhysicalAddress) {

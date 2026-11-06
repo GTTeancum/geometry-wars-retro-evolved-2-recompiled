@@ -38,7 +38,7 @@ u32 g_arena_used;  // bytes
 // Draw with translated NV2A vertex programs (else the CPU interpreter).
 bool g_use_gpu_vertex = true;
 float g_scale_x, g_scale_y;
-// Our own glow over each frame (make GLOW=y; see apply_glow).
+// Our own glow over each frame (on unless make GLOW=n; see apply_glow).
 #ifdef GW_GLOW
 constexpr bool kGlow = true;
 #else
@@ -538,8 +538,9 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 count, 
 
 // --- Glow --------------------------------------------------------------------------------
 // The game builds its glow from about 80 passes over float render targets
-// (see TODO.md). Until those are reproduced, make GLOW=y adds a glow of our
-// own at the end of each frame: the finished picture shrunk to a quarter
+// (see TODO.md). Until those are reproduced, a glow of our
+// own is added at the end of each frame (make GLOW=n leaves it out): the
+// finished picture shrunk to a quarter
 // (each pixel the average of 4x4), blurred across and down (8 texels each
 // way), and added back over the picture. It uses pbkit's two extra buffers
 // (640x480, 16-bit: 1.2 MB) and the four-texture sum combiner
