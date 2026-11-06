@@ -46,8 +46,29 @@ void tail_lines(char* out, size_t out_size, int lines) {
   out[n] = 0;
 }
 
+// On hardware there is no monitor to read the ring: every 5 s it goes to
+// D:\gw2log.txt next to the game (fails quietly on a read-only disc), with
+// the counters and the frame rate first.
+void write_log_file(u32 fps) {
+  static char text[sizeof(gw_log_ring) + 256];
+  EnterCriticalSection(&g_log_lock);
+  int n = snprintf(text, 256, "frames %u (%u/s) interrupts %u gpu_packets %u draws %u guest %u KiB%s%s\n",
+                   gw_stats.swaps, fps, gw_stats.interrupts, gw_stats.gpu_packets, gw_stats.gpu_draws,
+                   gw_memory_committed() >> 10, g_fatal ? " FATAL: " : "", g_fatal ? g_fatal_text : "");
+  if (n < 0 || n > 255) n = 255;
+  const u32 end = gw_log_pos, start = end > sizeof(gw_log_ring) ? end - sizeof(gw_log_ring) : 0;
+  for (u32 p = start; p < end; ++p) text[n++] = gw_log_ring[p & (sizeof(gw_log_ring) - 1)];
+  LeaveCriticalSection(&g_log_lock);
+  HANDLE f = CreateFileA("D:\\gw2log.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return;
+  DWORD written;
+  WriteFile(f, text, (DWORD)n, &written, nullptr);
+  CloseHandle(f);
+}
+
 DWORD WINAPI status_thread(LPVOID) {
   static char tail[2048];
+  u32 seconds = 0;
   u32 last_swaps = 0;
   DWORD last_tick = GetTickCount();
   u32 fps = 0;
@@ -64,6 +85,7 @@ DWORD WINAPI status_thread(LPVOID) {
     if (swaps != last_swaps) stalled_seconds = 0;
     last_swaps = swaps;
     last_tick = now;
+    if (++seconds % 5 == 0) write_log_file(fps);
     EnterCriticalSection(&g_log_lock);
     tail_lines(tail, sizeof(tail), 10);
     // Clip each line to the screen width so wrapping never scrolls the

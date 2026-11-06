@@ -1,4 +1,5 @@
-"""Press buttons in the game running in XEMU through its test-only remote pad.
+"""Press buttons in the game, in XEMU or on a development Xbox, through its
+test-only remote pad.
 
 The pad record (gw_remote_pad in src/input.cpp) is written through XEMU's GDB
 stub (boot_xemu.ps1 -GdbPort, default 9258); frames are counted from gw_stats
@@ -6,6 +7,11 @@ through the monitor. Never sends host input. Adapted from the Jedi Power
 Battles project's xemu_pad.py.
 
   python xbox/tools/xemu_pad.py "press A" "wait 60" "stick 0 1 30" "shot menu"
+  python xbox/tools/xemu_pad.py --xbdm 10.0.0.231 "press A" "shot menu"
+
+With --xbdm the console's debug monitor (port 731) reads and writes the
+game's memory instead (the XBE loads at its fixed base, so the link map's
+addresses hold), and screenshots come from tools/xbdm_shot.py.
 
 Steps:
   press A[,B...] [frames]   hold the buttons for frames (default 6), then release
@@ -24,6 +30,7 @@ import pathlib
 import re
 import socket
 import subprocess
+import sys
 import time
 
 MAGIC = 0x44415047
@@ -126,13 +133,40 @@ class Gdb:
             pass
 
 
+class XbdmTarget:
+    """A development Xbox's debug monitor, standing in for both the XEMU
+    monitor (word) and the GDB stub (write)."""
+
+    def __init__(self, host):
+        sys.path.insert(0, str(XBOX / 'tools'))
+        import xbdm_shot
+        self.host = host
+        self.xbdm = xbdm_shot.Xbdm(host)
+
+    def word(self, address):
+        return int.from_bytes(self.xbdm.getmem(address, 4), 'little')
+
+    def write(self, address, data):
+        self.xbdm.sock.sendall(f'setmem addr=0x{address:08X} data={data.hex()}\r\n'.encode())
+        status = self.xbdm.line()
+        if not status.startswith('200'):
+            raise SystemExit(f'xbdm setmem: {status}')
+
+    def close(self):
+        self.xbdm.sock.close()
+
+
 class Session:
     def __init__(self, args):
         map_text = (XBOX / 'build/gw2.map').read_text()
         self.pad = symbol(map_text, 'gw_remote_pad')
         self.stats = symbol(map_text, 'gw_stats')
-        self.monitor = Monitor(args.port)
-        self.gdb = Gdb(args.gdb_port)
+        self.xbdm_host = args.xbdm
+        if args.xbdm:
+            self.monitor = self.gdb = XbdmTarget(args.xbdm)
+        else:
+            self.monitor = Monitor(args.port)
+            self.gdb = Gdb(args.gdb_port)
         self.out = XBOX / 'test-artifacts/pad'
         self.buttons, self.left, self.right, self.triggers = 0, (0, 0), (0, 0), (0, 0)
 
@@ -158,6 +192,10 @@ class Session:
     def shot(self, name):
         self.out.mkdir(parents=True, exist_ok=True)
         path = self.out / f'{name}.png'
+        if self.xbdm_host:
+            subprocess.run([sys.executable, str(XBOX / 'tools/xbdm_shot.py'), self.xbdm_host, str(path)], check=True,
+                           capture_output=True)
+            return path
         subprocess.run(['powershell', '-ExecutionPolicy', 'Bypass', '-File', str(XBOX / 'tools/xemu_shot.ps1'),
                         '-Out', str(path)], check=True, capture_output=True)
         return path
@@ -205,6 +243,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--port', type=int, default=9257)
     p.add_argument('--gdb-port', type=int, default=9258)
+    p.add_argument('--xbdm', help='a development Xbox address (its debug monitor) instead of XEMU')
     p.add_argument('steps', nargs='+')
     args = p.parse_args()
     session = Session(args)

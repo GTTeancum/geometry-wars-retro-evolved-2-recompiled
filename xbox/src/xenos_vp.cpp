@@ -363,12 +363,14 @@ const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool div
           }
           if (in.vop == 14) {
             b.mac(SLT, cnst(0, "xxxx"), a, Op(), b.to_temp(kS0));
+          } else if (in.vop == 12) {
+            // a == 0 as 0 >= |a|: testing -a >= 0 failed on the real NV2A,
+            // which (unlike XEMU) seems to order -0 below 0; |a| of a zero
+            // compares equal to 0 either way.
+            b.mac(MAX, a, neg(a), Op(), b.to_temp(kS0));
+            b.mac(SGE, cnst(0, "xxxx"), temp(kS0), Op(), b.to_temp(kS0));
           } else {
             b.mac(SGE, a, cnst(0, "xxxx"), Op(), b.to_temp(kS0));
-            if (in.vop == 12) {
-              b.mac(SGE, neg(a), cnst(0, "xxxx"), Op(), b.to_temp(kS1));
-              b.mac(MUL, temp(kS0), temp(kS1), Op(), b.to_temp(kS0));
-            }
           }
           b.mac(ADD, bb, Op(), neg(c), b.to_temp(kS1));
           b.mac(MAD, temp(kS0), temp(kS1), c, stage);

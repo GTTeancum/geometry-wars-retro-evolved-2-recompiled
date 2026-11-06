@@ -28,8 +28,9 @@ $(GEN_OBJS): NXDK_CXXFLAGS += -Ibuild/gen -O2
 # shader interpreter) into a call; the runtime gets the builtins back.
 $(RUNTIME_OBJS): NXDK_CXXFLAGS += -fbuiltin -mfpmath=sse
 
-# Our own glow over each frame (see src/nv2a.cpp); make GLOW=n leaves it out.
-ifneq ($(GLOW),n)
+# Our own glow over each frame (see src/nv2a.cpp); make GLOW=y puts it in.
+# Off by default: it draws bright blocks in XEMU and nothing on hardware.
+ifeq ($(GLOW),y)
 src/nv2a.obj: NXDK_CXXFLAGS += -DGW_GLOW
 endif
 
