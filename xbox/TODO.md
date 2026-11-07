@@ -5,6 +5,40 @@ order. Measurements are from XEMU at 64 MB unless noted.
 
 ## 1. 60 fps at 720p
 
+- [ ] **Pausing freezes the game (found 2026-11-07).** Pressing Start in a
+      level stops the picture: the main thread spins in the game's
+      BlockOnFence (sub_820A4CE0 / sub_820A1B18), waiting for a GPU fence.
+      Read on the console: progress (device +10896's word) 0x430F, the
+      device's fence counter (+10908) 0x43CB: 188 fences inserted that never
+      ran. During play the progress keeps pace (two behind, logged by the
+      temporary audit in src/gpu.cpp, audit_progress). Not the native draws
+      (native_enabled off: same) nor the interrupt threads' processors.
+      Suspects: the commands now running on the thread that writes them
+      (run_commands) and a fence the game expects the GPU to reach without
+      another kick (the 360's GPU runs on its own), or older: pausing was
+      not tested for a long time. Next: try the last commit (197d89a); log
+      what the pause path writes after the last kick.
+
+### Native drawing (replacing the 360 graphics path)
+
+The game builds every frame as Xenos (360 GPU) command packets through its
+Direct3D, and src/gpu.cpp + src/nv2a.cpp decode and re-issue them for the
+NV2A: the frame is built twice. The plan, in order:
+
+- [ ] 1. Commands run on the thread that writes them (src/gpu.cpp
+      run_commands), no command processor thread; its interrupts are
+      delivered by a small interrupt thread.
+- [ ] 2. Native Direct3D draw calls (DrawVertices 820A08B8,
+      DrawIndexedVertices 820A0CA0, BeginVertices/EndVertices
+      820A0408/820A08A8) that read the device's state shadows and draw on
+      the NV2A at once: no draw packets built (draw setup 820A76B0, constant
+      flush 820A91A0) or decoded.
+- [ ] 3. Native code writes its vertices (line batches, text) in host order
+      where the NV2A reads them: no byte swaps.
+- [ ] 4. The game's frame rendering (sub_820653C8 and the passes under it)
+      native, on top of 1-3.
+
+
 On hardware (Deadline, moving and shooting): 29-33 fps.
 `tools/xbdm_profile.py` samples the console's threads through xbdm, and the
 log's `cpu ms/frame` line (src/status.cpp) times the largest parts. Per
@@ -58,6 +92,14 @@ starfield 2, the rest (the game's own code) about 17.
       (guest 0x82063448, about 3.5%); vertex copies in `draw_on_gpu`.
 
 ## 2. Readable text
+
+- [ ] **Unreadable at 720p (seen on the TV, 2026-11-07).** In the menus at
+      1280x720 the text is thick and smeared (the Single Player screen:
+      "Game mode locked", "Unlock progress", the button prompts): letters run
+      together. It read cleanly at 640x480. Suspects: our own glow over the
+      whole frame (src/nv2a.cpp, apply_glow) blurring and brightening small
+      text; the mipmap / filter choice now that text is drawn at 720p size;
+      the font textures' conversion. Compare with GLOW=n first.
 
 - [ ] Fonts and UI art were converted at 512x512 at most, halving the
       1024x1024 atlas. Now (not yet seen in XEMU): up to 1024, and textures
@@ -156,28 +198,62 @@ starfield 2, the rest (the game's own code) about 17.
 
 ## 6. Sound
 
-No XMA on the Xbox: the installer converts every sound to IMA ADPCM.
+No XMA on the Xbox: the installer converts every sound to IMA ADPCM. None of
+the game's audio engine, its XAudio2 or the XMA unit runs: the game's sound
+layer is cut over at its events and parameters (src/sound_game.cpp) to a
+native engine that plays the game's sound graphs (src/sound_native.cpp).
 
+- [x] **Native engine (2026-11-07).** The nine sound graphs (audio\*.dat:
+      System, GW3_FX, UIMusic, Song_1..6; 1342 components of 47 kinds) are
+      interpreted as the game's engine does (timing, scripts, every component
+      kind; derived from the game's code). Sound effects' bank in memory, the
+      music streamed from the disc. Surround is carried as stereo (the
+      Xbox's output); chains of mixers are combined so each sound is mixed
+      once; silent layers are skipped undecoded and keep their place. The
+      reverb send goes through a reverb of our own (the 360 used XAudio's
+      built-in one). Pause stops the six songs' graphs, as the original.
+- [x] PC check (`xbox\tools\sound_check.cmd`): plays the graphs from the
+      staged disc through a scripted menu, Song 1 with shots and explosions,
+      and Song 3, and writes `xbox\build\sound_check\menu.wav`, `game.wav`,
+      `song3.wav` with each second's level and cost. Streaming in real time
+      matches an all-in-memory run (SOUND_RESIDENT=1) to rounding.
+      Cost on the PC: about 22 us per 5.3 ms frame in the menu, 30 us in a
+      busy game.
+- [ ] **Cost on the console (2026-11-07).** It plays steadily (187.5 frames
+      a second, 12 queued). Mix: about 0.16 ms per 5.3 ms frame in the menu,
+      0.55-0.7 ms in a level (it was 1.9 ms): control 0.09, sounds 0.16,
+      effects 0.10, combining the mixer chains 0.09, mixing 0.05, reverb
+      0.06 ms (the log's "audio: us a frame" lines). What makes the Xbox
+      slow and the PC not: data fetched from memory (the game's threads push
+      the engine's data out of the cache between frames; the reverb's
+      arithmetic alone takes 17 us warm, 60-70 in the game), and nxdk's
+      -fno-builtin turning fabsf/fmaxf/sqrtf into library calls. Frames are
+      mixed 4 at a time (the later ones find the data in the cache). Prefetch
+      instructions did not help. Next: a smaller working set (hot fields of
+      components and voices together; combining only what changed).
+      Not yet listened to on the TV.
+- [x] **Lock-up after a few minutes (2026-11-07):** the console ran out of
+      memory (the game commits memory as it plays). The effects' long waves
+      (34 of 104, 3.7 MB) now stream like the music; about 11 MB free after
+      start-up (was 7.7). The first three fatal errors of a run are saved to
+      E:\GW2\gw2crash1.txt ..3 (the log ring is soon overwritten).
+- [x] **"Unanticipated CPU_INTERRUPT" / call to 0BADF00D (2026-11-07):** the
+      commands run ahead of the interrupts' delivery, so a later interrupt's
+      callback (scratch registers 4 and 5) overwrote an earlier one's before
+      its delivery; the graphics interrupt thread then died. Each INTERRUPT
+      packet now records its callback and the scratch write-back is repeated
+      just before its delivery (src/gpu.cpp).
+- [ ] TransitionSwitch (Song 3's output the game waits on) and the music's
+      section changes: heard only in the PC check so far.
 - [x] `installer\SoundConvert.cs` (and `tools\convert_banks.py`, the same for
       development): each wave of the banks (`audio\*.baf`; WAVE records of
       0x5C or 0x50 bytes) goes through ffmpeg once into 4-bit IMA ADPCM, written
       as `audio\<bank>.adpcm` next to the untouched banks, with a table keyed
-      by each wave's place in its bank. 265 sounds, 1846 s, 76 MB (the XMA was
+      by each wave's place in its bank. 265 sounds, 1873 s, 77 MB (the XMA was
       38 MB); about 18 dB signal to noise on the noisiest effects. Needs
       ffmpeg on the player's PC (or ffmpeg.exe next to the installer); takes
-      about 8 minutes.
-- [ ] Runtime: the game's XAudio2 decodes through the 360's XMA unit (only
-      XMACreateContext / XMAReleaseContext are imports; contexts are driven
-      through the audio unit's registers). Emulate the unit: a context's input
-      address lies in a loaded bank, which names the wave; "decoding" writes
-      that wave's ADPCM samples (decoded, 16-bit) to the context's output.
-      The ADPCM files stay on disc and are read as the sounds play.
-- [ ] A render-driver thread calls the game's XAudio callback every 256
-      samples (48 kHz) and sends the mixed frames (6 channels, float) to the
-      AC97 through nxdk, mixed to stereo 16-bit. The mixer costs CPU every
-      5.3 ms, so this waits until the frame rate allows it.
-- [ ] Music is sequenced from the song banks' samples (Song_N.dat), so the
-      same path plays it.
+      about 8 minutes. One entry (GW3 LeaderChange2) says more samples than
+      its data holds; the engine plays what is there.
 
 ## 7. Windows installer
 

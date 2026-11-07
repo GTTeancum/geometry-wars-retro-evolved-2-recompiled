@@ -24,6 +24,9 @@
 // and textures first.
 #include "runtime.h"
 
+#include <windows.h>
+#include <xmmintrin.h>
+
 extern "C" void __imp__sub_820653C8(PPCContext& ctx, uint8_t* base);
 
 // The game's frame (guest 0x82037E00) is: update the game, begin the frame
@@ -44,6 +47,7 @@ u32 g_frame = 0;  // the game's frames, counted when they render (or not)
 // Whether this frame will be rendered: the update runs before the render in
 // the same frame, so the jobs can leave out work only drawing needs.
 bool gw_frame_drawn() { return g_frame % kDrawEvery == 0; }
+u32 gw_drawn_index() { return g_frame / kDrawEvery; }
 
 extern "C" void sub_820653C8(PPCContext& ctx, uint8_t* base) {
   const bool draw = gw_frame_drawn();
@@ -69,4 +73,34 @@ extern "C" void sub_82064F88(PPCContext& ctx, uint8_t* base) {
 extern "C" void sub_82064C90(PPCContext& ctx, uint8_t* base) {
   (void)ctx;
   (void)base;
+}
+
+// End of the game's frame and its swap (guest 0x8205E8A8), then the frame
+// held to the 60 Hz display: the game steps a fixed 1/60 s per frame, and
+// nothing else paces it here (its Direct3D's swap does not wait for the
+// display), so a fast frame would make it play fast. Each frame ends no
+// earlier than its 1/60 s slot; a frame that runs late does not make the
+// next ones hurry (more than two slots behind, the schedule restarts).
+extern "C" void __imp__sub_8205E8A8(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_8205E8A8(PPCContext& ctx, uint8_t* base) {
+  __imp__sub_8205E8A8(ctx, base);
+  static LARGE_INTEGER frequency;
+  static i64 next;
+  if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
+  const i64 period = frequency.QuadPart / 60;
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  if (!next || now.QuadPart > next + 2 * period) {
+    next = now.QuadPart + period;
+    return;
+  }
+  // Whole milliseconds asleep (Sleep(1) may last up to 2 ms), the rest spun.
+  for (;;) {
+    QueryPerformanceCounter(&now);
+    const i64 left = next - now.QuadPart;
+    if (left <= 0) break;
+    if (left * 1000 / frequency.QuadPart >= 2) Sleep(1);
+    else _mm_pause();
+  }
+  next += period;
 }

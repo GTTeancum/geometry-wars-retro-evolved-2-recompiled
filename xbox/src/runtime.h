@@ -86,11 +86,29 @@ u32 gw_physical_alloc(u32 size, u32 align);  // committed, zeroed; 0 on failure
 // is one NV2A line there (2 vertices of x, y, z, brightness, edge), which the
 // GPU reads in place. The address is rounded down to its segment.
 u8* gw_grid_line_host(u32 guest);
+// The host mirror from guest's place on for 'bytes' bytes, or nullptr when
+// there is no mirror or they would not fit in it.
+u8* gw_grid_line_block(u32 guest, u32 bytes);
+// The in-level grid's lines, written by src/grid_native.cpp into the line
+// buffer's host mirror and drawn by src/nv2a.cpp (the one definition of the
+// layout): the grid's 89 x 133 points, row by row, 12 bytes each (x, y, z),
+// host-order floats, as they were before the update that wrote them. Rows 1
+// to 87 are drawn as line strips across, columns 1 to 131 as strips down
+// (rows 0 to 88), each in the colour colours[n & 7] for row or column n
+// (float bits, host order).
+constexpr u32 kGwGridLineRows = 89, kGwGridLineCols = 133, kGwGridLineVertex = 12;
+constexpr u32 kGwGridLineBytes = kGwGridLineRows * kGwGridLineCols * kGwGridLineVertex;
+struct GwGridLines {
+  u8* host;  // the points (nullptr: not written)
+  u32 colours[8];
+};
+extern GwGridLines gw_grid_lines;
 // Host mirrors of guest vertex buffers in NV2A order (src/vertex_mirror.cpp):
 // add one for the first 'size' bytes of a guest buffer; find the host address
 // of [guest, guest + bytes) when it lies wholly in a mirror, else null.
 u8* gw_vertex_mirror_add(u32 guest, u32 size);
 u8* gw_vertex_mirror(u32 guest, u32 bytes);
+u32 gw_vertex_mirror_room(u32 guest);  // bytes from guest to its mirror's end (0: in none)
 void gw_physical_free(u32 guest);
 u32 gw_system_alloc(u32 size, u32 align = 16);
 u32 gw_stack_alloc(u32 size);                // returns the low end
@@ -125,7 +143,7 @@ extern GwStats gw_stats;
 // CPU time of the largest parts (timestamp-counter cycles), logged in ms
 // per frame every 5 s by src/status.cpp. A part's time includes any time
 // its thread was switched out inside it.
-enum GwPart { kPartGrid, kPartParticles, kPartStars, kPartCommands, kPartCount };
+enum GwPart { kPartGrid, kPartParticles, kPartStars, kPartCommands, kPartAudio, kPartCount };
 extern volatile u64 gw_part_cycles[kPartCount];
 extern volatile u32 gw_gpu_kicks;  // moves of the command ring's write pointer (src/gpu.cpp)
 struct GwPartTimer {
@@ -172,6 +190,43 @@ void gw_note_thread(u32 start_address, u32 start_context);
 // src/render_native.cpp: whether the current game frame will be rendered
 // (it updates every frame, renders every second one).
 bool gw_frame_drawn();
+// src/audio.cpp: the 360 audio render driver's exports (not reached: the
+// game's XAudio2 never starts).
+void gw_audio_register(u32 callback, u32 arg);
+void gw_audio_unregister();
+void gw_audio_frame(u32 samples);
+// src/sound_native.cpp: the native sound engine (the game's sound graphs
+// played from the converted banks); one 256-sample stereo frame for the AC97.
+void gw_sound_init();
+void gw_sound_mix(i16* out, u32 samples);
+// The game's side (src/sound_game.cpp): start-up, events, parameters, the
+// graphs' outputs, pause.
+void gw_sound_start();
+void gw_sound_event(u32 event);
+void gw_sound_param(u32 param, float value);
+void gw_sound_action(const char* name);           // an action (event) by name
+void gw_sound_set_param(const char* name, float value);
+void gw_sound_debug();                            // what is playing (the PC check)
+float gw_sound_output(u32 output);
+void gw_sound_pause(bool paused);
+// src/audio.cpp: the AC97 output thread.
+void gw_audio_start();
+// src/kernel_threads.cpp: the calling thread at dispatch level (holding the
+// lock that stands for the 360's raised IRQL) and back at passive level.
+void gw_raise_dispatch();
+void gw_lower_passive();
+// The calling thread's 360 processor (its dispatch lock); the audio driver's
+// thread takes kAudioProcessor, which no game thread uses.
+void gw_set_processor(u8 processor);
+constexpr u8 kAudioProcessor = 6;
+constexpr u8 kInterruptProcessor = 7;  // the graphics and vblank interrupts' threads
+// src/particle_native.cpp: one particle's update (guest sub_82063448).
+void gw_particle(u32 particle_system, u32 in, u32 out, u32 streak, u32 glow);
+// src/particle_buffers.cpp: a particle buffer set's buffer for a job.
+u32 gw_particle_set_buffer(u32 set, u32 job, bool glow);
+// src/render_native.cpp: the number of the next frame drawn (counts drawn
+// frames).
+u32 gw_drawn_index();
 // src/nv2a.cpp: sets the display's scan-out line length (CRTC offset) to the
 // frame's pitch, logging the values it found when they were wrong.
 void gw_crtc_pitch();

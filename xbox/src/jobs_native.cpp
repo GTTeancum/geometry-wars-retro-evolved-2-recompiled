@@ -22,12 +22,12 @@ void __imp__sub_82063F08(PPCContext& ctx, uint8_t* base);
 void sub_820A5420(PPCContext& ctx, uint8_t* base);
 void sub_820631E8(PPCContext& ctx, uint8_t* base);
 void sub_820632F0(PPCContext& ctx, uint8_t* base);
-void sub_82063A38(PPCContext& ctx, uint8_t* base);  // a job's particle share
+void sub_82063A38(PPCContext& ctx, uint8_t* base);  // a job's particle share (src/particle_native.cpp)
+void sub_82064110(PPCContext& ctx, uint8_t* base);  // the bucket index sort (src/particle_native.cpp)
 void sub_8205CA88(PPCContext& ctx, uint8_t* base);  // the grid job
 void sub_82074F48(PPCContext& ctx, uint8_t* base);
 void sub_8205A7F0(PPCContext& ctx, uint8_t* base);
 void sub_82075548(PPCContext& ctx, uint8_t* base);  // the starfield
-void sub_82064110(PPCContext& ctx, uint8_t* base);
 void sub_82062F28(PPCContext& ctx, uint8_t* base);
 }
 

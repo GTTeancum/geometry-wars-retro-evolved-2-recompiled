@@ -151,6 +151,8 @@ struct GwThread {
   u32 start_context;
   u32 xapi_startup;
   u8 irql;
+  u8 processor;    // the 360 hardware thread it runs on (gw_set_irql)
+  u8 irql_lock;    // the processor whose dispatch lock it holds
   HANDLE host;
   GwObject* object;
   const char* last_call;  // most recent system call (gw_note_call)
@@ -249,14 +251,73 @@ DWORD WINAPI thread_proc(LPVOID param) {
 
 }  // namespace
 
-// Commit-on-touch for large guest allocations; anything else is logged and
-// handled as a crash of that thread.
+// A read from the guest's null page (guest 0 to 64 KiB): the 360 gave zeros
+// (the game's mixer reads a missing voice's fields, offsets 0x14..0x1C, and
+// computes on them before checking), the Xbox cannot map the page (its host
+// address is the system's). The faulting load is emulated instead: its
+// destination register set to zero and the instruction skipped. Integer
+// loads only (mov, movzx, movsx, with any addressing); anything else, and
+// any write, stays a crash.
+namespace {
+bool emulate_null_read(CONTEXT* c) {
+  const u8* ip = (const u8*)c->Eip;
+  u32 len = 0;
+  bool word = false;
+  while (ip[len] == 0x66) {
+    word = true;
+    ++len;
+  }
+  const u8 op = ip[len++];
+  u8 op2 = 0;
+  if (op == 0x0F) op2 = ip[len++];
+  const bool plain = op == 0x8B || op == 0x8A;
+  const bool extend = op == 0x0F && (op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF);
+  if (!plain && !extend) return false;
+  const u8 modrm = ip[len++];
+  const u8 mod = modrm >> 6, reg = (modrm >> 3) & 7, rm = modrm & 7;
+  if (mod == 3) return false;
+  if (rm == 4) {
+    const u8 sib = ip[len++];
+    if (mod == 0 && (sib & 7) == 5) len += 4;
+  } else if (mod == 0 && rm == 5) {
+    len += 4;
+  }
+  len += mod == 1 ? 1 : mod == 2 ? 4 : 0;
+  DWORD* regs[8] = {&c->Eax, &c->Ecx, &c->Edx, &c->Ebx, &c->Esp, &c->Ebp, &c->Esi, &c->Edi};
+  if (op == 0x8A) {  // 8-bit destination: al, cl, dl, bl, ah, ch, dh, bh
+    *regs[reg & 3] &= reg < 4 ? ~0xFFu : ~0xFF00u;
+  } else if (op == 0x8B && word) {
+    *regs[reg] &= ~0xFFFFu;
+  } else {
+    *regs[reg] = 0;
+  }
+  c->Eip += len;
+  return true;
+}
+}  // namespace
+
+// Commit-on-touch for large guest allocations; reads of the guest's null
+// page (emulate_null_read); anything else is logged and handled as a crash
+// of that thread.
 int gw_fault_filter(void* p) {
   auto* info = (EXCEPTION_POINTERS*)p;
   EXCEPTION_RECORD* rec = info->ExceptionRecord;
   if (rec->ExceptionCode == 0xC0000005 && rec->NumberParameters >= 2 &&
       gw_handle_fault((u32)rec->ExceptionInformation[1])) {
     return EXCEPTION_CONTINUE_EXECUTION;
+  }
+  if (rec->ExceptionCode == 0xC0000005 && rec->NumberParameters >= 2 && rec->ExceptionInformation[0] == 0 &&
+      (u32)rec->ExceptionInformation[1] - (u32)GW_MEMBASE < 0x10000 && emulate_null_read(info->ContextRecord)) {
+    static u32 told = 0;
+    if (told++ < 8)
+      gw_log("null read: guest %08X at host %08X, zero\n", (u32)rec->ExceptionInformation[1] - (u32)GW_MEMBASE,
+             (u32)rec->ExceptionAddress);
+    return EXCEPTION_CONTINUE_EXECUTION;
+  }
+  if (rec->ExceptionCode == 0xC0000005 && rec->NumberParameters >= 2 &&
+      (u32)rec->ExceptionInformation[1] - (u32)GW_MEMBASE < 0x10000) {
+    const u8* ip = (const u8*)rec->ExceptionAddress;
+    gw_log("null page access not emulated: bytes %02X %02X %02X %02X %02X\n", ip[0], ip[1], ip[2], ip[3], ip[4]);
   }
   u32 address = rec->NumberParameters >= 2 ? (u32)rec->ExceptionInformation[1] : 0;
   gw_log("exception %08X at host %08X, address %08X (guest %08X)\n", (u32)rec->ExceptionCode,
@@ -295,6 +356,13 @@ u32 gw_thread_create(u32 stack_size, u32 xapi_startup, u32 start_address, u32 st
                      u32 creation_flags, u32* out_thread_id) {
   GwThread* t = setup_thread(stack_size);
   t->start_address = start_address;
+  // The 360 processor: creation flags bits 24-31, a mask (see gw_set_irql).
+  for (u8 i = 0; i < 6; ++i) {
+    if ((creation_flags >> 24) & (1u << i)) {
+      t->processor = i;
+      break;
+    }
+  }
   gw_note_thread(start_address, start_context);
   t->start_context = start_context;
   t->xapi_startup = xapi_startup;
@@ -629,6 +697,20 @@ GW_EXPORT(NtSuspendThread) {
 }
 
 GW_EXPORT(KeSetAffinityThread) {
+  GwObject* obj = gw_object_from_guest(GW_ARG(3));
+  for (LONG i = 0; i < g_thread_count && i < 64; ++i) {
+    GwThread* t = g_threads[i];
+    if (t && t->object == obj) {
+      if (GW_ARG(5)) gw_store32(GW_ARG(5), 1u << t->processor);
+      for (u8 p = 0; p < 6; ++p) {
+        if (GW_ARG(4) & (1u << p)) {
+          t->processor = p;
+          break;
+        }
+      }
+      GW_RETURN(X_STATUS_SUCCESS);
+    }
+  }
   if (GW_ARG(5)) gw_store32(GW_ARG(5), 1);
   GW_RETURN(X_STATUS_SUCCESS);
 }
@@ -654,26 +736,79 @@ GW_EXPORT(KiApcNormalRoutineNop) {}
 
 // --- IRQL and spin locks -----------------------------------------------------------------
 
+// IRQL at dispatch level (2) and above: on the 360 no other thread runs on
+// that core until it drops, and the game relies on that (its audio mixer's
+// threads, and the audio driver's callback, which the driver calls at
+// dispatch level, share data guarded only by raised IRQL; its helper
+// threads run on other processors, 4 and 5, and must keep running while the
+// callback holds its own). Here one lock per 360 processor stands for it: a
+// thread holds its processor's lock while its IRQL is 2 or more, so those
+// sections exclude each other as on that processor, and only there. A
+// thread's processor comes from its creation flags (bits 24-31, a mask) or
+// KeSetAffinityThread, else 0; the audio driver's thread (src/audio.cpp)
+// has one of its own, kAudioProcessor.
+namespace {
+constexpr u32 kProcessors = 8;
+CRITICAL_SECTION g_dispatch_lock[kProcessors];
+volatile LONG g_dispatch_ready;
+void dispatch_lock_init() {
+  if (InterlockedCompareExchange(&g_dispatch_ready, 1, 0) == 0) {
+    for (u32 i = 0; i < kProcessors; ++i) InitializeCriticalSection(&g_dispatch_lock[i]);
+    InterlockedExchange(&g_dispatch_ready, 2);
+  }
+  while (g_dispatch_ready != 2) {
+  }
+}
+u8 processor_from_mask(u32 mask) {
+  for (u8 i = 0; i < 6; ++i) {
+    if (mask & (1u << i)) return i;
+  }
+  return 0;
+}
+}  // namespace
+
+void gw_set_irql(GwThread* t, u8 irql) {
+  dispatch_lock_init();
+  if (t->irql < 2 && irql >= 2) {
+    t->irql_lock = t->processor % kProcessors;
+    EnterCriticalSection(&g_dispatch_lock[t->irql_lock]);
+  }
+  if (t->irql >= 2 && irql < 2) LeaveCriticalSection(&g_dispatch_lock[t->irql_lock]);
+  t->irql = irql;
+  gw_store8(t->pcr + 0x18, irql);
+}
+
+void gw_set_processor(u8 processor) { gw_current_thread()->processor = processor; }
+
+void gw_raise_dispatch() { gw_set_irql(gw_current_thread(), 2); }
+void gw_lower_passive() { gw_set_irql(gw_current_thread(), 0); }
+
 GW_EXPORT(KeRaiseIrqlToDpcLevel) {
   GwThread* t = gw_current_thread();
   u8 old = t->irql;
-  t->irql = 2;
-  gw_store8(t->pcr + 0x18, 2);
+  if (old < 2) gw_set_irql(t, 2);
   GW_RETURN(old);
 }
 
-GW_EXPORT(KfLowerIrql) {
-  GwThread* t = gw_current_thread();
-  t->irql = (u8)GW_ARG(3);
-  gw_store8(t->pcr + 0x18, t->irql);
-}
+GW_EXPORT(KfLowerIrql) { gw_set_irql(gw_current_thread(), (u8)GW_ARG(3)); }
 
 namespace {
 
 void spin_acquire(u32 lock) {
   volatile LONG* p = (volatile LONG*)gw_host(lock);
   LONG me = (LONG)__builtin_bswap32(gw_current_thread()->pcr);
-  while (InterlockedCompareExchange(p, me, 0) != 0) SwitchToThread();
+  // On the 360 the holder runs at raised IRQL and cannot be switched out;
+  // here it can, and SwitchToThread only gives way to threads of the
+  // waiter's priority or above: a waiter above the holder (the audio thread
+  // over the game's lower-priority mixer threads) waited forever, the game
+  // frozen. After a few tries, a 1 ms sleep lets any thread run.
+  for (u32 tries = 0; InterlockedCompareExchange(p, me, 0) != 0; ++tries) {
+    if (tries < 16) {
+      SwitchToThread();
+    } else {
+      Sleep(1);
+    }
+  }
 }
 
 void spin_release(u32 lock) {
@@ -686,14 +821,14 @@ void spin_release(u32 lock) {
 GW_EXPORT(KfAcquireSpinLock) {
   GwThread* t = gw_current_thread();
   u8 old = t->irql;
-  t->irql = 2;
+  if (old < 2) gw_set_irql(t, 2);
   spin_acquire(GW_ARG(3));
   GW_RETURN(old);
 }
 
 GW_EXPORT(KfReleaseSpinLock) {
   spin_release(GW_ARG(3));
-  gw_current_thread()->irql = (u8)GW_ARG(4);
+  gw_set_irql(gw_current_thread(), (u8)GW_ARG(4));
 }
 
 GW_EXPORT(KeAcquireSpinLockAtRaisedIrql) { spin_acquire(GW_ARG(3)); }

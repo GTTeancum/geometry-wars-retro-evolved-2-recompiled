@@ -34,6 +34,9 @@ constexpr u32 kMainFrames = 2;
 constexpr u32 kMainSize = 0x400000, kGlowSize = 0x380000;
 constexpr u32 kMainMirror = 512 * 128, kGlowMirror = 512 * 112;
 
+// The two sets' buffers by set and job (gw_particle_set_buffer).
+u32 g_set_main[kMainFrames][kJobs], g_set_glow[kMainFrames][kJobs];
+
 u32 call_alloc(PPCContext& ctx, uint8_t* base, void (*fn)(PPCContext&, uint8_t*), u32 size) {
   ctx.r3.u64 = size;
   fn(ctx, base);
@@ -41,6 +44,16 @@ u32 call_alloc(PPCContext& ctx, uint8_t* base, void (*fn)(PPCContext&, uint8_t*)
 }
 
 }  // namespace
+
+// A set's buffer for a job (main picture or glow pass). The particle job
+// (src/particle_native.cpp) picks the set by drawn frame, not by the game's
+// frame in flight: three frames in flight on two sets, with every second
+// frame drawn, made one drawn frame in three write the set the frame drawn
+// before it used, while the GPU could still be reading it (whole quads
+// half-written: large stray polygons for a frame, most with many particles).
+u32 gw_particle_set_buffer(u32 set, u32 job, bool glow) {
+  return (glow ? g_set_glow : g_set_main)[set % kMainFrames][job % kJobs];
+}
 
 // Particle system initialisation (guest 0x820673C8).
 extern "C" void sub_820673C8(PPCContext& ctx, uint8_t* base) {
@@ -55,6 +68,8 @@ extern "C" void sub_820673C8(PPCContext& ctx, uint8_t* base) {
       const u32 g = call_alloc(ctx, base, sub_8206A480, kGlowSize);
       gw_vertex_mirror_add(m, kMainMirror);
       gw_vertex_mirror_add(g, kGlowMirror);
+      g_set_main[i / kJobs][i % kJobs] = m;
+      g_set_glow[i / kJobs][i % kJobs] = g;
       gw_store32(main + i * 4, m);
       gw_store32(glow + i * 4, g);
     } else {

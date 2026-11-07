@@ -51,6 +51,12 @@ ifneq ($(DRAW_EVERY),)
 src/render_native.obj: NXDK_CXXFLAGS += -DGW_DRAW_EVERY=$(DRAW_EVERY)
 endif
 
+# Record small copies of the frames around the ship's spawn (src/nv2a.cpp,
+# tools/xbdm_frames.py): make SPAWN_CAPTURE=y
+ifeq ($(SPAWN_CAPTURE),y)
+src/nv2a.obj: NXDK_CXXFLAGS += -DGW_SPAWN_CAPTURE
+endif
+
 # Compare the native grid update with the original now and then: make GRID_CHECK=y
 ifeq ($(GRID_CHECK),y)
 src/grid_native.obj: NXDK_CXXFLAGS += -DGW_GRID_CHECK -DGW_GRID_GUEST_SYNC

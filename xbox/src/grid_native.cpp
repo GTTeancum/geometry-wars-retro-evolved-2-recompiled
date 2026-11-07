@@ -42,6 +42,8 @@ extern "C" void __imp__sub_8205D118(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__sub_8205B000(PPCContext& ctx, uint8_t* base);
 #endif
 
+GwGridLines gw_grid_lines;
+
 namespace {
 
 constexpr u32 C = 0x82000000, D = 0x82180000, K = 0x821A0000;
@@ -159,45 +161,135 @@ constexpr int kFirstRow = -1, kLastRow = kRows + 1;
 #else
 constexpr int kFirstRow = 0, kLastRow = kRows;
 #endif
+// Each row is kStride floats, its point i at kLead + i: the rows start on a
+// 32-byte cache line (544 bytes = 17 lines) and points 1, 5, 9... (the SSE
+// groups in update_row) on 16 bytes, so their loads and stores are aligned.
+constexpr u32 kLead = 3, kStride = 136;
+static_assert(kLead + kCols <= kStride && (kLead + 1) % 4 == 0 && kStride * 4 % 32 == 0);
+
+// A row of points in memory: kChunks chunks of four points, each chunk their
+// x, y, velocity x and velocity y (64 bytes, two cache lines), point i in
+// chunk (kLead + i) / 4, lane (kLead + i) % 4. One row is one block, so an
+// update streams through the grid in one sweep: the four separate arrays
+// before this were four interleaved streams, each read from a different
+// memory page (the Xbox's memory is slowest on a page change), and the
+// grid's time was mostly waiting for memory.
+constexpr u32 kChunks = kStride / 4;  // 34
+struct alignas(64) Chunk {
+  float x[4], y[4], vx[4], vy[4];
+};
+struct alignas(64) Row {
+  Chunk c[kChunks];
+};
+inline u32 element(u32 i) { return ((i + kLead) >> 2) * 16 + ((i + kLead) & 3); }
+// One of a row's four values, by point (p: the row's first float plus 0 for
+// x, 4 for y, 8 for velocity x, 12 for velocity y).
+struct Lane {
+  float* p;
+  float& operator[](u32 i) const { return p[element(i)]; }
+  float* group(u32 i) const { return p + element(i); }  // i = 1 mod 4: that chunk's four, aligned
+};
+constexpr u32 kX = 0, kY = 4, kVX = 8, kVY = 12;
+inline Lane lane(Row& r, u32 which) { return Lane{&r.c[0].x[0] + which}; }
+inline void copy_row(Row& to, const Row& from) {
+  const float* a = &from.c[0].x[0];
+  float* b = &to.c[0].x[0];
+  for (u32 n = 0; n < kChunks * 16; n += 4) _mm_store_ps(b + n, _mm_load_ps(a + n));
+}
+// One position buffer, updated in place (update_row keeps the old positions
+// of the row it is on and of the row above, the only ones still needed): the
+// game's two slots exist only so its six job threads can run rows in any
+// order, and here one thread runs them in order (update_grid). The guest's
+// slots are loaded from the read slot and, with GW_GRID_GUEST_SYNC, stored
+// to the write slot.
+//
+// The rest positions are a lattice: the game's reset (sub_8205B000) computes
+// x from the column and y from the row, so every row has the same rest x and
+// every point of a row the same rest y. load() checks that, bit for bit; if
+// it holds, update_row reads one row of rest x and a rest y per row instead
+// of two full arrays (half the memory the springs read per update).
 struct HostGrid {
   u32 guest;  // the guest grid loaded, 0 = load before the next update
-  float pos_x[2][kGridRows][kCols], pos_y[2][kGridRows][kCols];
-  float vel_x[kGridRows][kCols], vel_y[kGridRows][kCols];
-  float rest_x[kGridRows][kCols], rest_y[kGridRows][kCols];
+  bool lattice;
+  Row rows_[kGridRows];  // positions and velocities
+  alignas(32) float rest_x_[kGridRows][kStride];  // the full rest positions (read only if !lattice)
+  alignas(32) float rest_y_[kGridRows][kStride];
+  alignas(32) float lattice_x[kStride];  // rest x by column (lattice)
+  float lattice_y[kGridRows];            // rest y by row (lattice)
+  Lane pos_x(u32 h) { return lane(rows_[h], kX); }
+  Lane pos_y(u32 h) { return lane(rows_[h], kY); }
+  Lane vel_x(u32 h) { return lane(rows_[h], kVX); }
+  Lane vel_y(u32 h) { return lane(rows_[h], kVY); }
+  const float* rest_x(u32 h) const { return lattice ? &lattice_x[kLead] : &rest_x_[h][kLead]; }
+  float rest_y_at(u32 h, u32 i) const { return lattice ? lattice_y[h] : rest_y_[h][kLead + i]; }
+  const float* rest_y_row(u32 h) const { return &rest_y_[h][kLead]; }
 
-  void load(u32 grid) {
+  void load(u32 grid, u32 slot) {
+    const u32 at = 8 + slot * 8;
     for (int r = kFirstRow; r <= kLastRow; ++r) {
-      const u32 j = (u32)(r + 1);
+      const u32 h = (u32)(r + 1);
       for (u32 i = 0; i < kCols; ++i) {
         const u32 p = grid + (u32)r * kRow + i * kPoint;
-        vel_x[j][i] = lf(p + 0);
-        vel_y[j][i] = lf(p + 4);
-        pos_x[0][j][i] = lf(p + 8);
-        pos_y[0][j][i] = lf(p + 12);
-        pos_x[1][j][i] = lf(p + 16);
-        pos_y[1][j][i] = lf(p + 20);
-        rest_x[j][i] = lf(p + 24);
-        rest_y[j][i] = lf(p + 28);
+        vel_x(h)[i] = lf(p + 0);
+        vel_y(h)[i] = lf(p + 4);
+        pos_x(h)[i] = lf(p + at);
+        pos_y(h)[i] = lf(p + at + 4);
+        rest_x_[h][kLead + i] = lf(p + 24);
+        rest_y_[h][kLead + i] = lf(p + 28);
       }
     }
+    const u32 first = (u32)(kFirstRow + 1);
+    lattice = true;
+    for (int r = kFirstRow; r <= kLastRow && lattice; ++r) {
+      const u32 h = (u32)(r + 1);
+      lattice = memcmp(&rest_x_[h][kLead], &rest_x_[first][kLead], kCols * 4) == 0;
+      for (u32 i = 1; i < kCols && lattice; ++i)
+        lattice = memcmp(&rest_y_[h][kLead + i], &rest_y_[h][kLead], 4) == 0;
+      lattice_y[h] = rest_y_[h][kLead];
+    }
+    memcpy(lattice_x, rest_x_[first], sizeof(lattice_x));
+    static bool told;
+    if (!told) gw_log("grid: rest positions %s\n", lattice ? "a lattice" : "not a lattice (full arrays)");
+    told = true;
     guest = grid;
   }
-  void store(u32 grid) const {
+  // The rows updated (updated[h]), their inner points: what the original
+  // writes.
+  void store(u32 grid, u32 slot, const bool* updated) {
+    const u32 at = 8 + slot * 8;
     for (int r = kFirstRow; r <= kLastRow; ++r) {
-      const u32 j = (u32)(r + 1);
-      for (u32 i = 0; i < kCols; ++i) {
+      const u32 h = (u32)(r + 1);
+      if (!updated[h]) continue;
+      for (u32 i = 1; i + 1 < kCols; ++i) {
         const u32 p = grid + (u32)r * kRow + i * kPoint;
-        sf(p + 0, vel_x[j][i]);
-        sf(p + 4, vel_y[j][i]);
-        sf(p + 8, pos_x[0][j][i]);
-        sf(p + 12, pos_y[0][j][i]);
-        sf(p + 16, pos_x[1][j][i]);
-        sf(p + 20, pos_y[1][j][i]);
+        sf(p + 0, vel_x(h)[i]);
+        sf(p + 4, vel_y(h)[i]);
+        sf(p + at, pos_x(h)[i]);
+        sf(p + at + 4, pos_y(h)[i]);
       }
     }
   }
 };
-HostGrid g_host;  // 390 KB
+// The grid's points for its lines (see GwGridLines), when the line buffer
+// has a host mirror that holds them; the colours are taken here too.
+u8* gw_grid_lines_points() {
+  const u32 lines = lw(K + 5888);
+  u8* const mirror = gw_grid_line_block(lines, kGwGridLineBytes);  // refused unless they fit
+  if (!mirror) return nullptr;
+  for (u32 n = 0; n < 8; ++n) gw_grid_lines.colours[n] = __builtin_bswap32(raw(K + 5852 + n * 4));
+  gw_grid_lines.host = mirror;
+  return mirror;
+}
+
+HostGrid g_host;  // 410 KB, 200 KB of it (the rows) read per update (lattice)
+
+// The old positions of the row being updated and of the one before (by row
+// parity), and which host row each holds this update (-1: none).
+struct OldRows {
+  Row rows[2];  // whole rows (only x and y are read)
+  int row[2];
+  bool updated[kGridRows];  // rows updated this update (GW_GRID_GUEST_SYNC's store)
+} g_old;
 
 // The job's pushers (16 bytes each at args + 32: x, y, strength, scale),
 // loaded once per job in host floats. A pusher moves a point only where
@@ -244,30 +336,51 @@ void update_row(u32 args, u32 j, const Constants& k, const Pushers& all) {
   const u32 rs = read / 8, ws = write / 8;  // position slots
   HostGrid& g = g_host;
   const u32 h = j + 1;  // this row in the host arrays
-  // This row and its neighbours: positions in the read slot (which no row
-  // writes this frame), rest positions.
-  const float* hx = g.pos_x[rs][h];
-  const float* hy = g.pos_y[rs][h];
-  // When the game reads and writes the same slot, each point still sees its
-  // left neighbour's position from before this row (the original read the
-  // row before writing any of it).
-  float here_x[kCols], here_y[kCols];
-  if (rs == ws) {
-    memcpy(here_x, hx, sizeof(here_x));
-    memcpy(here_y, hy, sizeof(here_y));
-    hx = here_x;
-    hy = here_y;
+  // The positions are updated in place (see HostGrid). The original reads
+  // the read slot and writes the write slot: this row and the next as they
+  // were before this update, and the row above as it was too, unless the two
+  // slots are the same (then the row above is already new). Each point also
+  // sees its left neighbour from before this row either way (the original
+  // read the row before writing any of it). So this row's old positions are
+  // copied before it is written, and kept for the next row as its row above.
+  const int slot = (int)(h & 1);
+  copy_row(g_old.rows[slot], g.rows_[h]);  // aligned SSE copies (the library memcpy was slow)
+  g_old.row[slot] = (int)h;
+  g_old.updated[h] = true;
+  const Lane hx = lane(g_old.rows[slot], kX);
+  const Lane hy = lane(g_old.rows[slot], kY);
+  Lane ax = g.pos_x(h - 1);
+  Lane ay = g.pos_y(h - 1);
+  if (rs != ws && g_old.row[slot ^ 1] == (int)h - 1) {
+    ax = lane(g_old.rows[slot ^ 1], kX);
+    ay = lane(g_old.rows[slot ^ 1], kY);
+  } else if (rs != ws && g_old.row[slot ^ 1] > (int)h) {
+    static bool told;  // update_grid runs the rows in order; this would be a bug
+    if (!told) gw_log("grid: rows out of order (%u after %d)\n", h, g_old.row[slot ^ 1]);
+    told = true;
   }
-  const float* ax = g.pos_x[rs][h - 1];
-  const float* ay = g.pos_y[rs][h - 1];
-  const float* bx = g.pos_x[rs][h + 1];
-  const float* by = g.pos_y[rs][h + 1];
-  const float* hrx = g.rest_x[h];
-  const float* hry = g.rest_y[h];
-  const float* arx = g.rest_x[h - 1];
-  const float* ary = g.rest_y[h - 1];
-  const float* brx = g.rest_x[h + 1];
-  const float* bry = g.rest_y[h + 1];
+  const Lane bx = g.pos_x(h + 1);
+  const Lane by = g.pos_y(h + 1);
+  // Rest positions: one shared row of x and a constant y per row (lattice),
+  // the y given as three short rows here so the code below reads arrays.
+  const float* hrx = g.rest_x(h);
+  const float* arx = g.rest_x(h - 1);
+  const float* brx = g.rest_x(h + 1);
+  alignas(32) float rest_rows[3][kStride];
+  const float *ary, *hry, *bry;
+  if (g.lattice) {
+    for (u32 r = 0; r < 3; ++r) {
+      const __m128 y4 = _mm_set1_ps(g.lattice_y[h - 1 + r]);
+      for (u32 a = 0; a < kStride; a += 4) _mm_store_ps(&rest_rows[r][a], y4);
+    }
+    ary = rest_rows[0] + kLead;
+    hry = rest_rows[1] + kLead;
+    bry = rest_rows[2] + kLead;
+  } else {
+    ary = g.rest_y_row(h - 1);
+    hry = g.rest_y_row(h);
+    bry = g.rest_y_row(h + 1);
+  }
 
   // The pushers that can reach this row, in their original order.
   float ymin = hy[1], ymax = hy[1];
@@ -361,27 +474,40 @@ void update_row(u32 args, u32 j, const Constants& k, const Pushers& all) {
     float sy = ((ay[i] - ary[i]) + (by[i] - bry[i])) + (hy[i - 1] - hry[i - 1]) + (hy[i + 1] - hry[i + 1]);
     sx *= k.neighbour;
     sy *= k.neighbour;
-    float vx = (hrx[i] + sx - px) * k.stiffness + g.vel_x[h][i];
-    float vy = (hry[i] + sy - py) * k.stiffness + g.vel_y[h][i];
+    float vx = (hrx[i] + sx - px) * k.stiffness + g.vel_x(h)[i];
+    float vy = (hry[i] + sy - py) * k.stiffness + g.vel_y(h)[i];
     vx = (vx + fx) * k.damping;
     vy = (vy + fy) * k.damping;
     vx = sel(__builtin_fabsf(vx) - k.tiny, vx, k.zero);
     vy = sel(__builtin_fabsf(vy) - k.tiny, vy, k.zero);
-    g.vel_x[h][i] = vx;
-    g.vel_y[h][i] = vy;
+    g.vel_x(h)[i] = vx;
+    g.vel_y(h)[i] = vy;
     float x = vx * k.step + px, y = vy * k.step + py;
     x = sel(-max_x - x, -max_x, x);
     x = sel(x - max_x, max_x, x);
     y = sel(-max_y - y, -max_y, y);
     y = sel(y - max_y, max_y, y);
-    g.pos_x[ws][h][i] = x;
-    g.pos_y[ws][h][i] = y;
+    g.pos_x(h)[i] = x;
+    g.pos_y(h)[i] = y;
   };
 
   // sel(a, b, c) = a >= 0 ? b : c, four at a time (NaN picks c, as fsel).
+  // In assembly: the compiler types SSE compare masks and and/or as integer
+  // vectors, of which the Pentium III's SSE has none, and split each select
+  // into scalar code (about 30 instructions; most of the grid's time).
   auto sel4 = [](__m128 a, __m128 b, __m128 c) {
-    const __m128 m = _mm_cmpge_ps(a, _mm_setzero_ps());
-    return _mm_or_ps(_mm_and_ps(m, b), _mm_andnot_ps(m, c));
+    __m128 m = _mm_setzero_ps();
+    __asm__("cmpleps %[a], %[m]\n\t"  // m = 0 <= a (false for NaN)
+            "andps %[m], %[b]\n\t"
+            "andnps %[c], %[m]\n\t"
+            "orps %[b], %[m]"
+            : [m] "+x"(m), [b] "+x"(b)
+            : [a] "x"(a), [c] "x"(c));
+    return m;
+  };
+  auto and4 = [](__m128 a, __m128 b) {  // likewise
+    __asm__("andps %1, %0" : "+x"(a) : "x"(b));
+    return a;
   };
   const __m128 initial4 = _mm_set1_ps(k.initial), neighbour4 = _mm_set1_ps(k.neighbour);
   const __m128 stiffness4 = _mm_set1_ps(k.stiffness), damping4 = _mm_set1_ps(k.damping);
@@ -392,28 +518,40 @@ void update_row(u32 args, u32 j, const Constants& k, const Pushers& all) {
   const __m128 abs_mask = _mm_set1_ps(abs_float);
   const __m128 max_x4 = _mm_set1_ps(max_x), max_y4 = _mm_set1_ps(max_y);
   const __m128 neg_max_x4 = _mm_set1_ps(-max_x), neg_max_y4 = _mm_set1_ps(-max_y);
-  float* const vel_x = g.vel_x[h];
-  float* const vel_y = g.vel_y[h];
-  float* const out_x = g.pos_x[ws][h];
-  float* const out_y = g.pos_y[ws][h];
+  const Lane vel_x = g.vel_x(h);
+  const Lane vel_y = g.vel_y(h);
+  const Lane out_x = g.pos_x(h);
+  const Lane out_y = g.pos_y(h);
   auto springs4 = [&](u32 i) {
-    auto axis = [&](const float* hp, const float* hr, const float* ap, const float* ar, const float* bp,
-                    const float* br, float* vel, float* out, __m128 hi, __m128 lo) {
-      const __m128 pos = _mm_loadu_ps(hp + i);
-      __m128 sum = _mm_add_ps(_mm_sub_ps(_mm_loadu_ps(ap + i), _mm_loadu_ps(ar + i)),
-                              _mm_sub_ps(_mm_loadu_ps(bp + i), _mm_loadu_ps(br + i)));
-      sum = _mm_add_ps(sum, _mm_sub_ps(_mm_loadu_ps(hp + i - 1), _mm_loadu_ps(hr + i - 1)));
-      sum = _mm_add_ps(sum, _mm_sub_ps(_mm_loadu_ps(hp + i + 1), _mm_loadu_ps(hr + i + 1)));
+    auto axis = [&](Lane hp, const float* hr, Lane ap, const float* ar, Lane bp, const float* br, Lane vel,
+                    Lane out, __m128 hi, __m128 lo) {
+      const __m128 pos = _mm_load_ps(hp.group(i)), rest = _mm_load_ps(hr + i);
+      __m128 sum = _mm_add_ps(_mm_sub_ps(_mm_load_ps(ap.group(i)), _mm_load_ps(ar + i)),
+                              _mm_sub_ps(_mm_load_ps(bp.group(i)), _mm_load_ps(br + i)));
+      // The left and right neighbours' displacements, shuffled out of the
+      // aligned groups before, at and after this one (i - 4 >= -kLead and
+      // i + 7 < kStride - kLead for the groups run, 1 to 125): unaligned
+      // loads crossed a cache line every second group, which on the
+      // Pentium III costs more than the arithmetic. The same subtractions
+      // per point, so the same results.
+      const __m128 before = _mm_sub_ps(_mm_load_ps(hp.group(i) - 16), _mm_load_ps(hr + i - 4));
+      const __m128 here = _mm_sub_ps(pos, rest);
+      const __m128 after = _mm_sub_ps(_mm_load_ps(hp.group(i) + 16), _mm_load_ps(hr + i + 4));
+      const __m128 t0 = _mm_shuffle_ps(before, here, _MM_SHUFFLE(1, 0, 3, 3));  // b3 b3 h0 h1
+      const __m128 left = _mm_shuffle_ps(t0, here, _MM_SHUFFLE(2, 1, 2, 0));    // b3 h0 h1 h2
+      const __m128 t1 = _mm_shuffle_ps(here, after, _MM_SHUFFLE(0, 0, 3, 3));   // h3 h3 a0 a0
+      const __m128 right = _mm_shuffle_ps(here, t1, _MM_SHUFFLE(2, 0, 2, 1));   // h1 h2 h3 a0
+      sum = _mm_add_ps(sum, left);
+      sum = _mm_add_ps(sum, right);
       sum = _mm_mul_ps(sum, neighbour4);
-      __m128 v = _mm_add_ps(_mm_mul_ps(_mm_sub_ps(_mm_add_ps(_mm_loadu_ps(hr + i), sum), pos), stiffness4),
-                            _mm_loadu_ps(vel + i));
+      __m128 v = _mm_add_ps(_mm_mul_ps(_mm_sub_ps(_mm_add_ps(rest, sum), pos), stiffness4), _mm_load_ps(vel.group(i)));
       v = _mm_mul_ps(_mm_add_ps(v, initial4), damping4);
-      v = sel4(_mm_sub_ps(_mm_and_ps(v, abs_mask), tiny4), v, zero4);
-      _mm_storeu_ps(vel + i, v);
+      v = sel4(_mm_sub_ps(and4(v, abs_mask), tiny4), v, zero4);
+      _mm_store_ps(vel.group(i), v);
       __m128 p = _mm_add_ps(_mm_mul_ps(v, step4), pos);
       p = sel4(_mm_sub_ps(lo, p), lo, p);
       p = sel4(_mm_sub_ps(p, hi), hi, p);
-      _mm_storeu_ps(out + i, p);
+      _mm_store_ps(out.group(i), p);
     };
     axis(hx, hrx, ax, arx, bx, brx, vel_x, out_x, max_x4, neg_max_x4);
     axis(hy, hry, ay, ary, by, bry, vel_y, out_y, max_y4, neg_max_y4);
@@ -427,9 +565,31 @@ void update_row(u32 args, u32 j, const Constants& k, const Pushers& all) {
   };
 
   const bool springs_only = active_count == 0 && (all.count >= 0 || pushers == 0) && !push_b && !push_c;
+  // The lines this row reads or writes for the first time (the row below's
+  // positions and rest positions, this row's velocities and new positions;
+  // the row above and this row's old positions were the last row's), asked
+  // for kAhead floats ahead: the Pentium III fetches nothing ahead itself,
+  // and the grid is three times its cache, so each new line was a full wait
+  // for memory. Prefetching never faults, past the end included.
+  // The next row's block, asked for kAhead chunks ahead (this row's was the
+  // last row's next, and is in the cache): the Pentium III fetches nothing
+  // ahead itself. Prefetching never faults, past the end included.
+  const char* const next = (const char*)bx.p;
+  constexpr u32 kAhead = 4;  // chunks (eight cache lines)
+  for (u32 c = 0; c < kAhead; ++c) {
+    _mm_prefetch(next + c * 64, _MM_HINT_T0);
+    _mm_prefetch(next + c * 64 + 32, _MM_HINT_T0);
+  }
+  auto prefetch = [&](u32 i) {  // at each chunk's first point
+    if ((i + kLead) % 4 != 0) return;
+    const u32 c = (i + kLead) / 4 + kAhead;
+    _mm_prefetch(next + c * 64, _MM_HINT_T0);
+    _mm_prefetch(next + c * 64 + 32, _MM_HINT_T0);
+  };
   u32 i = 1;
   if (springs_only) {
     for (; i + 3 <= 131; i += 4) {
+      prefetch(i);
       if (objects_at(i) || objects_at(i + 1) || objects_at(i + 2) || objects_at(i + 3)) {
         for (u32 q = i; q < i + 4; ++q) point(q);
       } else {
@@ -437,7 +597,10 @@ void update_row(u32 args, u32 j, const Constants& k, const Pushers& all) {
       }
     }
   }
-  for (; i <= 131; ++i) point(i);
+  for (; i <= 131; ++i) {
+    prefetch(i);
+    point(i);
+  }
   ++g_stats.rows;
   const u64 t2 = __builtin_ia32_rdtsc();
   g_stats.physics_cycles += t2 - t1;
@@ -450,10 +613,27 @@ void update_row(u32 args, u32 j, const Constants& k, const Pushers& all) {
   if (!gw_frame_drawn()) return;
 #endif
   // 2. The row's lines: only for frames that are rendered (gw_frame_drawn),
-  // the line buffer is only drawn then. With the line buffer's host mirror (see
-  // gw_grid_line_host), each segment is a line of two vertices there
-  // (x, y, z, brightness, edge 0), the NV2A draws it; else, as the game
-  // does, a thin quad of four vertices in the guest buffer.
+  // the line buffer is only drawn then. With the line buffer's host mirror,
+  // the points themselves (GwGridLines in runtime.h: 12 bytes a point, once,
+  // where segments were 40 bytes each and every point was in four), which
+  // src/nv2a.cpp draws as line strips; else, as the game does, each segment
+  // a thin quad of four vertices in the guest buffer.
+  u8* const points = gw_grid_lines_points();
+  if (points) {
+    const u32 hz = __builtin_bswap32(raw(K + 7016));
+    auto put_row = [&](u32 r, Lane x, Lane y) {
+      float* v = (float*)(points + r * kGwGridLineCols * kGwGridLineVertex);
+      for (u32 i = 0; i < kCols; ++i, v += 3) {
+        v[0] = x[i];
+        v[1] = y[i];
+        memcpy(&v[2], &hz, 4);
+      }
+    };
+    put_row(j, hx, hy);
+    if (j == 1) put_row(0, ax, ay);
+    if (j == kRows - 1) put_row(kRows, bx, by);
+    if (!kWriteDisplacements) return;
+  }
   const float thickness = lf(K + 6964) * lf(K + 5900);
   const u32 z = raw(K + 7016);
   const u32 edge_a = raw(C + 10092), edge_b = raw(C + 10088);
@@ -461,7 +641,7 @@ void update_row(u32 args, u32 j, const Constants& k, const Pushers& all) {
   const u32 lines = lw(K + 5888);
   // The buffer starts at 'lines' (row 1's uprights); row j's segments at
   // lines + j * 29456 - 14784, rows numbered from 1.
-  u8* const mirror = gw_grid_line_host(lines);
+  u8* const mirror = points ? nullptr : gw_grid_line_host(lines);  // the points are there instead
   const u32 mirror_base = lines;
   const u32 hz = __builtin_bswap32(z);
   // a, b: the points' guest addresses (their texture u, v at +32, +36).
@@ -517,9 +697,13 @@ void update_row(u32 args, u32 j, const Constants& k, const Pushers& all) {
   // Row r's points (r = 0 or 88: the border rows).
   auto displacements = [&](u32 out, u32 r) {
     u32 from = grid + r * kRow;
+    const u32 rh = r + 1;
+    const bool old = g_old.row[rh & 1] == (int)rh;  // updated already: its old copy
+    const Lane px = old ? lane(g_old.rows[rh & 1], kX) : g.pos_x(rh);
+    const Lane py = old ? lane(g_old.rows[rh & 1], kY) : g.pos_y(rh);
     for (u32 i = 0; i < kCols; ++i, from += kPoint, out += kVertex) {
-      sf(out + 0, g.pos_x[rs][r + 1][i] - g.rest_x[r + 1][i]);
-      sf(out + 4, g.pos_y[rs][r + 1][i] - g.rest_y[r + 1][i]);
+      sf(out + 0, px[i] - g.rest_x(rh)[i]);
+      sf(out + 4, py[i] - g.rest_y_at(rh, i));
       sraw(out + 8, z);
       sraw(out + 12, raw(from + 32));
       sraw(out + 16, raw(from + 36));
@@ -567,15 +751,19 @@ void update_grid(u32 args) {
     g_stats = {g_stats.updates};
   }
   const u32 grid = lw(K + 5896);
+  const u32 read_slot = lw(D + 9660), write_slot = lw(K + 5908);
 #ifdef GW_GRID_GUEST_SYNC
-  g_host.load(grid);
+  g_host.load(grid, read_slot);
 #else
-  if (g_host.guest != grid) g_host.load(grid);
+  if (g_host.guest != grid) g_host.load(grid, read_slot);
 #endif
+  g_old.row[0] = g_old.row[1] = -1;
+  memset(g_old.updated, 0, sizeof(g_old.updated));
   for (u32 j; (j = next_row()) < kRows;) update_row(args, j, k, pushers);
 #ifdef GW_GRID_GUEST_SYNC
-  g_host.store(grid);
+  g_host.store(grid, write_slot, g_old.updated);
 #endif
+  (void)write_slot;
   InterlockedExchange(&g_grid_busy, 0);
 }
 

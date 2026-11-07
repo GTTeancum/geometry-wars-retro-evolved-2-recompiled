@@ -1,7 +1,8 @@
 // Converts the game's sound banks (audio\*.baf) from XMA to IMA ADPCM for
 // the Xbox, which has no XMA (see xbox\tools\convert_banks.py, the same
 // conversion for development, for the formats). Each wave's XMA is wrapped as
-// XMA2 RIFF and converted by ffmpeg (adpcm_ima_wav, trellis search); next to
+// XMA2 RIFF and converted by ffmpeg (adpcm_ima_wav, trellis search); waves of
+// 16-bit big-endian PCM (data type 3 at record +8) go in as raw PCM; next to
 // each bank, <bank>.adpcm holds the converted waves found by their place in
 // the original bank:
 //   'GWAD', wave count, then per wave (little-endian words): original data
@@ -39,12 +40,24 @@ public static class SoundConvert
     }
 
     // -> ADPCM data; block size and sample count from the RIFF ffmpeg writes.
-    static byte[] ToAdpcm(string ffmpeg, byte[] payload, int rate, int channels, string work, out int block, out int samples)
+    static byte[] ToAdpcm(string ffmpeg, byte[] payload, int rate, int channels, bool pcm, string work, out int block, out int samples)
     {
-        string src = Path.Combine(work, "in.wav"), dst = Path.Combine(work, "out.wav");
-        File.WriteAllBytes(src, Xma2Riff(payload, rate, channels));
-        var info = new ProcessStartInfo(ffmpeg, "-hide_banner -loglevel error -y -i \"" + src +
-                                        "\" -acodec adpcm_ima_wav -trellis 8 \"" + dst + "\"");
+        string dst = Path.Combine(work, "out.wav");
+        string source;
+        if (pcm)
+        {
+            string raw = Path.Combine(work, "in.raw");
+            File.WriteAllBytes(raw, payload);
+            source = "-f s16be -ar " + rate + " -ac " + channels + " -i \"" + raw + "\"";
+        }
+        else
+        {
+            string src = Path.Combine(work, "in.wav");
+            File.WriteAllBytes(src, Xma2Riff(payload, rate, channels));
+            source = "-i \"" + src + "\"";
+        }
+        var info = new ProcessStartInfo(ffmpeg, "-hide_banner -loglevel error -y " + source +
+                                        " -acodec adpcm_ima_wav -trellis 8 \"" + dst + "\"");
         info.UseShellExecute = false;
         info.RedirectStandardError = true;
         info.CreateNoWindow = true;
@@ -95,10 +108,11 @@ public static class SoundConvert
                     int size = (int)BE32(d, at + 4);
                     int offset = (int)BE32(d, at + 0x2C), length = (int)BE32(d, at + 0x30);
                     int rate = (int)BE32(d, at + 0x3C), channels = (int)BE32(d, at + 0x44);
+                    bool pcm = BE32(d, at + 8) == 3;
                     var payload = new byte[length];
                     Array.Copy(d, offset, payload, 0, length);
                     int block, samples;
-                    byte[] adpcm = ToAdpcm(ffmpeg, payload, rate, channels, work, out block, out samples);
+                    byte[] adpcm = ToAdpcm(ffmpeg, payload, rate, channels, pcm, work, out block, out samples);
                     foreach (int v in new[] { offset, length, rate, channels, samples, block, tableSize + (int)blob.Length, adpcm.Length })
                         tw.Write(v);
                     blob.Write(adpcm, 0, adpcm.Length);

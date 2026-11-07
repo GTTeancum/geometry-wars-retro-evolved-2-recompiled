@@ -103,7 +103,7 @@ DWORD WINAPI status_thread(LPVOID) {
         int n = snprintf(text, sizeof(text), "cpu ms/frame over %u frames (%u kicks a frame):", frames,
                          (kicks - last_kicks) / frames);
         last_kicks = kicks;
-        static const char* const kNames[kPartCount] = {"grid", "particles", "stars", "commands"};
+        static const char* const kNames[kPartCount] = {"grid", "particles", "stars", "commands", "audio"};
         for (int i = 0; i < kPartCount && n < (int)sizeof(text) - 24; ++i) {
           const u64 c = gw_part_cycles[i];
           // tenths of a ms (this printf has no %f)
@@ -165,6 +165,26 @@ void gw_fatal(const char* fmt, ...) {
   va_end(args);
   gw_log("FATAL: %s\n", g_fatal_text);
   g_fatal = true;
+  // The log as it was at each of the first three fatal errors, in
+  // D:\gw2crash1.txt ..3: the ring is soon filled by what follows.
+  static volatile long saved = 0;
+  const long number = InterlockedIncrement(&saved);
+  if (number <= 3) {
+    static char text[sizeof(gw_log_ring)];
+    if (g_log_ready) EnterCriticalSection(&g_log_lock);
+    const u32 end = gw_log_pos, start = end > sizeof(gw_log_ring) ? end - sizeof(gw_log_ring) : 0;
+    u32 n = 0;
+    for (u32 p = start; p < end; ++p) text[n++] = gw_log_ring[p & (sizeof(gw_log_ring) - 1)];
+    if (g_log_ready) LeaveCriticalSection(&g_log_lock);
+    char name[32];
+    snprintf(name, sizeof(name), "D:\\gw2crash%ld.txt", number);
+    HANDLE f = CreateFileA(name, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+      DWORD written;
+      WriteFile(f, text, n, &written, nullptr);
+      CloseHandle(f);
+    }
+  }
   for (;;) Sleep(1000);
 }
 

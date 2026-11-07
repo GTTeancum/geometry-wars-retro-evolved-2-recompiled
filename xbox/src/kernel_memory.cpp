@@ -122,6 +122,12 @@ bool free_grid_line_buffer(u32 address) {
 }
 }  // namespace
 
+u8* gw_grid_line_block(u32 guest, u32 bytes) {
+  u8* const host = gw_grid_line_host(guest);
+  if (!host) return nullptr;
+  return (u32)(host - g_grid_lines.host) + bytes <= kMirrorSize ? host : nullptr;
+}
+
 u8* gw_grid_line_host(u32 guest) {
   const SharedBuffer& b = g_grid_lines;
   if (!b.host || guest < b.address || guest - b.address >= kGridLineBufferSize) return nullptr;

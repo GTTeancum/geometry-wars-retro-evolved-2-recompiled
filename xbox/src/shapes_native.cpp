@@ -197,3 +197,59 @@ extern "C" void sub_8205EB58(PPCContext& ctx, uint8_t* base) {
   vertex(outline + 192, fma(n + tx, w, qx), fma(m + ty, w, qy), fma(w, tz, qz), one, zero);
   vertex(outline + 224, fma(w, tx, nms(w, n, qx)), fma(w, ty, nms(w, m, qy)), fma(w, tz, qz), u0, zero);
 }
+
+// An object's outline (guest 0x82061DA0): r3 the object's matrix, r4 its
+// model, r5 a colour (4 floats), r6 the part to draw. The model's mesh (+44):
+// +0 parts (12 bytes: +0 segments, +4 count), +4 part count, +12 the line
+// caps' length; each segment 48 bytes: +0 start, +16 end, +32 colour. Per
+// segment the colour times the given one, both ends through the matrix
+// (sub_82030338), then the 3D glowing line (sub_8205EB58), its arguments in
+// the original's stack frame (colour at +80, end at +96, start at +112) as
+// the line builder reads them from guest memory. Natively for the calls per
+// segment; the player's and the enemies' Draw call it for every part.
+extern "C" void sub_82030338(PPCContext& ctx, uint8_t* base);  // vector times matrix (math_native.cpp)
+extern "C" void sub_82061DA0(PPCContext& ctx, uint8_t* base) {
+  const u32 matrix = ctx.r3.u32, model = ctx.r4.u32, colour = ctx.r5.u32, part = ctx.r6.u32;
+  if (!model) return;
+  const u32 mesh = gw_load32(model + 44);
+  if (!mesh || part >= gw_load32(mesh + 4)) return;
+  const u32 entry = gw_load32(mesh + 0) + part * 12;
+  if (!entry || gw_load32(entry + 4) == 0) return;
+  const u32 cap_bits = gw_load32(mesh + 12);
+  float cap;
+  memcpy(&cap, &cap_bits, 4);
+  const u32 frame = ctx.r1.u32 - 208;
+  auto lf = [](u32 a) {
+    const u32 v = gw_load32(a);
+    float f;
+    memcpy(&f, &v, 4);
+    return f;
+  };
+  auto sf = [](u32 a, float f) {
+    u32 v;
+    memcpy(&v, &f, 4);
+    gw_store32(a, v);
+  };
+  for (u32 k = 0; k < gw_load32(entry + 4); ++k) {
+    const u32 segment = gw_load32(entry + 0) + k * 48;
+    sf(frame + 92, lf(segment + 44) * lf(colour + 12));
+    sf(frame + 80, lf(colour + 0) * lf(segment + 32));
+    sf(frame + 88, lf(segment + 40) * lf(colour + 8));
+    sf(frame + 84, lf(segment + 36) * lf(colour + 4));
+    ctx.r1.u64 = frame;
+    ctx.r3.u64 = frame + 96;
+    ctx.r4.u64 = segment + 16;
+    ctx.r5.u64 = matrix;
+    sub_82030338(ctx, base);
+    ctx.r3.u64 = frame + 112;
+    ctx.r4.u64 = segment;
+    ctx.r5.u64 = matrix;
+    sub_82030338(ctx, base);
+    ctx.r3.u64 = frame + 112;
+    ctx.r4.u64 = frame + 96;
+    ctx.r5.u64 = frame + 80;
+    ctx.f1.f64 = (double)cap;
+    sub_8205EB58(ctx, base);
+    ctx.r1.u64 = frame + 208;
+  }
+}

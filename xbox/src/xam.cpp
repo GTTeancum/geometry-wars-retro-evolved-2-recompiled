@@ -297,18 +297,26 @@ GW_EXPORT(XamInputGetState) {
 GW_EXPORT(XamInputSetState) { GW_RETURN(GW_ARG(3) == 0 ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED); }
 
 // --- audio -----------------------------------------------------------------------------------
-// The audio driver callback is not run yet, so the game produces no sound.
+// The render driver (src/audio.cpp): r3 points at {callback, argument}, the
+// driver handle goes to *r4; each frame is submitted with r4 the samples.
 
 GW_EXPORT(XAudioRegisterRenderDriverClient) {
   u32 callback = GW_ARG(3);
   gw_log("XAudioRegisterRenderDriverClient(callback %08X, arg %08X)\n", gw_load32(callback),
          gw_load32(callback + 4));
+  gw_audio_register(gw_load32(callback), gw_load32(callback + 4));
   gw_store32(GW_ARG(4), 0x41550000);
   GW_RETURN(X_STATUS_SUCCESS);
 }
 
-GW_EXPORT(XAudioUnregisterRenderDriverClient) { GW_RETURN(X_STATUS_SUCCESS); }
-GW_EXPORT(XAudioSubmitRenderDriverFrame) { GW_RETURN(X_STATUS_SUCCESS); }
+GW_EXPORT(XAudioUnregisterRenderDriverClient) {
+  gw_audio_unregister();
+  GW_RETURN(X_STATUS_SUCCESS);
+}
+GW_EXPORT(XAudioSubmitRenderDriverFrame) {
+  gw_audio_frame(GW_ARG(4));
+  GW_RETURN(X_STATUS_SUCCESS);
+}
 
 GW_EXPORT(XAudioGetVoiceCategoryVolume) {
   float one = 1.0f;

@@ -3,6 +3,8 @@ monitor (xbdm, port 731).
 
   python xbox/tools/xbdm_profile.py <console address> [seconds] [--top N] [--function NAME] [--thread ID]
 
+--gap S pauses S seconds between rounds (less disturbance of the game).
+
 --thread counts only that thread (xbdm's id, as the by-thread table prints).
 --inclusive also prints, for each function, the running samples with it
 anywhere on the stack (2 KB): time including callees, to find subsystems.
@@ -96,9 +98,14 @@ def main():
         return int(m[1], 16) if m else None
 
     inclusive_mode = '--inclusive' in sys.argv
+    # --gap S: a pause after each round (sampling stops the game's threads
+    # while it reads them; a gap keeps the game near its own speed).
+    gap = float(sys.argv[sys.argv.index('--gap') + 1]) if '--gap' in sys.argv else 0.0
     inclusive = collections.Counter()
     idle_rounds = 0  # rounds in which every thread was waiting: the CPU had nothing to do
     while time.time() < end:
+        if gap:
+            time.sleep(gap)
         running_before = sum(by_thread.values())
         for tid in threads:
             reply = command(x, f'getcontext thread={tid} control')

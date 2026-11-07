@@ -93,8 +93,14 @@ inline void glow_vertex(u32 out, float x, float y, float z, float u, float r, fl
 extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base) {
   (void)base;
   GwPartTimer timer(kPartParticles);
-  const u32 system = ctx.r3.u32 + 40, in = ctx.r4.u32, out = ctx.r5.u32;
-  const u32 streak = ctx.r6.u32, glow = ctx.r7.u32;
+  gw_particle(ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
+}
+
+// The particle update itself (sub_82063448's arguments: the particle
+// system, the particle, its slot after compaction, its streak and glow
+// vertices).
+void gw_particle(u32 particle_system, u32 in, u32 out, u32 streak, u32 glow) {
+  const u32 system = particle_system + 40;
 
   // Everything read from the particle before anything is written.
   const float px = lf(in + 0), py = lf(in + 4), pz = lf(in + 8);
@@ -204,7 +210,14 @@ extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base) {
   // Direction of travel this frame (normalised), for the streak.
   const float sx = x - px, sy = y - py;
   const float r = rsq(sy * sy + sx * sx);
-  const float dir_x = sx * r, dir_y = sy * r;
+  float dir_x = sx * r, dir_y = sy * r;
+  // A particle that did not move this frame (sx = sy = 0, as in the ship's
+  // spawn bursts) has no direction: 0 x infinity, not a number, in every
+  // corner of its streak. The 360's GPU drops such a quad; the NV2A drew it
+  // as a huge polygon over the screen. Without a direction the streak has
+  // no size (all four corners at the particle), which shows the same as
+  // dropping it.
+  if (!(dir_x - dir_x == 0.0f) || !(dir_y - dir_y == 0.0f)) dir_x = dir_y = 0.0f;
   // The streak runs from the old position (two corners) to the new one (two
   // corners). 'across' is the trail length turned a quarter (x <- y, y <- x),
   // 'along' the width along the motion, as the PowerPC code combines them.
@@ -247,4 +260,134 @@ extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base) {
     // these, from the mirror only (src/nv2a.cpp), and writing the guest buffer
     // would commit its memory (it ran out in big explosions at 720p).
   }
+}
+
+extern "C" void sub_820A1800(PPCContext& ctx, uint8_t* base);  // vertex buffer lock
+extern "C" void sub_820A1850(PPCContext& ctx, uint8_t* base);  // vertex buffer unlock
+
+namespace {
+inline u32 lw(u32 a) { return gw_load32(a); }
+inline void sw(u32 a, u32 v) { gw_store32(a, v); }
+
+// The particle vertex buffers: tables of buffers at kMainBuffers and
+// kGlowBuffers, (frame x 6 + job) each; the frame number at kFrame; each
+// job's count of live particles at kLive + 4 x job.
+constexpr u32 kGlowBuffers = 0x821B3E7C, kMainBuffers = 0x821B3E80, kFrame = 0x821B3E84, kLive = 0x821B3E88;
+// A particle system: +0 bucket index bias, +4 buckets (5636 bytes: 128
+// particles of 44 bytes, then the count at +5632), +8 the bucket index
+// array, +12 the last index, +496 the next index (shared by the jobs).
+constexpr u32 kBucket = 5636, kParticle = 44, kPerBucket = 128, kCount = 5632;
+
+u32 lock(PPCContext& ctx, uint8_t* base, u32 buffer) {
+  ctx.r3.u64 = buffer;
+  ctx.r4.u64 = 0;
+  ctx.r5.u64 = 0;
+  ctx.r6.u64 = 0;
+  sub_820A1800(ctx, base);
+  return ctx.r3.u32;
+}
+}  // namespace
+
+// A job's share of the particles (guest 0x82063A38; r3 the particle system,
+// r4 the job's context, +4 its index). Takes buckets from the shared index
+// (+496) until past the last one, moves each live particle (brightness at +36
+// not negative) through gw_particle into the next free slot of the share's
+// first bucket with room (compacting them), writing its vertices in turn;
+// an emptied bucket gets count 0 and its index entry biased by +0. Natively
+// for the per-particle calls and the reserved-store increments, which the
+// recompiled code made the most expensive part of the particles; the same
+// stores in the same order otherwise. The jobs run one after another on
+// the main thread (sub_82063F08 below), so the index needs no atomics.
+extern "C" void sub_82063A38(PPCContext& ctx, uint8_t* base) {
+  GwPartTimer timer(kPartParticles);
+  const u32 system = ctx.r3.u32, job = lw(ctx.r4.u32 + 4);
+  ctx.r1.u64 = ctx.r1.u32 - 224;  // the original's frame, below which the calls put theirs
+  // This frame's buffers: the set by drawn frame (gw_particle_set_buffer),
+  // put in the game's tables where its renderer reads them.
+  const u32 slot = (lw(kFrame) * 6 + job) * 4;
+  u32 main_buffer = lw(lw(kMainBuffers) + slot), glow_buffer = lw(lw(kGlowBuffers) + slot);
+  if (const u32 m = gw_particle_set_buffer(gw_drawn_index() & 1, job, false)) {
+    main_buffer = m;
+    glow_buffer = gw_particle_set_buffer(gw_drawn_index() & 1, job, true);
+    sw(lw(kMainBuffers) + slot, main_buffer);
+    sw(lw(kGlowBuffers) + slot, glow_buffer);
+  }
+  u32 streak = lock(ctx, base, main_buffer);
+  u32 glow = lock(ctx, base, glow_buffer);
+  u32 live = 0, dest = 0, used = 0;
+  for (;;) {
+    const u32 next = system + 496;
+    const int index = (int)lw(next);
+    sw(next, (u32)(index + 1));
+    if (index > (int)lw(system + 12)) break;
+    const u32 entry = lw(system + 8) + (u32)index * 4;
+    const u32 number = lw(entry);
+    const u32 bucket = lw(system + 4) + number * kBucket;
+    if (!dest) {
+      dest = bucket;
+      used = 0;
+    }
+    for (int k = 0; k < (int)lw(bucket + kCount); ++k) {
+      const u32 p = bucket + (u32)k * kParticle;
+      if ((int)lw(p + 36) < 0) continue;
+      if (used >= kPerBucket) {
+        sw(dest + kCount, used);
+        dest = bucket;
+        used = 0;
+      }
+      gw_particle(system, p, dest + used * kParticle, streak, glow);
+      ++used;
+      streak += 128;
+      glow += 112;
+      ++live;
+    }
+    if (bucket != dest) {
+      sw(bucket + kCount, 0);
+      sw(entry, lw(system + 0) + number);
+    }
+  }
+  if (dest) sw(dest + kCount, used);
+  sw(kLive + job * 4, live);
+  ctx.r3.u64 = glow_buffer;
+  sub_820A1850(ctx, base);
+  ctx.r3.u64 = main_buffer;
+  sub_820A1850(ctx, base);
+  ctx.r1.u64 = ctx.r1.u32 + 224;
+}
+
+// Heap sort of the particle bucket index (guest 0x82064110 with its
+// sift-down 0x82064060): r3 points at the array's address, r4 the count; the
+// entries are signed 32-bit and sorted ascending. Equal entries are equal
+// values, so any correct sort gives the same array: natively a heap sort
+// on a host copy (up to kMaxSort entries; more: the original).
+extern "C" void __imp__sub_82064110(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82064110(PPCContext& ctx, uint8_t* base) {
+  constexpr int kMaxSort = 8192;
+  const int n = (int)ctx.r4.u32;
+  if (n > kMaxSort) {
+    __imp__sub_82064110(ctx, base);
+    return;
+  }
+  if (n <= 1) return;
+  static int values[kMaxSort];
+  const u32 array = lw(ctx.r3.u32);
+  for (int i = 0; i < n; ++i) values[i] = (int)lw(array + (u32)i * 4);
+  // Heap sort, as the original, on host integers.
+  auto sift = [&](int root, int end) {
+    for (int child; (child = 2 * root + 1) < end; root = child) {
+      if (child + 1 < end && values[child] < values[child + 1]) ++child;
+      if (!(values[root] < values[child])) return;
+      const int t = values[root];
+      values[root] = values[child];
+      values[child] = t;
+    }
+  };
+  for (int i = n / 2 - 1; i >= 0; --i) sift(i, n);
+  for (int end = n - 1; end > 0; --end) {
+    const int t = values[0];
+    values[0] = values[end];
+    values[end] = t;
+    sift(0, end);
+  }
+  for (int i = 0; i < n; ++i) sw(array + (u32)i * 4, (u32)values[i]);
 }

@@ -50,6 +50,11 @@ def main():
     for src in extracted.rglob('*'):
         if src.is_file():
             changed += copy(src, STAGE / src.relative_to(extracted))
+    # The sound banks converted for the Xbox (xbox/tools/convert_banks.py
+    # into xbox/build/audio_adpcm), next to the game's banks; the native
+    # sound engine (src/sound_native.cpp) plays these.
+    for src in sorted((ROOT / 'xbox' / 'build' / 'audio_adpcm').glob('*.adpcm')):
+        changed += copy(src, STAGE / 'Audio' / src.name)
     changed += copy(image, STAGE / 'gw2' / 'default.image.bin')
     changed += copy(xbe, STAGE / 'default.xbe')
     if devkit_128:

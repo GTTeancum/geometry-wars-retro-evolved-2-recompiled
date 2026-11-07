@@ -56,7 +56,7 @@ volatile u32 gw_nv2a_stage = 0;
 namespace {
 bool g_in_frame = false;
 // Per-frame vertex arena, 20 bytes a vertex.
-constexpr u32 kArenaBytes = 768 * 1024;
+constexpr u32 kArenaBytes = 1024 * 1024;  // (the menus' and game over's screens: up to 860 KiB a frame)
 u8* g_arena;
 u32 g_arena_used;  // bytes
 // Push buffer blocks are batched: every pb_end makes pbkit flush the CPU's
@@ -744,33 +744,56 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
     set_arrays(formats, offsets);
   };
 
-  // The grid's lines are in contiguous memory as NV2A lines, one for each
-  // 4-vertex segment of the game's quads (gw_grid_line_host): drawn where
-  // they are, smoothed. Their vertices are x, y, z, brightness, edge; the
-  // program's second input (u, v, brightness, edge in the game's layout, of
-  // which it uses the last two) reads from y on.
-  if (source == 2 && !rects && gp->attr_count == 2 && gp->stride == 28 && ((first + index_offset) % 4) == 0 &&
-      (count % 4) == 0) {
-    const u32 start = stream + (first + index_offset) * gp->stride;
-    u8* host = gw_grid_line_host(start);
-    if (host && count && gw_grid_line_host(start + count * gp->stride - 1)) {
-      const u32 base = (u32)MmGetPhysicalAddress(host);
-      formats[0] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (3 << 4) | (20 << 8);
-      formats[1] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (4 << 4) | (20 << 8);
-      offsets[0] = base;
-      offsets[1] = base + 4;
-      set_arrays(formats, offsets);
-      u32* p = blk_begin();
-      p = pb_push1(p, NV097_SET_LINE_WIDTH, 12);  // 1.5 pixels, in eighths
-      p = pb_push1(p, NV097_SET_LINE_SMOOTH_ENABLE, 1);
-      p = pb_push1(p, NV097_SET_BLEND_FUNC_SFACTOR, 0x0302);  // source alpha: the smoothing's coverage
-      blk_end(p);
-      draw_arrays(NV097_SET_BEGIN_END_OP_LINES, count / 2);
+  // The grid's lines: the game draws its line buffer of thin quads in two
+  // draws (the second at index offset 65528). src/grid_native.cpp writes the
+  // grid's points instead (GwGridLines in runtime.h), drawn here whole with
+  // the first piece of the first draw as smoothed line strips (the other
+  // pieces and draws do nothing): rows across from the array, columns down
+  // by index. The program's second input (u, v, brightness, edge, of which it
+  // uses the last two) is a constant per strip: (0, 0, colour, 0).
+  if (source == 2 && !rects && gp->attr_count == 2 && gp->stride == 28 && gw_grid_line_host(stream)) {
+    if (first + index_offset != 0 || !gw_grid_lines.host) return true;
+    const u32 base = (u32)MmGetPhysicalAddress(gw_grid_lines.host);
+    formats[0] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (3 << 4) | (kGwGridLineVertex << 8);
+    offsets[0] = base;
+    set_arrays(formats, offsets);  // input 1 off: the constant below
+    u32* p = blk_begin();
+    p = pb_push1(p, NV097_SET_LINE_WIDTH, 12);  // 1.5 pixels, in eighths
+    p = pb_push1(p, NV097_SET_LINE_SMOOTH_ENABLE, 1);
+    p = pb_push1(p, NV097_SET_BLEND_FUNC_SFACTOR, 0x0302);  // source alpha: the smoothing's coverage
+    blk_end(p);
+    auto colour = [](u32* p, u32 n) {
+      pb_push(p++, NV097_SET_VERTEX_DATA4F_M + 1 * 16, 4);
+      *p++ = 0;
+      *p++ = 0;
+      *p++ = gw_grid_lines.colours[n & 7];
+      *p++ = 0;
+      return p;
+    };
+    constexpr u32 W = kGwGridLineCols;
+    for (u32 r = 1; r + 1 < kGwGridLineRows; ++r) {
       p = blk_begin();
-      p = pb_push1(p, NV097_SET_LINE_SMOOTH_ENABLE, 0);
+      p = colour(p, r);
+      p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_LINE_STRIP);
+      p = pb_push1(p, 0x40000000 | NV097_DRAW_ARRAYS, ((W - 1) << 24) | (r * W));
+      p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
       blk_end(p);
-      return true;
     }
+    constexpr u32 H = kGwGridLineRows;  // 89: 44 pairs of 16-bit indices and one 32-bit
+    for (u32 c = 1; c + 1 < W; ++c) {
+      p = blk_begin();
+      p = colour(p, c);
+      p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_LINE_STRIP);
+      pb_push(p++, 0x40000000 | NV097_ARRAY_ELEMENT16, H / 2);
+      for (u32 r = 0; r + 1 < H; r += 2) *p++ = (r * W + c) | ((r + 1) * W + c) << 16;
+      p = pb_push1(p, NV097_ARRAY_ELEMENT32, (H - 1) * W + c);
+      p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
+      blk_end(p);
+    }
+    p = blk_begin();
+    p = pb_push1(p, NV097_SET_LINE_SMOOTH_ENABLE, 0);
+    blk_end(p);
+    return true;
   }
 
   // Vertices the native code wrote into a host mirror in the NV2A's order
@@ -1291,6 +1314,10 @@ void apply_glow() {
 
 }  // namespace
 
+#ifdef GW_SPAWN_CAPTURE
+void capture_trigger();  // below gw_nv2a_swap
+#endif
+
 void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_hash, const XvsProgram* vs,
                   u32 ps_hash) {
   if (!g_ready) return;
@@ -1365,6 +1392,11 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     if (uv_i >= 0) {
       const Texture* t = texture_from_fetch(&regs[0x4800 + tex_const * 6]);
       const u32 texture_format = regs[0x4800 + tex_const * 6 + 1] & 0x3F;
+      // The arena's border (vertex shader ADB9F3EC: four sides, two quads
+      // each) reads the colour field's 18x12 level, a 16_16_16_16 render
+      // target not reproduced here: drawn with white, its vertex colours
+      // giving its look (bright on the 360 whatever the field).
+      if (!t && vs_hash == 0xADB9F3EC) t = &g_white;
       if (!t) return note_skip(kTextureFormat, texture_format);
       texture = t;
     }
@@ -1402,11 +1434,8 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     if (gp && field_splat && source == 2 && gp->stride) {
       const u32 stream = gw_gpu_to_guest(regs[0x4800 + gp->fetch_slot * 2] & ~3u);
       const u32 start = stream + regs[0x2102] * gp->stride;
-      if (gw_vertex_mirror(start, gp->stride) && !gw_vertex_mirror(start, count * gp->stride)) {
-        u32 fit = 0;
-        while (fit < count && gw_vertex_mirror(start, (fit + 4) * gp->stride)) fit += 4;
-        count = fit;
-      }
+      const u32 room = gw_vertex_mirror_room(start);  // bytes from start to its mirror's end
+      if (room && room < count * gp->stride) count = room / gp->stride / 4 * 4;
     }
     if (gp && count) {
       const u32 piece = gp->stride ? (kArenaBytes / 2 / gp->stride) / 12 * 12 : count;
@@ -1489,6 +1518,47 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
 }
 
 // Called on each guest swap: shows the frame drawn since the last one.
+#ifdef GW_SPAWN_CAPTURE
+// Frames around the ship's spawn, for tools/xbdm_frames.py: every drawn
+// frame, shrunk to a quarter (320x180, R5G6B5, one pixel of each 4x4), into
+// a ring of kCaptureFrames; the spawn (a particle draw past 2048 vertices
+// after none for 30 frames, see the audit in gw_nv2a_draw) freezes the ring
+// kCaptureFrames / 2 frames later, so it holds the frames before and after.
+// gw_capture_state: [0] 'CAPT', [1] frames written (ring position = [1] %
+// kCaptureFrames), [2] 1 once frozen, [3] frames left before freezing
+// (0 = not triggered).
+constexpr u32 kCaptureFrames = 24, kCaptureW = 320, kCaptureH = 180;
+extern "C" {
+volatile u32 gw_capture_state[4] = {0x43415054, 0, 0, 0};
+u16 gw_capture_frames[kCaptureFrames][kCaptureH][kCaptureW];
+}
+void capture_trigger() {
+  // The level start's spawn draws correctly; the freeze is by white area
+  // (capture_frame) instead.
+}
+void capture_frame() {
+  if (gw_capture_state[2]) return;
+  while (pb_busy()) {
+  }
+  const u8* picture = (const u8*)pb_back_buffer();
+  const u32 pitch = pb_back_buffer_pitch(), w = pb_back_buffer_width(), h = pb_back_buffer_height();
+  u16(*out)[kCaptureW] = gw_capture_frames[gw_capture_state[1] % kCaptureFrames];
+  u32 white = 0;  // near-white pixels (the stray polygons are large and white)
+  for (u32 y = 0; y < kCaptureH; ++y) {
+    const u16* row = (const u16*)(picture + (y * h / kCaptureH) * pitch);
+    for (u32 x = 0; x < kCaptureW; ++x) {
+      const u16 px = row[x * w / kCaptureW];
+      out[y][x] = px;
+      white += (px >> 11) >= 28 && ((px >> 5) & 63) >= 56 && (px & 31) >= 28;
+    }
+  }
+  gw_capture_state[1] = gw_capture_state[1] + 1;
+  // A quarter of the frame near-white: freeze a few frames later.
+  if (white > kCaptureW * kCaptureH / 4 && !gw_capture_state[3]) gw_capture_state[3] = 6;
+  if (gw_capture_state[3] && --gw_capture_state[3] == 0) gw_capture_state[2] = 1;
+}
+#endif
+
 void gw_nv2a_swap() {
   if (!g_ready) return;
   // Nothing drawn since the last swap (a frame the game updated but did not
@@ -1514,6 +1584,9 @@ void gw_nv2a_swap() {
   field_end();
   if (kGlow) apply_glow();
   blk_flush();
+#ifdef GW_SPAWN_CAPTURE
+  capture_frame();
+#endif
 #ifdef GW_OVERLAY
   pb_erase_text_screen();
   pb_print("Geometry Wars RE2 - Xbox  frame %u\n", g_frames);

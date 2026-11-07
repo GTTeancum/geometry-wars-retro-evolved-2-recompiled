@@ -496,10 +496,21 @@ const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool div
   } else {
     b.mac(MAD, temp(kPos), cnst(3, "xyxy"), cnst(3, "zwzw"), pos_xy);
   }
-  Builder::Dest pos_zw;
-  pos_zw.output = kOutPos;
-  pos_zw.out_mask = 0xC;
-  b.mov(pos_zw, cnst(0, "xxxy"));
+  // z = 0 (no depth test). w: with the divide, the position's own w, which
+  // the NV2A clips against (and interpolates with), as the Xbox's Direct3D
+  // footer leaves it: a constant 1 there let points behind the camera
+  // through, mirrored across the screen, and their quads smeared over it
+  // (the camera's swoop and the particles flying at it as the ship spawns).
+  Builder::Dest pos_z;
+  pos_z.output = kOutPos;
+  pos_z.out_mask = divide ? 0x4 : 0xC;
+  b.mov(pos_z, cnst(0, "xxxy"));
+  if (divide) {
+    Builder::Dest pos_w;
+    pos_w.output = kOutPos;
+    pos_w.out_mask = 0x8;
+    b.mov(pos_w, temp(kPos, "wwww"));
+  }
 
   if (b.failed || !out.stride) {
     gw_log("nv2a: vertex shader %08X stays on the CPU\n", p.hash);

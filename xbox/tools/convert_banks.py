@@ -3,8 +3,9 @@ the Xbox, which has no XMA. Run by the installer; needs ffmpeg.
 
 A bank: 'BANK' header (0x34 bytes; wave count at +12), then one 'WAVE'
 record per sample, each with its own size at +4 (0x5C, or 0x50 without loop
-data): name at +12, then big-endian words data offset +0x2C, size +0x30,
-volume +0x34, format +0x38, sample rate +0x3C, bits +0x40, channels +0x44.
+data): data type +8 (8 XMA, 3 16-bit big-endian PCM), name at +12, then
+big-endian words data offset +0x2C, size +0x30, volume +0x34, format +0x38,
+sample rate +0x3C, bits +0x40, channels +0x44.
 
 Each wave's XMA, wrapped as XMA2 RIFF, goes through ffmpeg once into 4-bit
 IMA ADPCM (Microsoft layout, trellis search; about the size of the XMA). The
@@ -33,7 +34,7 @@ PACKET = 2048
 
 
 def records(data):
-    """(index, name, offset, size, rate, channels) for each WAVE record."""
+    """(index, name, offset, size, rate, channels, data type) for each WAVE record."""
     count = struct.unpack('>I', data[12:16])[0]
     at = 0x34
     for i in range(count):
@@ -43,7 +44,8 @@ def records(data):
         name = data[at + 12:at + 44].split(b'\0')[0].decode(errors='replace')
         offset, length = struct.unpack('>II', data[at + 0x2C:at + 0x34])
         rate, _bits, channels = struct.unpack('>III', data[at + 0x3C:at + 0x48])
-        yield i, name, offset, length, rate, channels
+        kind = struct.unpack('>I', data[at + 8:at + 12])[0]
+        yield i, name, offset, length, rate, channels, kind
         at += size
 
 
@@ -63,12 +65,20 @@ def chunks(riff):
         at += 8 + size + (size & 1)
 
 
-def to_adpcm(ffmpeg, payload, rate, channels, work):
-    """-> (ADPCM data, block size, samples)."""
-    src, dst = work / 'in.wav', work / 'out.wav'
-    src.write_bytes(xma2_riff(payload, rate, channels))
-    r = subprocess.run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-i', str(src), '-acodec',
-                        'adpcm_ima_wav', '-trellis', '8', str(dst)], capture_output=True, text=True)
+def to_adpcm(ffmpeg, payload, rate, channels, work, pcm=False):
+    """-> (ADPCM data, block size, samples). pcm: the payload is 16-bit
+    big-endian PCM (data type 3), not XMA."""
+    dst = work / 'out.wav'
+    if pcm:
+        src = work / 'in.raw'
+        src.write_bytes(payload)
+        source = ['-f', 's16be', '-ar', str(rate), '-ac', str(channels), '-i', str(src)]
+    else:
+        src = work / 'in.wav'
+        src.write_bytes(xma2_riff(payload, rate, channels))
+        source = ['-i', str(src)]
+    r = subprocess.run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-y'] + source +
+                       ['-acodec', 'adpcm_ima_wav', '-trellis', '8', str(dst)], capture_output=True, text=True)
     if r.returncode:
         raise RuntimeError(r.stderr.strip()[:300])
     block = samples = None
@@ -90,9 +100,10 @@ def convert_bank(ffmpeg, path, out_path, work):
     if data[:4] != b'BANK':
         raise RuntimeError(f'{path} is not a sound bank')
     entries, blob, seconds = [], bytearray(), 0.0
-    for i, name, offset, length, rate, channels in records(data):
+    for i, name, offset, length, rate, channels, kind in records(data):
         try:
-            adpcm, block, samples = to_adpcm(ffmpeg, data[offset:offset + length], rate, channels, work)
+            adpcm, block, samples = to_adpcm(ffmpeg, data[offset:offset + length], rate, channels, work,
+                                             pcm=kind == 3)
         except RuntimeError as e:
             raise RuntimeError(f'{path.name} #{i} {name}: {e}') from None
         entries.append((offset, length, rate, channels, samples, block, len(blob), len(adpcm)))

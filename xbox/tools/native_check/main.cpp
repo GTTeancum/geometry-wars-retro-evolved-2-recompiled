@@ -48,12 +48,44 @@ extern "C" void sub_820A87B0(PPCContext& ctx, uint8_t* base);
 #endif
 extern "C" void sub_82061750(PPCContext& ctx, uint8_t* base);  // stubbed below
 extern "C" void sub_82030338(PPCContext& ctx, uint8_t* base);  // native (math_native.cpp)
+extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base);  // native (particle_native.cpp)
+extern "C" void sub_8209AC70(PPCContext& ctx, uint8_t* base);  // recorded below
+extern "C" void sub_8209D288(PPCContext& ctx, uint8_t* base);  // native (d3d_native.cpp)
+extern "C" void sub_820AA9E0(PPCContext& ctx, uint8_t* base);  // stand-ins below
+extern "C" void sub_8212EDC0(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_8205EB58(PPCContext& ctx, uint8_t* base);  // native (shapes_native.cpp)
+extern "C" void sub_82064060(PPCContext& ctx, uint8_t* base);  // the original, below
 #include "original.inc"
 
 extern "C" void sub_8205B880(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_82075548(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82063A38(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_8209D288(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_820A68B0(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_820A65F8(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82061DA0(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_8209D8A0(PPCContext& ctx, uint8_t* base);
+// The shader sets' callees: making room hands back a fixed buffer; the copy
+// is a guest memcpy (r3 destination, r4 source, r5 bytes).
+constexpr u32 kRoomBuffer = 0x70430000;
+extern "C" void sub_820AA9E0(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = kRoomBuffer; }
+extern "C" void sub_8212EDC0(PPCContext& ctx, uint8_t*) {
+  memmove(gw_host(ctx.r3.u32), gw_host(ctx.r4.u32), ctx.r5.u32);
+}
+// The scissor's callee: records the corners it was given.
+u64 g_scissor_args[5];
+extern "C" void sub_8209AC70(PPCContext& ctx, uint8_t*) {
+  g_scissor_args[0] = ctx.r4.u64;
+  g_scissor_args[1] = ctx.r5.u64;
+  g_scissor_args[2] = ctx.r6.u64;
+  g_scissor_args[3] = ctx.r7.u64;
+  g_scissor_args[4] = ctx.r1.u64;
+}
+extern "C" void sub_82064110(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82064060(PPCContext& ctx, uint8_t* base) { original_sub_82064060(ctx, base); }
+extern "C" void __imp__sub_82064110(PPCContext& ctx, uint8_t* base) { original_sub_82064110(ctx, base); }
 extern "C" void sub_820A91A0(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_821308B8(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_82096F30(PPCContext& ctx, uint8_t* base);
@@ -106,9 +138,12 @@ jmp_buf* gw_jmp_buf_for(u32, bool) { return nullptr; }
 // No host mirror here: the native grid writes its lines into the guest
 // buffer, where the comparison reads them.
 u8* gw_grid_line_host(u32) { return nullptr; }
+u8* gw_grid_line_block(u32, u32) { return nullptr; }
 u8* gw_vertex_mirror(u32, u32) { return nullptr; }
 u8* gw_vertex_mirror_add(u32, u32) { return nullptr; }
 bool gw_frame_drawn() { return true; }  // every frame drawn here
+u32 gw_drawn_index() { return 0; }
+u32 gw_particle_set_buffer(u32, u32, bool) { return 0; }  // the game's tables as they are
 volatile u64 gw_part_cycles[kPartCount];
 namespace rex::runtime {
 PPCFunc* ResolveIndirectFunction(uint32_t) { return nullptr; }
@@ -128,6 +163,8 @@ constexpr u32 kGrid = 0xC0010000;      // row 0 of the grid (one row above it)
 constexpr u32 kLines = 0xC0200000;     // line vertices (rows start 14784 before)
 constexpr u32 kDisplace = 0xC0600000;  // displacement vertices
 constexpr u32 kStarBuffer = 0xC0700000;  // three starfield vertex buffers
+constexpr u32 kPart = 0x70400000;        // a particle system, buckets, index (the shares' test)
+constexpr u32 kVerts = 0x71000000;       // the shares' vertex buffers (12 x 256 KB)
 constexpr u32 kLineQuad = 0xC0780000, kLineOutline = 0xC0781000;  // the line builder's two streams
 float random_float(float lo, float hi) { return lo + (hi - lo) * (float)rand() / (float)RAND_MAX; }
 // The line builder's vertex allocator (guest 0x82061750), stubbed: fixed
@@ -292,7 +329,8 @@ int main(int argc, char** argv) {
   SetUnhandledExceptionFilter(report_fault);
   u32 seed = argc > 1 ? (u32)atoi(argv[1]) : 1;
   if (!map(0x82000000, 0x220000) || !map(kStack - 0x10000, 0x20000) || !map(kArgs, 0x20000) ||
-      !map(kGrid - kRow, 91 * kRow) || !map(kLines, 88 * 1052 * 28 + 0x1000) || !map(kDisplace, 89 * 133 * 28 + 0x1000) || !map(kStarBuffer, 3 * 0x30000)) {
+      !map(kGrid - kRow, 91 * kRow) || !map(kLines, 88 * 1052 * 28 + 0x1000) || !map(kDisplace, 89 * 133 * 28 + 0x1000) || !map(kStarBuffer, 3 * 0x30000) ||
+      !map(kPart, 0x40000) || !map(kVerts, 0x600000 + 0x1000)) {
     return 1;
   }
   FILE* f = fopen("..\\game\\analysis\\default.image.bin", "rb");
@@ -408,6 +446,325 @@ int main(int argc, char** argv) {
     }
     printf("particle update: %d values off by more than 0.1%% (worst %.2g)\n", bad_words, worst);
     bad += bad_words;
+  }
+
+
+  // The jobs' particle shares (guest 0x82063A38, six jobs in turn over one
+  // particle system) and the bucket index sort after them (0x82064110).
+  {
+    constexpr u32 kSys = kPart, kBuckets = kPart + 0x1000, kIndex = kPart + 0x30000, kCtx = kPart + 0x31000;
+    constexpr u32 kTables = kPart + 0x32000;
+    constexpr u32 kBucketBytes = 5636;
+    int differ = 0;
+    for (int round = 0; round < 6; ++round) {
+      const u32 n = 4 + rand() % 26;  // buckets
+      // Wells and holes off; the particle constants are the last test's.
+      gw_store32(kSys + 40 + 448, 0);
+      gw_store32(kSys + 40 + 452, 0);
+      gw_store32(kSys + 0, n);
+      gw_store32(kSys + 4, kBuckets);
+      gw_store32(kSys + 8, kIndex);
+      gw_store32(kSys + 12, n - 1 - (u32)(rand() % 3));
+      gw_store32(kSys + 496, 0);
+      for (u32 b = 0; b < n; ++b) gw_store32(kIndex + b * 4, b);
+      for (u32 b = n - 1; b > 0; --b) {  // shuffled
+        const u32 o = (u32)rand() % (b + 1), t = gw_load32(kIndex + b * 4);
+        gw_store32(kIndex + b * 4, gw_load32(kIndex + o * 4));
+        gw_store32(kIndex + o * 4, t);
+      }
+      for (u32 b = 0; b < n; ++b) {
+        const u32 bucket = kBuckets + b * kBucketBytes, count = (u32)rand() % 129;
+        gw_store32(bucket + 5632, count);
+        for (u32 k = 0; k < 128; ++k) {
+          const u32 q = bucket + k * 44;
+          for (u32 c = 0; c < 3; ++c) sf(q + c * 4, frand(-700, 700) * (c == 2 ? 0.01f : 1.0f));
+          for (u32 c = 0; c < 3; ++c) sf(q + 12 + c * 4, frand(-3000, 3000) * (c == 2 ? 0.01f : 1.0f));
+          for (u32 c = 0; c < 3; ++c) sf(q + 24 + c * 4, frand(0, 1));
+          sf(q + 36, rand() % 3 == 0 ? frand(-1, -0.01f) : frand(0, 1));
+          sf(q + 40, frand(0, 60));
+        }
+      }
+      // Vertex buffers: frame 1, six jobs; the lock stand-in adds kLockedOffset.
+      gw_store32(0x821B3E84, 1);
+      gw_store32(0x821B3E80, kTables);
+      gw_store32(0x821B3E7C, kTables + 0x100);
+      for (u32 s = 0; s < 12; ++s) {
+        gw_store32(kTables + s * 4, kVerts + s * 0x40000);
+        gw_store32(kTables + 0x100 + s * 4, kVerts + 0x300000 + s * 0x40000);
+      }
+      for (u32 job = 0; job < 6; ++job) gw_store32(kCtx + job * 16 + 4, job);
+      const u32 sizes[4] = {0x32000, 0x100, 0x600000, 16};
+      const u32 starts[4] = {kPart, 0x821B3E88 - 0x80, kVerts, 0};
+      u8* before_part = (u8*)malloc(0x32000);
+      u8* before_verts = (u8*)malloc(0x600000);
+      memcpy(before_part, gw_host(kPart), 0x32000);
+      memcpy(before_verts, gw_host(kVerts), 0x600000);
+      u8* want_part = (u8*)malloc(0x32000);
+      u8* want_verts = (u8*)malloc(0x600000);
+      u8 want_live[24];
+      for (int pass = 0; pass < 2; ++pass) {
+        memcpy(gw_host(kPart), before_part, 0x32000);
+        memcpy(gw_host(kVerts), before_verts, 0x600000);
+        for (u32 job = 0; job < 6; ++job) {
+          static PPCContext ctx;
+          ctx = PPCContext{};
+          ctx.r1.u64 = kStack;
+          ctx.r3.u64 = kSys;
+          ctx.r4.u64 = kCtx + job * 16;
+          if (pass == 0) original_sub_82063A38(ctx, gw_host(0));
+          else sub_82063A38(ctx, gw_host(0));
+        }
+        static PPCContext ctx;
+        ctx = PPCContext{};
+        ctx.r1.u64 = kStack;
+        ctx.r3.u64 = kSys + 8;
+        ctx.r4.u64 = gw_load32(kSys);
+        ctx.r5.u64 = 0;
+        if (pass == 0) original_sub_82064110(ctx, gw_host(0));
+        else sub_82064110(ctx, gw_host(0));
+        if (pass == 0) {
+          memcpy(want_part, gw_host(kPart), 0x32000);
+          memcpy(want_verts, gw_host(kVerts), 0x600000);
+          memcpy(want_live, gw_host(0x821B3E88), 24);
+        } else {
+          for (u32 o = 0; o < 0x32000; o += 4) differ += memcmp(want_part + o, gw_host(kPart + o), 4) != 0;
+          for (u32 o = 0; o < 0x600000; o += 4) differ += memcmp(want_verts + o, gw_host(kVerts + o), 4) != 0;
+          differ += memcmp(want_live, gw_host(0x821B3E88), 24) != 0;
+        }
+      }
+      (void)sizes;
+      (void)starts;
+      free(before_part);
+      free(before_verts);
+      free(want_part);
+      free(want_verts);
+    }
+    printf("particle shares and bucket sort: %d words differ\n", differ);
+    bad += differ;
+  }
+
+
+  // Scissor (guest 0x8209D288): random viewports (some huge, negative or NaN)
+  // and rectangles, the clamp on and off.
+  {
+    constexpr u32 kDevice = kPart, kRect = kPart + 0x8000;
+    int differ = 0;
+    for (int n = 0; n < 20000; ++n) {
+      auto any_float = [&]() {
+        const int k = rand() % 10;
+        if (k == 0) return NAN;
+        if (k == 1) return frand(-5e9f, 5e9f);
+        return frand(-300, 1600);
+      };
+      for (u32 o = 0; o < 4; ++o) sf(kDevice + 12648 + o * 4, any_float());
+      for (u32 o = 0; o < 4; ++o) gw_store32(kRect + o * 4, (u32)(rand() % 2000 - 300));
+      gw_store32(kDevice + 11856, rand() % 2);
+      gw_store32(kDevice + 10436, (u32)rand() * 65537u);
+      gw_store32(kDevice + 10440, (u32)rand() * 65537u);
+      u8 before[16384];
+      memcpy(before, gw_host(kDevice + 10000), sizeof(before));
+      u8 want[16384];
+      u64 want_args[5];
+      for (int pass = 0; pass < 2; ++pass) {
+        memcpy(gw_host(kDevice + 10000), before, sizeof(before));
+        static PPCContext ctx;
+        ctx = PPCContext{};
+        ctx.r1.u64 = kStack;
+        ctx.r3.u64 = kDevice;
+        ctx.r4.u64 = kRect;
+        if (pass == 0) original_sub_8209D288(ctx, gw_host(0));
+        else sub_8209D288(ctx, gw_host(0));
+        if (pass == 0) {
+          memcpy(want, gw_host(kDevice + 10000), sizeof(want));
+          memcpy(want_args, g_scissor_args, sizeof(want_args));
+        } else {
+          differ += memcmp(want, gw_host(kDevice + 10000), sizeof(want)) != 0;
+          differ += memcmp(want_args, g_scissor_args, sizeof(want_args)) != 0;
+        }
+      }
+    }
+    printf("scissor: %d of 20000 differ\n", differ);
+    bad += differ;
+  }
+
+
+  // Set vertex / pixel shader (guest 0x820A68B0, 0x820A65F8): random devices,
+  // outgoing shaders and constant blocks.
+  {
+    constexpr u32 kDevice = kPart, kShaders = kPart + 0x10000;
+    int differ = 0;
+    for (int n = 0; n < 6000; ++n) {
+      const bool vertex = n & 1;
+      for (u32 o = 0; o < 0x4000; o += 4) gw_store32(kDevice + o, (u32)rand() * 2654435761u);
+      for (u32 o = 0; o < 0x3000; o += 4) gw_store32(kShaders + o, (u32)rand() * 2246822519u);
+      gw_store32(kDevice + 10908, rand() % 4 == 0 ? (u32)rand() : 0);
+      gw_store32(kDevice + 12696, rand() % 4 ? kShaders + 0x2000 : 0);
+      gw_store32(kDevice + 12692, rand() % 4 ? kShaders + 0x2400 : 0);
+      gw_store32(kDevice + 13524, kPart + 0x9000);
+      gw_store32(kDevice + 13528, rand() % 3 ? kPart + 0x9100 : kPart + 0x8000);
+      const u32 shader = rand() % 8 ? kShaders : 0;
+      const u32 block = kShaders + (vertex ? 872 : 40);
+      // Offset 0 (no block): the records go elsewhere, block + 20 stays 0.
+      const u32 offset = rand() % 6 ? 64 : 0;
+      gw_store32(block + 20, offset);
+      const u32 q = offset ? block + offset : kShaders + 0x2800;
+      gw_store64(q + 0, ((u64)rand() << 40) ^ ((u64)rand() << 20) ^ (u64)rand());
+      gw_store64(q + 8, rand() % 2 ? 0 : (u64)rand());
+      u32 at = q + 20;
+      for (int k = rand() % 3; k > 0; --k, at += 8) gw_store32(at, (u32)(rand() % 100) << 16 | (1 + rand() % 5));
+      gw_store32(at, (u32)(rand() % 100) << 16 | 0);
+      at += 4;
+      for (int k = rand() % 3; k > 0; --k) {
+        const u32 count = 1 + rand() % 6;
+        gw_store32(at, (u32)(rand() % 64) * 4 << 16 | count);
+        at += 4 + count * 4;
+      }
+      gw_store32(at, 0);
+      at += 4;
+      for (int k = rand() % 3; k > 0; --k) {
+        const u32 count = 2 * (1 + rand() % 4);
+        gw_store32(at, (u32)(rand() % 64) * 4 << 16 | count);
+        at += 4 + count / 2 * 8;
+      }
+      gw_store32(at, 0);
+      at += 4;
+      gw_store32(q + 16, rand() % 5 ? at - (q + 20) : (u32)(rand() % 40));
+      u8* before = (u8*)malloc(0x14000);
+      u8* want = (u8*)malloc(0x14000);
+      memcpy(before, gw_host(kPart), 0x14000);
+      u8 stack_before[256], stack_want[256];
+      memcpy(stack_before, gw_host(kStack - 256), 256);
+      for (int pass = 0; pass < 2; ++pass) {
+        memcpy(gw_host(kPart), before, 0x14000);
+        memcpy(gw_host(kStack - 256), stack_before, 256);
+        static PPCContext ctx;
+        ctx = PPCContext{};
+        ctx.r1.u64 = kStack;
+        ctx.r3.u64 = kDevice;
+        ctx.r4.u64 = shader;
+        if (pass == 0) (vertex ? original_sub_820A68B0 : original_sub_820A65F8)(ctx, gw_host(0));
+        else (vertex ? sub_820A68B0 : sub_820A65F8)(ctx, gw_host(0));
+        if (pass == 0) {
+          memcpy(want, gw_host(kPart), 0x14000);
+          memcpy(stack_want, gw_host(kStack - 256), 256);
+        } else {
+          differ += memcmp(want, gw_host(kPart), 0x14000) != 0;
+          differ += memcmp(stack_want + 208, gw_host(kStack - 48), 8) != 0;  // the packet slot only (the original also saves registers there)
+        }
+      }
+      free(before);
+      free(want);
+    }
+    printf("shader sets: %d of 6000 differ\n", differ);
+    bad += differ;
+  }
+
+
+  // Object outline (guest 0x82061DA0): random models, parts and matrices;
+  // both run the native vector routine and line builder, so this checks the
+  // loop, the colours and the arguments it passes.
+  {
+    constexpr u32 kModel = 0xC0785000, kMesh = 0xC0785100, kParts = 0xC0785200, kSegments = 0xC0785400;
+    constexpr u32 kMatrix = 0xC0786000, kTint = 0xC0786100;
+    auto put = [](u32 at, float v) {
+      u32 bits;
+      memcpy(&bits, &v, 4);
+      gw_store32(at, bits);
+    };
+    int differ = 0;
+    for (int n = 0; n < 2000; ++n) {
+      const u32 parts = 1 + rand() % 3;
+      gw_store32(kModel + 44, rand() % 10 ? kMesh : 0);
+      gw_store32(kMesh + 0, kParts);
+      gw_store32(kMesh + 4, parts);
+      put(kMesh + 12, random_float(0, 8));
+      for (u32 q = 0; q < parts; ++q) {
+        gw_store32(kParts + q * 12 + 0, kSegments + q * 8 * 48);
+        gw_store32(kParts + q * 12 + 4, (u32)(rand() % 9));
+      }
+      for (u32 o = 0; o < 3 * 8 * 48; o += 4) put(kSegments + o, random_float(-60, 60));
+      for (u32 o = 0; o < 64; o += 4) put(kMatrix + o, random_float(-2, 2));
+      for (u32 o = 0; o < 16; o += 4) put(kTint + o, random_float(0, 1.5f));
+      const u32 part = (u32)(rand() % (parts + 1));
+      const u32 model = rand() % 20 ? kModel : 0;
+      static u8 want[0x2000 + 48];
+      for (int pass = 0; pass < 2; ++pass) {
+        memset(gw_host(kLineQuad), 0, 0x1000);
+        memset(gw_host(kLineOutline), 0, 0x2000);
+        gw_store32(0x821A0000 + 12424 + 2052, kLineQuad);
+        gw_store32(0x821A0000 + 12424 + 2056, 0);
+        gw_store32(0x821A0000 + 14536 + 2052, kLineOutline);
+        gw_store32(0x821A0000 + 14536 + 2056, 0);
+        static PPCContext ctx;
+        ctx = PPCContext{};
+        ctx.r1.u64 = kStack;
+        ctx.r3.u64 = kMatrix;
+        ctx.r4.u64 = model;
+        ctx.r5.u64 = kTint;
+        ctx.r6.u64 = part;
+        if (pass == 0) original_sub_82061DA0(ctx, gw_host(0));
+        else sub_82061DA0(ctx, gw_host(0));
+        static u8 got[0x2000 + 48 + 0x1000];
+        memcpy(got, gw_host(kLineQuad), 0x1000);
+        memcpy(got + 0x1000, gw_host(kLineOutline), 0x2000);
+        memcpy(got + 0x3000, gw_host(kStack - 208 + 80), 48);
+        static u8 want_all[sizeof(got)];
+        if (pass == 0) memcpy(want_all, got, sizeof(got));
+        else differ += memcmp(want_all, got, sizeof(got)) != 0;
+      }
+      (void)want;
+    }
+    printf("object outline: %d of 2000 differ\n", differ);
+    bad += differ;
+  }
+
+
+  // SetViewport (guest 0x8209D8A0): random viewports, targets and tiling
+  // states; both call the native scissor (recorded by its callee).
+  {
+    constexpr u32 kDevice = kPart, kSurface = kPart + 0x8000;
+    int differ = 0;
+    for (int n = 0; n < 20000; ++n) {
+      for (u32 o = 0; o < 0x3800; o += 4) gw_store32(kDevice + 10000 + o, (u32)rand() * 2654435761u);
+      gw_store32(kDevice + 12440, rand() % 8 ? kSurface : 0);
+      gw_store32(kDevice + 12456, rand() % 2 ? kSurface : 0);
+      gw_store8(kDevice + 10940, (u8)(rand() & 0x30));
+      for (u32 k = 0; k < 5; ++k)
+        gw_store32(kDevice + 12728 + k * 4, rand() % 3 ? gw_load32(kDevice + 12440 + k * 4) : (u32)rand());
+      gw_store32(kDevice + 13180, 1 + rand() % 1500);
+      gw_store32(kDevice + 13184, 1 + rand() % 900);
+      gw_store32(kSurface + 36, (u32)(rand() % 1500) << 18 | (u32)(rand() % 900) << 3);
+      const double v[6] = {random_float(-50, 1300), random_float(-50, 800), random_float(-10, 1400),
+                           random_float(-10, 900), random_float(0, 1), random_float(0, 1)};
+      static u8 before[0x3800], want[0x3800];
+      memcpy(before, gw_host(kDevice + 10000), sizeof(before));
+      u64 want_args[5];
+      for (int pass = 0; pass < 2; ++pass) {
+        memcpy(gw_host(kDevice + 10000), before, sizeof(before));
+        memset(g_scissor_args, 0, sizeof(g_scissor_args));
+        static PPCContext ctx;
+        ctx = PPCContext{};
+        ctx.r1.u64 = kStack;
+        ctx.r3.u64 = kDevice;
+        ctx.f1.f64 = v[0];
+        ctx.f2.f64 = v[1];
+        ctx.f3.f64 = v[2];
+        ctx.f4.f64 = v[3];
+        ctx.f5.f64 = v[4];
+        ctx.f6.f64 = v[5];
+        if (pass == 0) original_sub_8209D8A0(ctx, gw_host(0));
+        else sub_8209D8A0(ctx, gw_host(0));
+        if (pass == 0) {
+          memcpy(want, gw_host(kDevice + 10000), sizeof(want));
+          memcpy(want_args, g_scissor_args, sizeof(want_args));
+        } else {
+          differ += memcmp(want, gw_host(kDevice + 10000), sizeof(want)) != 0;
+          differ += memcmp(want_args, g_scissor_args, 4 * sizeof(u64)) != 0;  // not r1
+        }
+      }
+    }
+    printf("set viewport: %d of 20000 differ\n", differ);
+    bad += differ;
   }
 
   // Starfield (guest 0x82075548), with the vertex buffer lock and pow stubbed.

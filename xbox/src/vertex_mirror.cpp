@@ -40,6 +40,15 @@ u8* gw_vertex_mirror_add(u32 guest, u32 size) {
   return host;
 }
 
+u32 gw_vertex_mirror_room(u32 guest) {
+  const int n = (int)g_count;
+  for (int i = 0; i < n; ++i) {
+    const Mirror& m = g_mirrors[i];
+    if (guest - m.guest < m.size) return m.size - (guest - m.guest);
+  }
+  return 0;
+}
+
 u8* gw_vertex_mirror(u32 guest, u32 bytes) {
   const int n = (int)g_count;
   for (int i = 0; i < n; ++i) {
