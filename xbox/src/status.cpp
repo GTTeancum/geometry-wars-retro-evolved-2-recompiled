@@ -80,6 +80,7 @@ DWORD WINAPI status_thread(LPVOID) {
     DWORD now = GetTickCount();
     u32 swaps = gw_stats.swaps;
     fps = (swaps - last_swaps) * 1000 / (now - last_tick ? now - last_tick : 1);
+    if (gw_nv2a_active) gw_crtc_pitch();
     static u32 last_drawn;
     const u32 drawn = gw_stats.drawn;
     g_drawn_per_second = (drawn - last_drawn) * 1000 / (now - last_tick ? now - last_tick : 1);

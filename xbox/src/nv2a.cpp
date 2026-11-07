@@ -423,6 +423,47 @@ u32 blend_factor(u32 x) {
 
 }  // namespace
 
+// The display (CRTC) starts each line of the frame 'offset' x 8 bytes after
+// the last: CR13 holds the offset's bits 0-7, CR19 bits 5-7 its bits 8-10,
+// CR42 bit 6 its bit 11. At 720p (2560-byte lines) the TV showed the frame
+// read at the wrong line length while the frame in memory was right, so it
+// is set here from pbkit's pitch, and checked again every second
+// (src/status.cpp). CR1F unlocks the extended registers (0x57); its lock is
+// put back afterwards, as is the index register.
+void gw_crtc_pitch() {
+  static u32 pitch = 0;
+  if (!pitch) pitch = pb_back_buffer_pitch();
+  const u32 offset = pitch / 8;
+  volatile u8* const index = (volatile u8*)0xFD6013D4;
+  volatile u8* const data = (volatile u8*)0xFD6013D5;
+  const u8 old_index = *index;
+  *index = 0x1F;
+  const u8 lock = *data;
+  *data = 0x57;
+  auto get = [&](u8 r) {
+    *index = r;
+    return (u8)*data;
+  };
+  auto put = [&](u8 r, u8 v) {
+    *index = r;
+    *data = v;
+  };
+  const u8 cr13 = get(0x13), cr19 = get(0x19), cr42 = get(0x42);
+  const u8 want13 = (u8)(offset & 0xFF);
+  const u8 want19 = (u8)((cr19 & 0x1F) | (((offset >> 8) & 7) << 5));
+  const u8 want42 = (u8)((cr42 & ~0x40) | (((offset >> 11) & 1) << 6));
+  const bool wrong = cr13 != want13 || cr19 != want19 || cr42 != want42;
+  if (wrong) {
+    put(0x13, want13);
+    put(0x19, want19);
+    put(0x42, want42);
+  }
+  put(0x1F, lock);
+  *index = old_index;
+  if (wrong)
+    gw_log("crtc: line length was CR13 %02X CR19 %02X CR42 %02X, set for %u bytes\n", cr13, cr19, cr42, pitch);
+}
+
 void gw_nv2a_init() {
   u32 vs[] = {
 #include "nv2a_vs.inl"
@@ -446,6 +487,7 @@ void gw_nv2a_init() {
     gw_log("nv2a: pb_init failed\n");
     return;
   }
+  gw_crtc_pitch();
   u32* p = blk_begin();
   p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_START, 0);
   p = pb_push1(p, NV097_SET_TRANSFORM_EXECUTION_MODE,

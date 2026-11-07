@@ -172,6 +172,9 @@ void gw_note_thread(u32 start_address, u32 start_context);
 // src/render_native.cpp: whether the current game frame will be rendered
 // (it updates every frame, renders every second one).
 bool gw_frame_drawn();
+// src/nv2a.cpp: sets the display's scan-out line length (CRTC offset) to the
+// frame's pitch, logging the values it found when they were wrong.
+void gw_crtc_pitch();
 u32 gw_thread_create(u32 stack_size, u32 xapi_startup, u32 start_address, u32 start_context,
                      u32 creation_flags, u32* out_thread_id);  // returns a handle
 void gw_run_main_thread();
