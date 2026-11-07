@@ -46,6 +46,7 @@ extern "C" void sub_820A87B0(PPCContext& ctx, uint8_t* base);
 #define REX_STORE_U32(x, y) (*(u32*)REX_HOST(x) = __builtin_bswap32(y))
 #define REX_STORE_U64(x, y) (*(u64*)REX_HOST(x) = __builtin_bswap64(y))
 #endif
+extern "C" void sub_82061750(PPCContext& ctx, uint8_t* base);  // stubbed below
 #include "original.inc"
 
 extern "C" void sub_8205B880(PPCContext& ctx, uint8_t* base);
@@ -57,6 +58,7 @@ extern "C" void sub_821308B8(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_82096F30(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_820A6438(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_820A6518(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_8205FBA8(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__sub_821308B8(PPCContext& ctx, uint8_t* base) { original_sub_821308B8(ctx, base); }
 // The constant upload's full-buffer helper: never reached (the test buffer has room).
 extern "C" void sub_820A87B0(PPCContext&, uint8_t*) { gw_fatal("sub_820A87B0 reached"); }
@@ -121,6 +123,13 @@ constexpr u32 kGrid = 0xC0010000;      // row 0 of the grid (one row above it)
 constexpr u32 kLines = 0xC0200000;     // line vertices (rows start 14784 before)
 constexpr u32 kDisplace = 0xC0600000;  // displacement vertices
 constexpr u32 kStarBuffer = 0xC0700000;  // three starfield vertex buffers
+constexpr u32 kLineQuad = 0xC0780000, kLineOutline = 0xC0781000;  // the line builder's two streams
+float random_float(float lo, float hi) { return lo + (hi - lo) * (float)rand() / (float)RAND_MAX; }
+// The line builder's vertex allocator (guest 0x82061750), stubbed: fixed
+// buffers for its two streams.
+extern "C" void sub_82061750(PPCContext& ctx, uint8_t*) {
+  ctx.r3.u64 = ctx.r3.u32 == 0x821A0000 + 16648 ? kLineQuad : kLineOutline;
+}
 
 float frand(float lo, float hi) { return lo + (hi - lo) * (float)rand() / (float)RAND_MAX; }
 void sf(u32 a, float f) {
@@ -553,6 +562,69 @@ int main(int argc, char** argv) {
       }
     }
     printf("large-block copy: %d of 500 differ\n", differ);
+    if (differ) ++bad;
+  }
+
+  // Glowing-line builder (guest 0x8205FBA8): random segments and colours,
+  // the vertex allocator stubbed (fixed buffers, see sub_82061750 above).
+  {
+    int differ = 0;
+    float worst = 0;
+    for (int n = 0; n < 2000; ++n) {
+      const u32 colour = 0xC0782000;  // inside the starfield buffers' mapping
+      for (int c = 0; c < 4; ++c) {
+        const float v = random_float(0, 2);
+        u32 bits;
+        memcpy(&bits, &v, 4);
+        gw_store32(colour + c * 4, bits);
+      }
+      const double x0 = random_float(-300, 300), y0 = random_float(-200, 200);
+      const double x1 = x0 + random_float(-20, 20), y1 = y0 + random_float(-20, 20);
+      static u8 want[384];
+      for (int pass = 0; pass < 2; ++pass) {
+        memset(gw_host(kLineQuad), 0, 128);
+        memset(gw_host(kLineOutline), 0, 256);
+        // The two streams' chunks: the stubbed allocator's buffers, empty
+        // (the native code takes room itself while a chunk has some).
+        gw_store32(0x821A0000 + 16648 + 2052, kLineQuad);
+        gw_store32(0x821A0000 + 16648 + 2056, 0);
+        gw_store32(0x821A0000 + 18760 + 2052, kLineOutline);
+        gw_store32(0x821A0000 + 18760 + 2056, 0);
+        static PPCContext ctx;
+        ctx = PPCContext{};
+        ctx.r1.u64 = kStack;
+        ctx.f1.f64 = x0;
+        ctx.f2.f64 = y0;
+        ctx.f3.f64 = x1;
+        ctx.f4.f64 = y1;
+        ctx.r7.u64 = colour;
+        if (pass == 0) original_sub_8205FBA8(ctx, gw_host(0));
+        else sub_8205FBA8(ctx, gw_host(0));
+        u8 got[384];
+        memcpy(got, gw_host(kLineQuad), 128);
+        memcpy(got + 128, gw_host(kLineOutline), 256);
+        if (pass == 0) {
+          memcpy(want, got, sizeof(got));
+          continue;
+        }
+        bool bad = false;
+        for (int w = 0; w < 96; ++w) {
+          u32 a, b;
+          memcpy(&a, want + w * 4, 4);
+          memcpy(&b, got + w * 4, 4);
+          a = __builtin_bswap32(a);
+          b = __builtin_bswap32(b);
+          float fa, fb;
+          memcpy(&fa, &a, 4);
+          memcpy(&fb, &b, 4);
+          const float err = fabsf(fa - fb) / (1.0f + fabsf(fa));
+          if (!(err <= worst)) worst = err;
+          if (!(err <= 1e-5f)) bad = true;
+        }
+        differ += bad;
+      }
+    }
+    printf("glowing-line builder: %d of 2000 differ (worst %.2g)\n", differ, worst);
     if (differ) ++bad;
   }
 
