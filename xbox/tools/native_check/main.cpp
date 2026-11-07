@@ -100,6 +100,8 @@ jmp_buf* gw_jmp_buf_for(u32, bool) { return nullptr; }
 // No host mirror here: the native grid writes its lines into the guest
 // buffer, where the comparison reads them.
 u8* gw_grid_line_host(u32) { return nullptr; }
+u8* gw_vertex_mirror(u32, u32) { return nullptr; }
+u8* gw_vertex_mirror_add(u32, u32) { return nullptr; }
 volatile u64 gw_part_cycles[kPartCount];
 namespace rex::runtime {
 PPCFunc* ResolveIndirectFunction(uint32_t) { return nullptr; }

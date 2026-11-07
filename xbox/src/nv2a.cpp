@@ -712,6 +712,19 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
     }
   }
 
+  // Vertices the native code wrote into a host mirror in the NV2A's order
+  // (gw_vertex_mirror: particles, stars): drawn where they are.
+  bool mirrored = false;  // the stream starts in a mirror but runs past it
+  if (source == 2 && !rects) {
+    const u32 start = stream + (first + index_offset) * gp->stride;
+    if (u8* host = gw_vertex_mirror(start, count * gp->stride)) {
+      set_formats((u32)MmGetPhysicalAddress(host));
+      draw_arrays(nv_prim, count);
+      return true;
+    }
+    mirrored = gw_vertex_mirror(start, gp->stride) != nullptr;
+  }
+
   // Otherwise the vertices are copied into the arena, in draw order, words
   // swapped to host order.
   if (!arena_room(bytes)) return false;
@@ -722,7 +735,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
   // straight copy, reading ahead: the game wrote the vertices earlier in the
   // frame and they have left the cache, so each line would otherwise wait
   // on memory (most of the command processor's time on the Xbox).
-  if (source == 2 && !rects && endian == 2) {
+  if (source == 2 && !rects && endian == 2 && !mirrored) {
     const u32* in = (const u32*)gw_host(stream + (first + index_offset) * gp->stride);
     const u32 total = count * words;
     for (u32 k = 0; k < total; ++k) {
@@ -744,10 +757,14 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
         index = index_endian ? (u16)((h << 8) | (h >> 8)) : h;
       }
     }
-    const u32* in = (const u32*)gw_host(stream + (index + index_offset) * gp->stride);
+    const u32 at = stream + (index + index_offset) * gp->stride;
+    const u32* in = (const u32*)gw_host(at);
     _mm_prefetch((const char*)in + 4 * gp->stride, _MM_HINT_NTA);
     u32* dst = rects ? corners[i % 3] : out;
-    if (endian == 2) {
+    const u8* host = mirrored ? gw_vertex_mirror(at, gp->stride) : nullptr;
+    if (host) {
+      memcpy(dst, host, gp->stride);  // already in the NV2A's order
+    } else if (endian == 2) {
       for (u32 k = 0; k < words; ++k) dst[k] = __builtin_bswap32(in[k]);
     } else {
       for (u32 k = 0; k < words; ++k) dst[k] = swap_endian(in[k], endian);

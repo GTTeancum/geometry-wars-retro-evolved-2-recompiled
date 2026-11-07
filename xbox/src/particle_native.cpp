@@ -14,8 +14,9 @@
 //      along its motion, plus a 28-byte-vertex quad for the glow pass.
 //
 // The maths follows the PowerPC code operation for operation, in single
-// precision. The glow quad is not written while src/nv2a.cpp does not draw
-// the glow pass (kWriteGlowQuad).
+// precision. Both quads go into the buffers' host mirrors in the NV2A's
+// order when they fit there (src/vertex_mirror.cpp), else big-endian into
+// the guest buffer.
 #include "runtime.h"
 
 #include <xmmintrin.h>
@@ -28,11 +29,8 @@ constexpr u32 kTrailLength = 0x821B0000 + 16120 + 32;
 constexpr u32 kTrailWidth = 0x821B0000 + 16172 + 32;
 constexpr u32 kBrightnessBias = 0x821A0000 - 11648;
 
-#ifdef GW_PARTICLE_GLOW
+// The glow quads are the light splats of the grid's colour field.
 constexpr bool kWriteGlowQuad = true;
-#else
-constexpr bool kWriteGlowQuad = false;  // the glow pass is not drawn yet
-#endif
 
 inline float lf(u32 a) {
   u32 v;
@@ -215,18 +213,38 @@ extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base) {
   const float along_x = width * dir_x, along_y = width * dir_y;
   const float cr = intensity * red, cg = intensity * green, cb = intensity * blue;
   const float u0 = lf(C + 3208);
-  streak_vertex(streak + 0, (px - across_x) - along_x, (across_y + py) - along_y, pz, u0, cr, cg, cb, u0);
-  streak_vertex(streak + 32, (across_x + px) - along_x, (py - across_y) - along_y, pz, one, cr, cg, cb, u0);
-  streak_vertex(streak + 64, (along_x + across_x) + x, (y - across_y) + along_y, z, one, cr, cg, cb, one);
-  streak_vertex(streak + 96, (x - across_x) + along_x, (along_y + across_y) + y, z, u0, cr, cg, cb, one);
+  if (u8* host = gw_vertex_mirror(streak, 128)) {
+    const float quad[4][8] = {
+        {(px - across_x) - along_x, (across_y + py) - along_y, pz, u0, cr, cg, cb, u0},
+        {(across_x + px) - along_x, (py - across_y) - along_y, pz, one, cr, cg, cb, u0},
+        {(along_x + across_x) + x, (y - across_y) + along_y, z, one, cr, cg, cb, one},
+        {(x - across_x) + along_x, (along_y + across_y) + y, z, u0, cr, cg, cb, one},
+    };
+    memcpy(host, quad, sizeof(quad));
+  } else {
+    streak_vertex(streak + 0, (px - across_x) - along_x, (across_y + py) - along_y, pz, u0, cr, cg, cb, u0);
+    streak_vertex(streak + 32, (across_x + px) - along_x, (py - across_y) - along_y, pz, one, cr, cg, cb, u0);
+    streak_vertex(streak + 64, (along_x + across_x) + x, (y - across_y) + along_y, z, one, cr, cg, cb, one);
+    streak_vertex(streak + 96, (x - across_x) + along_x, (along_y + across_y) + y, z, u0, cr, cg, cb, one);
+  }
 
   if (kWriteGlowQuad) {
     const float mid_x = (px + x) * half, mid_y = (py + y) * half;
     const float gr = cr * glow_k, gg = cg * glow_k, gb = cb * glow_k;
     const float size = lf(C + 3364);
-    glow_vertex(glow + 0, mid_x - size, mid_y - size, zero, zero, gr, gg, gb);
-    glow_vertex(glow + 28, mid_x + size, mid_y - size, one, zero, gr, gg, gb);
-    glow_vertex(glow + 56, mid_x + size, mid_y + size, one, one, gr, gg, gb);
-    glow_vertex(glow + 84, mid_x - size, mid_y + size, zero, one, gr, gg, gb);
+    if (u8* host = gw_vertex_mirror(glow, 112)) {
+      const float quad[4][7] = {
+          {mid_x - size, mid_y - size, zero, zero, gr, gg, gb},
+          {mid_x + size, mid_y - size, one, zero, gr, gg, gb},
+          {mid_x + size, mid_y + size, one, one, gr, gg, gb},
+          {mid_x - size, mid_y + size, zero, one, gr, gg, gb},
+      };
+      memcpy(host, quad, sizeof(quad));
+    } else {
+      glow_vertex(glow + 0, mid_x - size, mid_y - size, zero, zero, gr, gg, gb);
+      glow_vertex(glow + 28, mid_x + size, mid_y - size, one, zero, gr, gg, gb);
+      glow_vertex(glow + 56, mid_x + size, mid_y + size, one, one, gr, gg, gb);
+      glow_vertex(glow + 84, mid_x - size, mid_y + size, zero, one, gr, gg, gb);
+    }
   }
 }

@@ -14,9 +14,12 @@
 //   - the main-picture buffers keep two frames in flight instead of three:
 //     the third frame shares the first frame's set (the draws read a frame's
 //     particles while the next frame fills the other set);
-//   - every glow-pass entry shares one buffer, as src/nv2a.cpp does not draw
-//     the glow pass yet. The jobs then write over each other there, which
-//     nothing reads. Give them their own memory again once the glow is drawn.
+//   - the glow-pass buffers likewise (their quads are the light splats of
+//     the grid's colour field, src/nv2a.cpp);
+//   - each buffer's first part has a host mirror (src/vertex_mirror.cpp)
+//     that src/particle_native.cpp fills in the NV2A's order and the
+//     renderer draws in place: 64 KB of a main buffer (512 particles a job),
+//     56 KB of a glow buffer, past which the guest buffer is used.
 #include "runtime.h"
 
 extern "C" void sub_820E8130(PPCContext& ctx, uint8_t* base);  // game heap allocation
@@ -29,6 +32,7 @@ constexpr u32 kTableMain = 0x821B0000 + 16000, kTableGlow = 0x821B0000 + 15996;
 constexpr u32 kJobs = 6, kFramesInFlight = 3, kEntries = kJobs * kFramesInFlight;
 constexpr u32 kMainFrames = 2;
 constexpr u32 kMainSize = 0x400000, kGlowSize = 0x380000;
+constexpr u32 kMainMirror = 512 * 128, kGlowMirror = 512 * 112;
 
 u32 call_alloc(PPCContext& ctx, uint8_t* base, void (*fn)(PPCContext&, uint8_t*), u32 size) {
   ctx.r3.u64 = size;
@@ -46,11 +50,19 @@ extern "C" void sub_820673C8(PPCContext& ctx, uint8_t* base) {
   gw_store32(kTableGlow, glow);
   for (u32 i = 0; i < kEntries; ++i) {
     const u32 own = i % (kMainFrames * kJobs);
-    gw_store32(main + i * 4, own == i ? call_alloc(ctx, base, sub_8206A480, kMainSize) : gw_load32(main + own * 4));
+    if (own == i) {
+      const u32 m = call_alloc(ctx, base, sub_8206A480, kMainSize);
+      const u32 g = call_alloc(ctx, base, sub_8206A480, kGlowSize);
+      gw_vertex_mirror_add(m, kMainMirror);
+      gw_vertex_mirror_add(g, kGlowMirror);
+      gw_store32(main + i * 4, m);
+      gw_store32(glow + i * 4, g);
+    } else {
+      gw_store32(main + i * 4, gw_load32(main + own * 4));
+      gw_store32(glow + i * 4, gw_load32(glow + own * 4));
+    }
   }
-  const u32 shared_glow = call_alloc(ctx, base, sub_8206A480, kGlowSize);
-  for (u32 i = 0; i < kEntries; ++i) gw_store32(glow + i * 4, shared_glow);
-  gw_log("particle buffers: main picture %u sets for %u frames in flight, glow pass one shared buffer\n", kMainFrames,
+  gw_log("particle buffers: main picture and glow pass %u sets for %u frames in flight, mirrored\n", kMainFrames,
          kFramesInFlight);
   sub_82063EC0(ctx, base);
 }

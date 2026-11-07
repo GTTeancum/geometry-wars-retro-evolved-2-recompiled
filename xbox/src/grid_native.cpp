@@ -286,8 +286,12 @@ void update_row(u32 args, u32 j, const Constants& k, const Pushers& all) {
   g_stats.active += (u32)active_count;
 
   const u64 t1 = __builtin_ia32_rdtsc();
-  // 1. Physics of the inner points.
-  for (u32 i = 1; i <= 131; ++i) {
+  // 1. Physics of the inner points. point(i) is one point, everything the
+  // original does; springs4(i) is points i to i + 3 at once with SSE, for
+  // when no pusher, extra pusher or object reaches them (the usual case:
+  // only springs, damping and the clamp), in the same single-precision
+  // operations in the same order, so the results are the same.
+  auto point = [&](u32 i) {
     const float px = hx[i], py = hy[i];
     float fx = k.initial, fy = k.initial;
     const int cx = (int)((cell_ox + px) * cell_sx), cy = (int)((cell_oy + py) * cell_sy);
@@ -372,7 +376,68 @@ void update_row(u32 args, u32 j, const Constants& k, const Pushers& all) {
     y = sel(y - max_y, max_y, y);
     g.pos_x[ws][h][i] = x;
     g.pos_y[ws][h][i] = y;
+  };
+
+  // sel(a, b, c) = a >= 0 ? b : c, four at a time (NaN picks c, as fsel).
+  auto sel4 = [](__m128 a, __m128 b, __m128 c) {
+    const __m128 m = _mm_cmpge_ps(a, _mm_setzero_ps());
+    return _mm_or_ps(_mm_and_ps(m, b), _mm_andnot_ps(m, c));
+  };
+  const __m128 initial4 = _mm_set1_ps(k.initial), neighbour4 = _mm_set1_ps(k.neighbour);
+  const __m128 stiffness4 = _mm_set1_ps(k.stiffness), damping4 = _mm_set1_ps(k.damping);
+  const __m128 tiny4 = _mm_set1_ps(k.tiny), zero4 = _mm_set1_ps(k.zero), step4 = _mm_set1_ps(k.step);
+  const u32 abs_bits = 0x7FFFFFFF;  // SSE1 only (the Pentium III): the mask through a float
+  float abs_float;
+  memcpy(&abs_float, &abs_bits, 4);
+  const __m128 abs_mask = _mm_set1_ps(abs_float);
+  const __m128 max_x4 = _mm_set1_ps(max_x), max_y4 = _mm_set1_ps(max_y);
+  const __m128 neg_max_x4 = _mm_set1_ps(-max_x), neg_max_y4 = _mm_set1_ps(-max_y);
+  float* const vel_x = g.vel_x[h];
+  float* const vel_y = g.vel_y[h];
+  float* const out_x = g.pos_x[ws][h];
+  float* const out_y = g.pos_y[ws][h];
+  auto springs4 = [&](u32 i) {
+    auto axis = [&](const float* hp, const float* hr, const float* ap, const float* ar, const float* bp,
+                    const float* br, float* vel, float* out, __m128 hi, __m128 lo) {
+      const __m128 pos = _mm_loadu_ps(hp + i);
+      __m128 sum = _mm_add_ps(_mm_sub_ps(_mm_loadu_ps(ap + i), _mm_loadu_ps(ar + i)),
+                              _mm_sub_ps(_mm_loadu_ps(bp + i), _mm_loadu_ps(br + i)));
+      sum = _mm_add_ps(sum, _mm_sub_ps(_mm_loadu_ps(hp + i - 1), _mm_loadu_ps(hr + i - 1)));
+      sum = _mm_add_ps(sum, _mm_sub_ps(_mm_loadu_ps(hp + i + 1), _mm_loadu_ps(hr + i + 1)));
+      sum = _mm_mul_ps(sum, neighbour4);
+      __m128 v = _mm_add_ps(_mm_mul_ps(_mm_sub_ps(_mm_add_ps(_mm_loadu_ps(hr + i), sum), pos), stiffness4),
+                            _mm_loadu_ps(vel + i));
+      v = _mm_mul_ps(_mm_add_ps(v, initial4), damping4);
+      v = sel4(_mm_sub_ps(_mm_and_ps(v, abs_mask), tiny4), v, zero4);
+      _mm_storeu_ps(vel + i, v);
+      __m128 p = _mm_add_ps(_mm_mul_ps(v, step4), pos);
+      p = sel4(_mm_sub_ps(lo, p), lo, p);
+      p = sel4(_mm_sub_ps(p, hi), hi, p);
+      _mm_storeu_ps(out + i, p);
+    };
+    axis(hx, hrx, ax, arx, bx, brx, vel_x, out_x, max_x4, neg_max_x4);
+    axis(hy, hry, ay, ary, by, bry, vel_y, out_y, max_y4, neg_max_y4);
+  };
+  // Whether an object's spatial-hash cell holds anything at point i.
+  auto objects_at = [&](u32 i) {
+    const int cx = (int)((cell_ox + hx[i]) * cell_sx), cy = (int)((cell_oy + hy[i]) * cell_sy);
+    if ((u32)cx >= cells_w || (u32)cy >= cells_h) return false;
+    const u32 cell = cells + (cells_w * (u32)cy + (u32)cx) * 4;
+    return (int)lw(cell) < (int)lw(cell + 4);
+  };
+
+  const bool springs_only = active_count == 0 && (all.count >= 0 || pushers == 0) && !push_b && !push_c;
+  u32 i = 1;
+  if (springs_only) {
+    for (; i + 3 <= 131; i += 4) {
+      if (objects_at(i) || objects_at(i + 1) || objects_at(i + 2) || objects_at(i + 3)) {
+        for (u32 q = i; q < i + 4; ++q) point(q);
+      } else {
+        springs4(i);
+      }
+    }
   }
+  for (; i <= 131; ++i) point(i);
   ++g_stats.rows;
   const u64 t2 = __builtin_ia32_rdtsc();
   g_stats.physics_cycles += t2 - t1;

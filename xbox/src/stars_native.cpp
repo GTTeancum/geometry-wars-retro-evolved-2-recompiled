@@ -81,6 +81,9 @@ extern "C" void sub_82075548(PPCContext& ctx, uint8_t* base) {
   ctx.r6.u64 = 0;
   sub_820A1800(ctx, base);
   u32 out = ctx.r3.u32;
+  // The buffer's host mirror (src/vertex_mirror.cpp; made on first use): the
+  // vertices in the NV2A's order, drawn in place by the renderer.
+  u8* host = gw_vertex_mirror_add(out, kStarCount * kVertexSize);
 
   const float red = lf(C + 12288), green = lf(C + 12292), blue = lf(C + 5140);
   const float c = lf(C + 3400), d = lf(C + 1876), b = lf(C + 4528), a = lf(C + 4500);
@@ -93,13 +96,13 @@ extern "C" void sub_82075548(PPCContext& ctx, uint8_t* base) {
     phase = sel(phase, phase, one);
     sf(star + 12, phase);
     const float s = sine(ctx, base, phase * k);
-    sf(out + 0, lf(star + 0));
-    sf(out + 4, lf(star + 4));
-    sf(out + 8, lf(star + 16));
     const float level = (((brightness + one) * s) * s * c + base_level) * scale * fade;
-    sf(out + 12, level * red);
-    sf(out + 16, level * green);
-    sf(out + 20, level * blue);
+    const float v[6] = {lf(star + 0), lf(star + 4), lf(star + 16), level * red, level * green, level * blue};
+    if (host) {
+      memcpy(host + n * kVertexSize, v, sizeof(v));
+    } else {
+      for (int w = 0; w < 6; ++w) sf(out + 4 * w, v[w]);
+    }
   }
 
   ctx.r3.u64 = gw_load32(kBuffers + index * 4);

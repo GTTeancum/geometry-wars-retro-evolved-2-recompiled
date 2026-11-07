@@ -86,6 +86,11 @@ u32 gw_physical_alloc(u32 size, u32 align);  // committed, zeroed; 0 on failure
 // is one NV2A line there (2 vertices of x, y, z, brightness, edge), which the
 // GPU reads in place. The address is rounded down to its segment.
 u8* gw_grid_line_host(u32 guest);
+// Host mirrors of guest vertex buffers in NV2A order (src/vertex_mirror.cpp):
+// add one for the first 'size' bytes of a guest buffer; find the host address
+// of [guest, guest + bytes) when it lies wholly in a mirror, else null.
+u8* gw_vertex_mirror_add(u32 guest, u32 size);
+u8* gw_vertex_mirror(u32 guest, u32 bytes);
 void gw_physical_free(u32 guest);
 u32 gw_system_alloc(u32 size, u32 align = 16);
 u32 gw_stack_alloc(u32 size);                // returns the low end
