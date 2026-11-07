@@ -126,13 +126,34 @@ struct Reader {
   u32 size;   // dwords (power of two for the ring, exact for indirect buffers)
   u32 pos;    // dwords
   bool ring;
+  // Wraps the ring by a mask (its size is a power of two: a division per
+  // word was a tenth of the command processor's time on the Xbox); an
+  // indirect buffer never wraps.
   u32 next() {
-    u32 v = gw_load32(base + (pos % size) * 4);
+    const u32 at = ring ? pos & (size - 1) : pos;
     ++pos;
-    return v;
+    return gw_load32(base + at * 4);
   }
   void skip(u32 n) { pos += n; }
 };
+
+// Register writes from the stream: count consecutive registers from first
+// (or count writes to first when 'one'). Runs that touch none of the
+// registers with side effects (scratch, coherency) go in a tight loop.
+void write_registers(Reader& r, u32 first, u32 count, bool one) {
+  const u32 last = one ? first : first + count - 1;
+  const bool plain = last < kRegisterCount && !(first <= kRegScratchReg0 + 7 && last >= kRegScratchReg0) &&
+                     !(first <= kRegCoherStatusHost && last >= kRegCoherStatusHost);
+  if (!plain) {
+    for (u32 i = 0; i < count; ++i) write_register(one ? first : first + i, r.next());
+    return;
+  }
+  if (one) {
+    for (u32 i = 0; i < count; ++i) g_regs[first] = r.next();
+    return;
+  }
+  for (u32 i = 0; i < count; ++i) g_regs[first + i] = r.next();
+}
 
 void execute(Reader& r, u32 end, PPCContext& ctx);
 
@@ -210,7 +231,7 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
     }
     case 0x56: {  // SET_SHADER_CONSTANTS
       u32 index = r.next() & 0xFFFF;
-      for (u32 i = 1; i < count; ++i) write_register(index + i - 1, r.next());
+      if (count > 1) write_registers(r, index, count - 1, false);
       break;
     }
     case 0x3F:
@@ -297,13 +318,13 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
       u32 type = (offset_type >> 16) & 0xFF;
       static const u32 kBases[5] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
       if (type < 5) {
-        for (u32 i = 1; i < count; ++i) write_register(kBases[type] + index + i - 1, r.next());
+        if (count > 1) write_registers(r, kBases[type] + index, count - 1, false);
       }
       break;
     }
     case 0x55: {  // SET_CONSTANT2
       u32 index = r.next() & 0xFFFF;
-      for (u32 i = 1; i < count; ++i) write_register(index + i - 1, r.next());
+      if (count > 1) write_registers(r, index, count - 1, false);
       break;
     }
     case 0x22:
@@ -350,7 +371,7 @@ void execute(Reader& r, u32 end, PPCContext& ctx) {
         u32 count = ((packet >> 16) & 0x3FFF) + 1;
         u32 base = packet & 0x7FFF;
         bool one = (packet >> 15) & 1;
-        for (u32 i = 0; i < count; ++i) write_register(one ? base : base + i, r.next());
+        write_registers(r, base, count, one);
         break;
       }
       case 1: {

@@ -20,6 +20,29 @@
 #define MASK(mask, value) (((value) << (__builtin_ffs(mask) - 1)) & (mask))
 #endif
 
+// pbkit's pb_push1/pb_push2/pb_push are function calls (with checks only in
+// its debug build); the renderer makes thousands a frame, so here they are
+// inline writes of the same words: method header (count << 18, subchannel
+// 0), then the parameters. Also used by the fp20compiler output included
+// below.
+namespace {
+inline u32* gw_push1(u32* p, u32 method, u32 a) {
+  p[0] = 1u << 18 | method;
+  p[1] = a;
+  return p + 2;
+}
+inline u32* gw_push2(u32* p, u32 method, u32 a, u32 b) {
+  p[0] = 2u << 18 | method;
+  p[1] = a;
+  p[2] = b;
+  return p + 3;
+}
+inline void gw_push(u32* p, u32 method, u32 count) { p[0] = count << 18 | method; }
+}  // namespace
+#define pb_push1(p, method, a) gw_push1((p), (method), (a))
+#define pb_push2(p, method, a, b) gw_push2((p), (method), (a), (b))
+#define pb_push(p, method, count) gw_push((p), (method), (count))
+
 namespace {
 
 bool g_ready = false;
@@ -1392,11 +1415,14 @@ void gw_nv2a_swap() {
   gw_nv2a_stage = 4;
   const u64 queued = gw_wait_begin();
   DWORD start = GetTickCount();
+  // Sleeping, not spinning, while the flip queue is full: this thread is
+  // above the game's, so a spin here took the one core from the game.
   while (pb_finished()) {
     if (GetTickCount() - start > 1000) {
       gw_log("nv2a: swap not accepted after 1 s at frame %u\n", g_frames);
       break;
     }
+    Sleep(1);
   }
   gw_wait_end(queued, 0, "renderer: flip queue full");
   gw_nv2a_stage = 0;
