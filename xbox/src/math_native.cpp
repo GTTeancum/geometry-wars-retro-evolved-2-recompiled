@@ -76,3 +76,48 @@ extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base) {
   }
   ctx.f1.f64 = (double)gw_sine((float)x);
 }
+
+// Vector times matrix (guest 0x82030338): r3 out (4 floats), r4 the vector,
+// r5 the 4x4 matrix (rows of 4 floats). out[c] = v0 m[0][c] + v1 m[1][c]
+// + v2 m[2][c] + v3 m[3][c], each product and sum rounded to single in that
+// order (fmuls, fadds). Returns r3. Used throughout the game's transforms.
+namespace {
+inline float load_float(u32 a) {
+  const u32 v = gw_load32(a);
+  float f;
+  memcpy(&f, &v, 4);
+  return f;
+}
+inline void store_float(u32 a, float f) {
+  u32 v;
+  memcpy(&v, &f, 4);
+  gw_store32(a, v);
+}
+void vector_times_matrix(float out[4], u32 vector, u32 matrix) {
+  const float v0 = load_float(vector), v1 = load_float(vector + 4), v2 = load_float(vector + 8);
+  const float v3 = load_float(vector + 12);
+  for (u32 c = 0; c < 4; ++c) {
+    float s = v0 * load_float(matrix + c * 4) + v1 * load_float(matrix + 16 + c * 4);
+    s = s + v2 * load_float(matrix + 32 + c * 4);
+    out[c] = s + v3 * load_float(matrix + 48 + c * 4);
+  }
+}
+}  // namespace
+
+extern "C" void sub_82030338(PPCContext& ctx, uint8_t* base) {
+  (void)base;
+  float out[4];
+  vector_times_matrix(out, ctx.r4.u32, ctx.r5.u32);
+  for (u32 c = 0; c < 4; ++c) store_float(ctx.r3.u32 + c * 4, out[c]);
+}
+
+// Matrix times matrix (guest 0x82041CA0): r3 out, r4 a, r5 b, out = a b, row
+// by row through a temporary (out may be a or b). Returns r3.
+extern "C" void sub_82041CA0(PPCContext& ctx, uint8_t* base) {
+  (void)base;
+  float out[4][4];
+  for (u32 row = 0; row < 4; ++row) vector_times_matrix(out[row], ctx.r4.u32 + row * 16, ctx.r5.u32);
+  for (u32 row = 0; row < 4; ++row) {
+    for (u32 c = 0; c < 4; ++c) store_float(ctx.r3.u32 + row * 16 + c * 4, out[row][c]);
+  }
+}

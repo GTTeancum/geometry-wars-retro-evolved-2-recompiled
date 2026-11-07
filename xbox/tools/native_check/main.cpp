@@ -47,6 +47,7 @@ extern "C" void sub_820A87B0(PPCContext& ctx, uint8_t* base);
 #define REX_STORE_U64(x, y) (*(u64*)REX_HOST(x) = __builtin_bswap64(y))
 #endif
 extern "C" void sub_82061750(PPCContext& ctx, uint8_t* base);  // stubbed below
+extern "C" void sub_82030338(PPCContext& ctx, uint8_t* base);  // native (math_native.cpp)
 #include "original.inc"
 
 extern "C" void sub_8205B880(PPCContext& ctx, uint8_t* base);
@@ -59,6 +60,8 @@ extern "C" void sub_82096F30(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_820A6438(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_820A6518(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_8205FBA8(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82030338(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82041CA0(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__sub_821308B8(PPCContext& ctx, uint8_t* base) { original_sub_821308B8(ctx, base); }
 // The constant upload's full-buffer helper: never reached (the test buffer has room).
 extern "C" void sub_820A87B0(PPCContext&, uint8_t*) { gw_fatal("sub_820A87B0 reached"); }
@@ -625,6 +628,70 @@ int main(int argc, char** argv) {
       }
     }
     printf("glowing-line builder: %d of 2000 differ (worst %.2g)\n", differ, worst);
+    if (differ) ++bad;
+  }
+
+  // Vector times matrix (guest 0x82030338) and matrix times matrix (guest
+  // 0x82041CA0; the original calls the vector routine, here the native one,
+  // so this checks its rows and temporaries), out also aliasing an input.
+  {
+    constexpr u32 kA = 0xC0783000, kB = 0xC0783100, kOut = 0xC0783200;
+    int differ = 0;
+    float worst = 0;
+    auto fill = [](u32 at, int n) {
+      for (int i = 0; i < n; ++i) {
+        const float v = random_float(-100, 100);
+        u32 bits;
+        memcpy(&bits, &v, 4);
+        gw_store32(at + i * 4, bits);
+      }
+    };
+    auto compare_floats = [&](const u8* want, const u8* got, int n) {
+      bool bad = false;
+      for (int i = 0; i < n; ++i) {
+        u32 a, b;
+        memcpy(&a, want + i * 4, 4);
+        memcpy(&b, got + i * 4, 4);
+        a = __builtin_bswap32(a);
+        b = __builtin_bswap32(b);
+        float fa, fb;
+        memcpy(&fa, &a, 4);
+        memcpy(&fb, &b, 4);
+        const float err = fabsf(fa - fb) / (1.0f + fabsf(fa));
+        if (!(err <= worst)) worst = err;
+        if (!(err <= 1e-6f)) bad = true;
+      }
+      return bad;
+    };
+    for (int n = 0; n < 2000; ++n) {
+      fill(kA, 16);
+      fill(kB, 16);
+      const int which = n % 3;  // 0: vector, 1: matrix, 2: matrix into a
+      u8 want[64], saved[128];
+      memcpy(saved, gw_host(kA), 64);
+      memcpy(saved + 64, gw_host(kB), 64);
+      for (int pass = 0; pass < 2; ++pass) {
+        memcpy(gw_host(kA), saved, 64);
+        memcpy(gw_host(kB), saved + 64, 64);
+        static PPCContext ctx;
+        ctx = PPCContext{};
+        ctx.r1.u64 = kStack;
+        ctx.r3.u64 = which == 2 ? kA : kOut;
+        ctx.r4.u64 = kA;
+        ctx.r5.u64 = kB;
+        if (which == 0) {
+          if (pass == 0) original_sub_82030338(ctx, gw_host(0));
+          else sub_82030338(ctx, gw_host(0));
+        } else {
+          if (pass == 0) original_sub_82041CA0(ctx, gw_host(0));
+          else sub_82041CA0(ctx, gw_host(0));
+        }
+        const u8* got = gw_host(which == 2 ? kA : kOut);
+        if (pass == 0) memcpy(want, got, 64);
+        else differ += compare_floats(want, got, which == 0 ? 4 : 16);
+      }
+    }
+    printf("vector/matrix products: %d of 2000 differ (worst %.2g)\n", differ, worst);
     if (differ) ++bad;
   }
 
