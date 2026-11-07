@@ -121,6 +121,7 @@ extern GwStats gw_stats;
 // its thread was switched out inside it.
 enum GwPart { kPartGrid, kPartParticles, kPartStars, kPartCommands, kPartCount };
 extern volatile u64 gw_part_cycles[kPartCount];
+extern volatile u32 gw_gpu_kicks;  // moves of the command ring's write pointer (src/gpu.cpp)
 struct GwPartTimer {
   GwPart part;
   u64 start;

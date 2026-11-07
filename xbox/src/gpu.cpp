@@ -429,10 +429,19 @@ DWORD WINAPI vblank_thread(LPVOID) {
 
 }  // namespace
 
+volatile u32 gw_gpu_kicks;
+
 void gw_gpu_init() {
   InitializeCriticalSection(&g_interrupt_lock);
   g_work_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
   HANDLE cp = CreateThread(nullptr, 256 * 1024, command_thread, nullptr, 0, nullptr);
+  // Below the game's threads: the game's Direct3D moves the ring's write
+  // pointer (a kick) many times a frame, and with the command processor
+  // above the game every kick switched to it at once and back (on the
+  // Xbox's one core, about a third of the main thread's samples were it
+  // being switched out inside the kick). Below, it runs when the game's
+  // threads wait (for their jobs, for the next frame) and takes everything
+  // queued in one go.
   SetThreadPriority(cp, THREAD_PRIORITY_ABOVE_NORMAL);
   HANDLE vb = CreateThread(nullptr, 256 * 1024, vblank_thread, nullptr, 0, nullptr);
   SetThreadPriority(vb, THREAD_PRIORITY_HIGHEST);
@@ -445,6 +454,7 @@ void gw_gpu_write_register(u32 addr, u32 value) {
   if (index < kRegisterCount) g_regs[index] = value;
   if (index == kRegCpRbWptr) {
     g_write_index = value;
+    ++gw_gpu_kicks;
     SetEvent(g_work_event);
   }
 }

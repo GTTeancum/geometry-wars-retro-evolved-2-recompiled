@@ -5,7 +5,7 @@ order. Measurements are from XEMU at 64 MB unless noted.
 
 ## 1. 60 fps at 720p
 
-On hardware (Deadline, moving and shooting): 27 fps; 30-32 moving only.
+On hardware (Deadline, moving and shooting): 29-33 fps.
 `tools/xbdm_profile.py` samples the console's threads through xbdm, and the
 log's `cpu ms/frame` line (src/status.cpp) times the largest parts. Per
 frame now: grid 7 ms (physics 4.6, lines 2.2), renderer 8-10, particles 2,
@@ -15,7 +15,15 @@ starfield 2, the rest (the game's own code) about 17.
       points kept in host floats (byte swaps through memory were most of
       its time on the Pentium III); the lines drawn by the NV2A as smoothed
       lines from their end points. 14 -> 7 ms.
-- [ ] Renderer (command processor thread): 8-10 ms.
+- [x] Renderer (command processor thread): 8-10 -> 6-7 ms. The vertex copy
+      waited on memory (the game's vertices have left the cache by then):
+      now one straight copy with read-ahead; pbkit blocks of 512 words, not
+      32 (each pb_end flushes the write-combining buffer and polls the GPU).
+- [x] The game's Direct3D itself is cheap: most samples under it were the
+      main thread switched out while the command processor ran (6 kicks a
+      frame). The command processor must stay above the game's threads:
+      below them the game hangs (something spins on the GPU's progress).
+- [ ] Renderer: the packet parser (13% of its samples), gw_nv2a_swap (8%).
 - [ ] Profile the game's own code (main thread) with xbdm_profile.py.
 
 - [ ] **Find the 30 fps ceiling.** Deadline runs at 30-32 fps. The game is a

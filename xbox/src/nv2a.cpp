@@ -14,6 +14,7 @@
 #include <pbkit/pbkit.h>
 #include <windows.h>
 #include <xboxkrnl/xboxkrnl.h>
+#include <xmmintrin.h>
 
 #ifndef MASK
 #define MASK(mask, value) (((value) << (__builtin_ffs(mask) - 1)) & (mask))
@@ -39,12 +40,16 @@ u32 g_arena_used;  // bytes
 // write-combining buffer and wait for it through a GPU register, and the
 // renderer used to close a block for each small state change (thousands a
 // frame). blk_begin/blk_end keep one block open across them and close it
-// once it holds 32 words (the largest single write here, a 16-instruction
-// vertex program upload, is 80, so a block stays within pbkit's 128);
+// once it holds kBlockWords words;
 // blk_flush closes it before any pbkit call
 // that opens its own (targets, resets, text, the flip).
 u32* g_block;
 u32* g_block_start;
+// Each pb_end makes pbkit flush the write-combining buffer and wait for the
+// GPU to see it through a register (about a tenth of the command processor's
+// time on the Xbox with blocks of 32 words), so blocks are long. The GPU
+// sees a block when it closes; the CPU is the bottleneck, not the GPU.
+constexpr long kBlockWords = 512;
 
 u32* blk_begin() {
   if (!g_block) g_block = g_block_start = pb_begin();
@@ -59,7 +64,7 @@ void blk_flush() {
 
 void blk_end(u32* p) {
   g_block = p;
-  if (p - g_block_start >= 32) blk_flush();
+  if (p - g_block_start >= kBlockWords) blk_flush();
 }
 
 // Draw with translated NV2A vertex programs (else the CPU interpreter).
@@ -684,6 +689,19 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
   u32 words = gp->stride / 4;
   u32* out = (u32*)(g_arena + g_arena_used);
   u32 corners[3][16];  // a rectangle's three corners, host order
+  // The usual draw: consecutive vertices, 32-bit words byte-reversed. One
+  // straight copy, reading ahead: the game wrote the vertices earlier in the
+  // frame and they have left the cache, so each line would otherwise wait
+  // on memory (most of the command processor's time on the Xbox).
+  if (source == 2 && !rects && endian == 2) {
+    const u32* in = (const u32*)gw_host(stream + first * gp->stride);
+    const u32 total = count * words;
+    for (u32 k = 0; k < total; ++k) {
+      if ((k & 7) == 0) _mm_prefetch((const char*)(in + k + 96), _MM_HINT_NTA);
+      out[k] = __builtin_bswap32(in[k]);
+    }
+    count = 0;  // done
+  }
   for (u32 i = 0; i < count; ++i) {
     u32 index = first + i;
     if (source == 0) {
@@ -698,8 +716,13 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
       }
     }
     const u32* in = (const u32*)gw_host(stream + index * gp->stride);
+    _mm_prefetch((const char*)in + 4 * gp->stride, _MM_HINT_NTA);
     u32* dst = rects ? corners[i % 3] : out;
-    for (u32 k = 0; k < words; ++k) dst[k] = swap_endian(in[k], endian);
+    if (endian == 2) {
+      for (u32 k = 0; k < words; ++k) dst[k] = __builtin_bswap32(in[k]);
+    } else {
+      for (u32 k = 0; k < words; ++k) dst[k] = swap_endian(in[k], endian);
+    }
     if (!rects) {
       out += words;
     } else if (i % 3 == 2) {

@@ -89,11 +89,14 @@ DWORD WINAPI status_thread(LPVOID) {
     if (++seconds % 5 == 0) {
       // ms of CPU per frame for each timed part, at 733 MHz.
       static u64 last_cycles[kPartCount];
-      static u32 last_frames;
+      static u32 last_frames, last_kicks;
       const u32 frames = swaps - last_frames;
       if (frames) {
-        char text[160];
-        int n = snprintf(text, sizeof(text), "cpu ms/frame over %u frames:", frames);
+        char text[192];
+        const u32 kicks = gw_gpu_kicks;
+        int n = snprintf(text, sizeof(text), "cpu ms/frame over %u frames (%u kicks a frame):", frames,
+                         (kicks - last_kicks) / frames);
+        last_kicks = kicks;
         static const char* const kNames[kPartCount] = {"grid", "particles", "stars", "commands"};
         for (int i = 0; i < kPartCount && n < (int)sizeof(text) - 24; ++i) {
           const u64 c = gw_part_cycles[i];
