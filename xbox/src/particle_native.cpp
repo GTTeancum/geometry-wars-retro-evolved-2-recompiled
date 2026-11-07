@@ -212,6 +212,8 @@ extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base) {
   const float across_x = length * dir_y, across_y = length * dir_x;
   const float along_x = width * dir_x, along_y = width * dir_y;
   const float cr = intensity * red, cg = intensity * green, cb = intensity * blue;
+  // The quads only for frames that are rendered (gw_frame_drawn).
+  if (!gw_frame_drawn()) return;
   const float u0 = lf(C + 3208);
   if (u8* host = gw_vertex_mirror(streak, 128)) {
     const float quad[4][8] = {
@@ -240,11 +242,9 @@ extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base) {
           {mid_x - size, mid_y + size, zero, one, gr, gg, gb},
       };
       memcpy(host, quad, sizeof(quad));
-    } else {
-      glow_vertex(glow + 0, mid_x - size, mid_y - size, zero, zero, gr, gg, gb);
-      glow_vertex(glow + 28, mid_x + size, mid_y - size, one, zero, gr, gg, gb);
-      glow_vertex(glow + 56, mid_x + size, mid_y + size, one, one, gr, gg, gb);
-      glow_vertex(glow + 84, mid_x - size, mid_y + size, zero, one, gr, gg, gb);
     }
+    // Past the mirror the splat is left out: only the colour field draws
+    // these, from the mirror only (src/nv2a.cpp), and writing the guest buffer
+    // would commit its memory (it ran out in big explosions at 720p).
   }
 }

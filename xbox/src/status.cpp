@@ -24,6 +24,7 @@ namespace {
 CRITICAL_SECTION g_log_lock;
 bool g_log_ready = false;
 volatile bool g_fatal = false;
+u32 g_drawn_per_second;  // frames shown in the last second (status_thread)
 char g_fatal_text[256];
 
 void ring_append(const char* text) {
@@ -53,8 +54,8 @@ void tail_lines(char* out, size_t out_size, int lines) {
 void write_log_file(u32 fps) {
   static char text[sizeof(gw_log_ring) + 256];
   EnterCriticalSection(&g_log_lock);
-  int n = snprintf(text, 256, "frames %u (%u/s) interrupts %u gpu_packets %u draws %u guest %u KiB%s%s\n",
-                   gw_stats.swaps, fps, gw_stats.interrupts, gw_stats.gpu_packets, gw_stats.gpu_draws,
+  int n = snprintf(text, 256, "frames %u (%u/s) drawn %u (%u/s) interrupts %u gpu_packets %u draws %u guest %u KiB%s%s\n",
+                   gw_stats.swaps, fps, gw_stats.drawn, g_drawn_per_second, gw_stats.interrupts, gw_stats.gpu_packets, gw_stats.gpu_draws,
                    gw_memory_committed() >> 10, g_fatal ? " FATAL: " : "", g_fatal ? g_fatal_text : "");
   if (n < 0 || n > 255) n = 255;
   const u32 end = gw_log_pos, start = end > sizeof(gw_log_ring) ? end - sizeof(gw_log_ring) : 0;
@@ -79,6 +80,10 @@ DWORD WINAPI status_thread(LPVOID) {
     DWORD now = GetTickCount();
     u32 swaps = gw_stats.swaps;
     fps = (swaps - last_swaps) * 1000 / (now - last_tick ? now - last_tick : 1);
+    static u32 last_drawn;
+    const u32 drawn = gw_stats.drawn;
+    g_drawn_per_second = (drawn - last_drawn) * 1000 / (now - last_tick ? now - last_tick : 1);
+    last_drawn = drawn;
     if (swaps == last_swaps && ++stalled_seconds % 10 == 0) {
       gw_log("no frame for %u s; renderer stage %u; threads:\n", stalled_seconds, gw_nv2a_stage);
       gw_dump_threads();
@@ -170,11 +175,22 @@ void gw_status_init() {
   // component or HDMI connection with 720p enabled in the console settings)
   // and falls back to 640x480. It costs about 6 MB more than 640x480: three
   // 1280x720 colour buffers and pbkit's 32-bit depth buffer.
-#ifdef GW_VIDEO_720P
-  if (!XVideoSetMode(1280, 720, 16, REFRESH_DEFAULT)) XVideoSetMode(640, 480, 16, REFRESH_DEFAULT);
+  // The first mode the console's video settings allow: 720p (on a console
+  // set to 720p a 640x480 request may not take, and the display then scans
+  // the 640-wide frames at another width), then 480p widescreen, then
+  // 640x480. make VIDEO=480 asks for 640x480 only.
+#ifdef GW_VIDEO_480
+  static const int kModes[][2] = {{640, 480}};
 #else
-  XVideoSetMode(640, 480, 16, REFRESH_DEFAULT);
+  static const int kModes[][2] = {{1280, 720}, {720, 480}, {640, 480}};
 #endif
+  for (const auto& m : kModes) {
+    const bool ok = XVideoSetMode(m[0], m[1], 16, REFRESH_DEFAULT);
+    gw_log("video: %dx%d %s\n", m[0], m[1], ok ? "set" : "not available");
+    if (ok) break;
+  }
+  const VIDEO_MODE mode = XVideoGetMode();
+  gw_log("video: in use %dx%d, %d bpp, %d Hz\n", mode.width, mode.height, mode.bpp, mode.refresh);
   CreateThread(nullptr, 0, status_thread, nullptr, 0, nullptr);
 }
 

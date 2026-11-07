@@ -96,6 +96,7 @@ float g_scale_x, g_scale_y;
 // Viewport scale for the current target: g_scale_x/y for the screen, the
 // colour field's own size for its splats (see the colour field below).
 float g_target_scale_x, g_target_scale_y;
+float g_target_row;  // added to y: the colour field's work area (its splats)
 // Our own glow over each frame (on unless make GLOW=n; see apply_glow).
 #ifdef GW_GLOW
 constexpr bool kGlow = true;
@@ -105,6 +106,14 @@ constexpr bool kGlow = false;
 constexpr float kGlowStrength = 0.7f;
 constexpr u32 kGlowProgramSlot = 128;  // nv2a_glow_vs.vs.cg (after the translated programs)
 u32 g_frames;
+// The glow's and the colour field's work areas: rows of pbkit's extra
+// buffers (chosen in gw_nv2a_init). 0 the glow's quarter-size picture, 1 its
+// blur, 2-4 the colour field's three regions (each 160x116 at most).
+struct WorkArea {
+  int buffer;  // pbkit extra buffer
+  u32 row;     // first row
+};
+WorkArea g_work[5];
 
 struct Texture {
   u32 key;  // gpu address ^ size ^ format
@@ -420,9 +429,19 @@ void gw_nv2a_init() {
   };
   // 16-bit back buffers to match the video mode set in status.cpp (memory).
   pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5, false);
-  // Work buffers: 0 and 1 for the glow (end of frame) and the grid's colour
-  // field (start of frame), 2 holds the field from frame to frame.
-  pb_extra_buffers(3);
+  // Work areas (see WorkArea) in as few of pbkit's extra buffers (each a whole
+  // frame, 1.8 MB at 720p) as hold them: the glow's quarter-size picture and
+  // its blurred copy, then the colour field's three 116-row bands, in one
+  // buffer at 720p, the field in a second one at 480 lines.
+  {
+    const VIDEO_MODE mode = XVideoGetMode();
+    const u32 quarter = (u32)mode.height / 4, band = 116;
+    g_work[0] = {0, 0};
+    g_work[1] = {0, quarter};
+    const bool one = 2 * quarter + 3 * band <= (u32)mode.height;
+    for (u32 k = 0; k < 3; ++k) g_work[2 + k] = one ? WorkArea{0, 2 * quarter + k * band} : WorkArea{1, k * band};
+    pb_extra_buffers(one ? 1 : 2);
+  }
   if (pb_init()) {
     gw_log("nv2a: pb_init failed\n");
     return;
@@ -660,7 +679,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
   c[12] = float_bits((vte & 1 ? vx_scale : 1.0f) * g_target_scale_x);
   c[13] = float_bits((vte & 4 ? vy_scale : 1.0f) * g_target_scale_y);
   c[14] = float_bits((vte & 2 ? vx_off : 0.0f) * g_target_scale_x);
-  c[15] = float_bits((vte & 8 ? vy_off : 0.0f) * g_target_scale_y);
+  c[15] = float_bits((vte & 8 ? vy_off : 0.0f) * g_target_scale_y + g_target_row);
   for (u32 i = 0; i < gp->const_count; ++i) memcpy(&c[(4 + i) * 4], &regs[0x4000 + gp->const_xenos[i] * 4], 16);
   upload_constants(0, c, 4 + gp->const_count);
 
@@ -844,6 +863,10 @@ void wait_for_idle() {
   blk_flush();
 }
 
+u8* work_pixels(int area) {
+  return (u8*)pb_extra_buffer(g_work[area].buffer) + g_work[area].row * pb_back_buffer_pitch();
+}
+
 // Render into pbkit's extra buffer 'index' (-1: the back buffer), ordered
 // after everything drawn so far.
 void glow_target(int index) {
@@ -1013,7 +1036,7 @@ void glow_quad(float x0, float y0, float x1, float y1, const float uv[4][4]) {
 // the rectangle (0, 0)-(w, h) of the current target; texel = scale * screen
 // pixel + base, so a texture coordinate runs from base to base + scale * w.
 void glow_pass(const void* from, u32 from_w, u32 from_h, u32 pitch, float w, float h, float scale,
-               const float offsets[4][2], const float weights[4]) {
+               const float offsets[4][2], const float weights[4], float dest_y = 0) {
   for (u32 unit = 0; unit < 4; ++unit) bind_linear(unit, from, from_w, from_h, pitch);
   set_sum_weights(weights);
   float uv[4][4];
@@ -1023,7 +1046,7 @@ void glow_pass(const void* from, u32 from_w, u32 from_h, u32 pitch, float w, flo
     uv[k][2] = offsets[k][0] + scale * w;
     uv[k][3] = offsets[k][1] + scale * h;
   }
-  glow_quad(0, 0, w, h, uv);
+  glow_quad(0, dest_y, w, dest_y + h, uv);
 }
 
 // --- The grid's colour field ----------------------------------------------------------------
@@ -1066,11 +1089,14 @@ struct FieldTap {
 // of up to four taps (bilinear).
 void field_pass(int target, float x0, float y0, float x1, float y1, const FieldTap* taps, int n) {
   const u32 width = pb_back_buffer_width(), height = pb_back_buffer_height(), pitch = pb_back_buffer_pitch();
-  glow_target(target);
+  const WorkArea& to = g_work[2 + target];
+  glow_target(to.buffer);
+  y0 += (float)to.row;
+  y1 += (float)to.row;
   float uv[4][4] = {}, weights[4] = {};
   for (int k = 0; k < 4; ++k) {
     const FieldTap& t = taps[k < n ? k : 0];
-    bind_linear((u32)k, pb_extra_buffer(t.buffer), width, height, pitch);
+    bind_linear((u32)k, work_pixels(2 + t.buffer), width, height - g_work[2 + t.buffer].row, pitch);
     uv[k][0] = t.x0;
     uv[k][1] = t.y0;
     uv[k][2] = t.x1;
@@ -1097,21 +1123,25 @@ void field_pass_state(bool on) {
 void field_begin() {
   if (g_field_open) return;
   field_pass_state(true);
+  // Region k of the field's work areas cleared (160x116).
+  auto clear = [](int k) {
+    glow_target(g_work[2 + k].buffer);
+    pb_fill(0, (int)g_work[2 + k].row, 160, 116, 0);
+  };
   if (!g_field_ready) {
-    glow_target(2);
-    pb_fill(0, 0, 160, 120, 0);
+    clear(2);
     g_field_ready = true;
   }
-  glow_target(1);
-  pb_fill(0, 0, 160, 120, 0);
+  clear(1);
   const FieldTap last = {2, 0, 0, (float)kFieldW, (float)kFieldH, 1};
   field_pass(1, 0, 64, kFieldW, 64 + kFieldH, &last, 1);
-  glow_target(0);
-  pb_fill(0, 0, 160, 120, 0);
+  clear(0);
+  glow_target(g_work[2].buffer);  // the splats' target
   field_pass_state(false);
   // The splats: viewport 150x100 in the game's units, drawn at half that.
   g_target_scale_x = (float)kFieldW / 150;
   g_target_scale_y = (float)kFieldH / 100;
+  g_target_row = (float)g_work[2].row;
   g_field_open = true;
 }
 
@@ -1136,6 +1166,7 @@ void field_end() {
   g_field_open = false;
   g_target_scale_x = g_scale_x;
   g_target_scale_y = g_scale_y;
+  g_target_row = 0;
   field_pass_state(true);
   // Each level a bilinear sample between 2x2 texels of the one before.
   const FieldTap l1 = {0, 0, 0, 74, 50, 1};
@@ -1177,8 +1208,9 @@ void apply_glow() {
   const u32 sw = width / 4, sh = height / 4;
   const float w = (float)sw, h = (float)sh;
   const void* picture = pb_back_buffer();
-  const void* small = pb_extra_buffer(0);
-  const void* blurred = pb_extra_buffer(1);
+  const void* small = work_pixels(0);
+  const void* blurred = work_pixels(1);
+  const float small_y = (float)g_work[0].row, blurred_y = (float)g_work[1].row;
   set_program_start(kGlowProgramSlot);
   use_sum_combiner();
   g_combiner = kOther;
@@ -1188,17 +1220,17 @@ void apply_glow() {
 
   // 1. A quarter of the size: four bilinear taps, each the average of 2x2,
   // cover the 4x4 block (output pixel x reads around source 4x + 1.5).
-  glow_target(0);
+  glow_target(g_work[0].buffer);
   const float quarter[4][2] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
   const float even[4] = {0.25f, 0.25f, 0.25f, 0.25f};
-  glow_pass(picture, width, height, pitch, w, h, 4, quarter, even);
+  glow_pass(picture, width, height, pitch, w, h, 4, quarter, even, small_y);
   // 2, 3. Blur across, then down: four bilinear taps, eight texels.
-  glow_target(1);
+  glow_target(g_work[1].buffer);
   const float across[4][2] = {{-2.5f, 0}, {-0.5f, 0}, {1.5f, 0}, {3.5f, 0}};
-  glow_pass(small, sw, sh, pitch, w, h, 1, across, even);
-  glow_target(0);
+  glow_pass(small, sw, sh, pitch, w, h, 1, across, even, blurred_y);
+  glow_target(g_work[0].buffer);
   const float down[4][2] = {{0, -2.5f}, {0, -0.5f}, {0, 1.5f}, {0, 3.5f}};
-  glow_pass(blurred, sw, sh, pitch, w, h, 1, down, even);
+  glow_pass(blurred, sw, sh, pitch, w, h, 1, down, even, small_y);
 
   // 4. Added back over the picture, enlarged (bilinear).
   glow_target(-1);
@@ -1298,7 +1330,7 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   if (uv_i < 0 || grid_lines) uv_i = -1;
   int color_i = grid_lines ? -1 : uv_i == 0 ? 1 : 0;
   if (grid_lines) {
-    bind_linear(0, pb_extra_buffer(2), kFieldW, kFieldH, pb_back_buffer_pitch());  // the colour field
+    bind_linear(0, work_pixels(4), kFieldW, kFieldH, pb_back_buffer_pitch());  // the colour field
     use_line_combiner();
   } else {
     bind_texture(texture);
@@ -1322,7 +1354,19 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   // 65528-vertex draw.
   if (g_use_gpu_vertex) {
     const XvpProgram* gp = xvp_get(vs, uv_i, color_i, !(vte & 0x100), grid_lines ? 0 : -1, field_splat);
-    if (gp) {
+    // The particles' splats are only in the glow buffers' mirrors
+    // (src/particle_native.cpp): a splat draw reaching past its mirror draws
+    // the mirrored part.
+    if (gp && field_splat && source == 2 && gp->stride) {
+      const u32 stream = gw_gpu_to_guest(regs[0x4800 + gp->fetch_slot * 2] & ~3u);
+      const u32 start = stream + regs[0x2102] * gp->stride;
+      if (gw_vertex_mirror(start, gp->stride) && !gw_vertex_mirror(start, count * gp->stride)) {
+        u32 fit = 0;
+        while (fit < count && gw_vertex_mirror(start, (fit + 4) * gp->stride)) fit += 4;
+        count = fit;
+      }
+    }
+    if (gp && count) {
       const u32 piece = gp->stride ? (kArenaBytes / 2 / gp->stride) / 12 * 12 : count;
       bool drawn = true;
       for (u32 first = 0; first < count && drawn; first += piece) {
@@ -1405,8 +1449,11 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
 // Called on each guest swap: shows the frame drawn since the last one.
 void gw_nv2a_swap() {
   if (!g_ready) return;
-  if (!g_in_frame) begin_frame();
+  // Nothing drawn since the last swap (a frame the game updated but did not
+  // render, src/render_native.cpp): the frame on screen stays.
+  if (!g_in_frame) return;
   ++g_frames;
+  ++gw_stats.drawn;
   if (g_frames % 300 == 0) {
     gw_log("nv2a: frame %u vertex shaders:\n", g_frames);
     for (const CensusEntry& e : g_census) {

@@ -108,6 +108,7 @@ jmp_buf* gw_jmp_buf_for(u32, bool) { return nullptr; }
 u8* gw_grid_line_host(u32) { return nullptr; }
 u8* gw_vertex_mirror(u32, u32) { return nullptr; }
 u8* gw_vertex_mirror_add(u32, u32) { return nullptr; }
+bool gw_frame_drawn() { return true; }  // every frame drawn here
 volatile u64 gw_part_cycles[kPartCount];
 namespace rex::runtime {
 PPCFunc* ResolveIndirectFunction(uint32_t) { return nullptr; }

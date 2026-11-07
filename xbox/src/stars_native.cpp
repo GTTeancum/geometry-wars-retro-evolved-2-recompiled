@@ -65,6 +65,18 @@ extern "C" void sub_82075548(PPCContext& ctx, uint8_t* base) {
   // The fade-in (clamped to 1 and kept) and the next of the three buffers.
   const float fade = sel(one - (lf(kFade) + lf(C + 4456)), lf(kFade) + lf(C + 4456), one);
   sf(kFade, fade);
+
+  // A frame that is not rendered (gw_frame_drawn) only moves the stars'
+  // twinkle on; their vertices, the buffer and the sines wait for a rendered
+  // frame.
+  if (!gw_frame_drawn()) {
+    const float a = lf(C + 4500), b = lf(C + 4528);
+    for (u32 n = 0, star = kStars; n < kStarCount; ++n, star += kStarSize) {
+      const float phase = lf(star + 12) - (lf(star + 8) * a + b);
+      sf(star + 12, sel(phase, phase, one));
+    }
+    return;
+  }
   const u32 index = (gw_load32(kBufferIndex) + 1) % 3;
   gw_store32(kBufferIndex, index);
 

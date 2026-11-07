@@ -6,9 +6,12 @@ front buffer from memory with 'getmem'.
 
   python xbox/tools/xbdm_shot.py <console address> <out.png> [width height]
 
-The back buffers are 640x480 R5G6B5 (src/status.cpp, src/nv2a.cpp) unless
-given; the pitch is the width's bytes rounded to pbkit's tile pitches.
+The frame is R5G6B5; its width, height and pitch are pbkit's own
+(pb_FrameBuffersWidth/Height/Pitch, addresses from the link map
+xbox/build/gw2.map), unless given.
 """
+import pathlib
+import re
 import socket
 import struct
 import sys
@@ -58,11 +61,24 @@ def png(path, width, height, rgb_rows):
     open(path, 'wb').write(data)
 
 
+def pbkit_frame(x):
+    """(width, height, pitch) of pbkit's frame buffers, from the console."""
+    text = (pathlib.Path(__file__).resolve().parents[1] / 'build' / 'gw2.map').read_text(errors='replace')
+    values = []
+    for name in ('Width', 'Height', 'Pitch'):
+        m = re.search(r'\s_pb_FrameBuffers' + name + r'\s+([0-9a-fA-F]+)\s', text)
+        values.append(struct.unpack('<I', x.getmem(int(m[1], 16), 4))[0])
+    return tuple(values)
+
+
 def main():
     host, out = sys.argv[1], sys.argv[2]
-    width, height = (int(sys.argv[3]), int(sys.argv[4])) if len(sys.argv) > 4 else (640, 480)
-    pitch = next(p for p in TILE_PITCHES if p >= width * 2)
     x = Xbdm(host)
+    if len(sys.argv) > 4:
+        width, height = int(sys.argv[3]), int(sys.argv[4])
+        pitch = next(p for p in TILE_PITCHES if p >= width * 2)
+    else:
+        width, height, pitch = pbkit_frame(x)
     start = struct.unpack('<I', x.getmem(PCRTC_START, 4))[0]
     frame = bytearray()
     for offset in range(0, pitch * height, 0x8000):

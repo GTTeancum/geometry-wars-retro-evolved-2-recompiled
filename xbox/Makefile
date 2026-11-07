@@ -39,9 +39,16 @@ ifeq ($(OVERLAY),y)
 src/nv2a.obj: NXDK_CXXFLAGS += -DGW_OVERLAY
 endif
 
-# 1280x720 output instead of 640x480: make VIDEO=720p
-ifeq ($(VIDEO),720p)
-src/status.obj: NXDK_CXXFLAGS += -DGW_VIDEO_720P
+# Output: 1280x720 when the console allows it (src/status.cpp); make
+# VIDEO=480 for 640x480 only.
+ifeq ($(VIDEO),480)
+src/status.obj: NXDK_CXXFLAGS += -DGW_VIDEO_480
+endif
+
+# Render every Nth game frame (the game updates every frame): make DRAW_EVERY=1
+# to render all of them.
+ifneq ($(DRAW_EVERY),)
+src/render_native.obj: NXDK_CXXFLAGS += -DGW_DRAW_EVERY=$(DRAW_EVERY)
 endif
 
 # Compare the native grid update with the original now and then: make GRID_CHECK=y

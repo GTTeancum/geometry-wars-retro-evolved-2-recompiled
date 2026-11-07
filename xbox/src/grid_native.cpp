@@ -446,7 +446,11 @@ void update_row(u32 args, u32 j, const Constants& k, const Pushers& all) {
     ~LineTimer() { g_stats.line_cycles += __builtin_ia32_rdtsc() - start; }
   } line_timer{t2};
 
-  // 2. The row's lines. With the line buffer's host mirror (see
+#ifndef GW_GRID_GUEST_SYNC
+  if (!gw_frame_drawn()) return;
+#endif
+  // 2. The row's lines: only for frames that are rendered (gw_frame_drawn),
+  // the line buffer is only drawn then. With the line buffer's host mirror (see
   // gw_grid_line_host), each segment is a line of two vertices there
   // (x, y, z, brightness, edge 0), the NV2A draws it; else, as the game
   // does, a thin quad of four vertices in the guest buffer.
