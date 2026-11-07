@@ -60,6 +60,7 @@ extern "C" void sub_82096F30(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_820A6438(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_820A6518(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_8205FBA8(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_8205EB58(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_82030338(PPCContext& ctx, uint8_t* base);
 extern "C" void sub_82041CA0(PPCContext& ctx, uint8_t* base);
 extern "C" void __imp__sub_821308B8(PPCContext& ctx, uint8_t* base) { original_sub_821308B8(ctx, base); }
@@ -131,7 +132,8 @@ float random_float(float lo, float hi) { return lo + (hi - lo) * (float)rand() /
 // The line builder's vertex allocator (guest 0x82061750), stubbed: fixed
 // buffers for its two streams.
 extern "C" void sub_82061750(PPCContext& ctx, uint8_t*) {
-  ctx.r3.u64 = ctx.r3.u32 == 0x821A0000 + 16648 ? kLineQuad : kLineOutline;
+  const u32 stream = ctx.r3.u32;
+  ctx.r3.u64 = stream == 0x821A0000 + 16648 || stream == 0x821A0000 + 12424 ? kLineQuad : kLineOutline;
 }
 
 float frand(float lo, float hi) { return lo + (hi - lo) * (float)rand() / (float)RAND_MAX; }
@@ -628,6 +630,69 @@ int main(int argc, char** argv) {
       }
     }
     printf("glowing-line builder: %d of 2000 differ (worst %.2g)\n", differ, worst);
+    if (differ) ++bad;
+  }
+
+  // 3D glowing-line builder (guest 0x8205EB58).
+  {
+    int differ = 0;
+    float worst = 0;
+    constexpr u32 kFrom = 0xC0784000, kTo = 0xC0784010, kColour = 0xC0784020;
+    auto put = [](u32 at, float v) {
+      u32 bits;
+      memcpy(&bits, &v, 4);
+      gw_store32(at, bits);
+    };
+    for (int n = 0; n < 2000; ++n) {
+      for (int c = 0; c < 4; ++c) put(kColour + c * 4, random_float(0, 2));
+      for (int c = 0; c < 3; ++c) {
+        const float a = random_float(-300, 300);
+        put(kFrom + c * 4, a);
+        put(kTo + c * 4, a + random_float(-30, 30));
+      }
+      const double cap = random_float(0, 10);
+      static u8 want[384];
+      for (int pass = 0; pass < 2; ++pass) {
+        memset(gw_host(kLineQuad), 0, 128);
+        memset(gw_host(kLineOutline), 0, 256);
+        gw_store32(0x821A0000 + 12424 + 2052, kLineQuad);
+        gw_store32(0x821A0000 + 12424 + 2056, 0);
+        gw_store32(0x821A0000 + 14536 + 2052, kLineOutline);
+        gw_store32(0x821A0000 + 14536 + 2056, 0);
+        static PPCContext ctx;
+        ctx = PPCContext{};
+        ctx.r1.u64 = kStack;
+        ctx.r3.u64 = kFrom;
+        ctx.r4.u64 = kTo;
+        ctx.r5.u64 = kColour;
+        ctx.f1.f64 = cap;
+        if (pass == 0) original_sub_8205EB58(ctx, gw_host(0));
+        else sub_8205EB58(ctx, gw_host(0));
+        u8 got[384];
+        memcpy(got, gw_host(kLineQuad), 128);
+        memcpy(got + 128, gw_host(kLineOutline), 256);
+        if (pass == 0) {
+          memcpy(want, got, sizeof(got));
+          continue;
+        }
+        bool bad = false;
+        for (int w = 0; w < 96; ++w) {
+          u32 a, b;
+          memcpy(&a, want + w * 4, 4);
+          memcpy(&b, got + w * 4, 4);
+          a = __builtin_bswap32(a);
+          b = __builtin_bswap32(b);
+          float fa, fb;
+          memcpy(&fa, &a, 4);
+          memcpy(&fb, &b, 4);
+          const float err = fabsf(fa - fb) / (1.0f + fabsf(fa));
+          if (!(err <= worst)) worst = err;
+          if (!(err <= 1e-5f)) bad = true;
+        }
+        differ += bad;
+      }
+    }
+    printf("3D glowing-line builder: %d of 2000 differ (worst %.2g)\n", differ, worst);
     if (differ) ++bad;
   }
 

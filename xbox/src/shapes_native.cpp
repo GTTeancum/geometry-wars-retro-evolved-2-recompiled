@@ -121,3 +121,79 @@ extern "C" void sub_8205FBA8(PPCContext& ctx, uint8_t* base) {
   vertex(outline + 192, (ny + nx) * width + bx, (nx_k1 + ny) * width + by, one, zero);
   vertex(outline + 224, width * nx + (bx - a), (by - b) + a, u0, zero);
 }
+
+// The 3D glowing-line builder (guest 0x8205EB58): the outlines of the game's
+// objects (guest 0x82061DA0 transforms an object's points and joins them with
+// it). r3, r4 the segment's ends (x, y, z), r5 the colour (r, g, b, a), f1 the
+// length of the glow caps along the segment. Like sub_8205FBA8, a thin quad
+// into one stream and an eight-vertex outline into another, the width at
+// right angles in the xy plane, the caps along the segment in 3D; the colour
+// is premultiplied by its alpha.
+extern "C" void sub_8205EB58(PPCContext& ctx, uint8_t* base) {
+  const u32 from = ctx.r3.u32, to = ctx.r4.u32, colour = ctx.r5.u32;
+  const double cap = ctx.f1.f64;
+  auto allocate = [&](u32 stream, u32 count) -> u32 {
+    const u32 used = gw_load32(stream + 2056);
+    if ((int)(used + count) <= 4096) {
+      gw_store32(stream + 2056, used + count);
+      return gw_load32(stream + 2052) + (used << 5);
+    }
+    ctx.r1.u64 = ctx.r1.u32 - 192;  // the original's frame
+    ctx.r3.u64 = stream;
+    ctx.r4.u64 = count;
+    sub_82061750(ctx, base);
+    ctx.r1.u64 = ctx.r1.u32 + 192;
+    return ctx.r3.u32;
+  };
+  const u32 quad = allocate(K + 12424, 4);
+  const u32 outline = allocate(K + 14536, 8);
+
+  const double alpha = lfs(colour + 12);
+  const double colour_scale = lfs(C + 10024);
+  const double red = single(single(alpha * lfs(colour + 0)) * colour_scale);
+  const double green = single(single(lfs(colour + 4) * alpha) * colour_scale);
+  const double blue = single(single(lfs(colour + 8) * alpha) * colour_scale);
+  const double px = lfs(from + 0), py = lfs(from + 4), pz = lfs(from + 8);
+  const double qx = lfs(to + 0), qy = lfs(to + 4), qz = lfs(to + 8);
+  const double w = lfs(K + 7572 + 32);
+  const double u0 = lfs(C + 3208), one = lfs(C + 1732), zero = lfs(C + 1740);
+  const double dx = single(qx - px), dy = single(qy - py), dz = single(qz - pz);
+
+  // 1 / length in the plane and in 3D (the bias keeps zero finite).
+  const double bias = lfd(C + 10080);
+  const double plane2 = (dx * dx + dy * dy) + bias;
+  const double space2 = ((dz * dz + dx * dx) + dy * dy) + bias;
+  const double r_plane = (double)(float)(1.0 / __builtin_sqrt(plane2));
+  const double r_space = (double)(float)(1.0 / __builtin_sqrt(space2));
+  const double along = r_space * cap;
+  const double n = r_plane * dy;     // across, x (f9)
+  const double m = -(r_plane * dx);  // across, y (f8)
+  const double tx = along * dx, ty = along * dy, tz = along * dz;  // the caps (f31, f30, f29)
+
+  auto fma = [](double a, double b, double c) { return a * b + c; };      // fmadd
+  auto nms = [](double a, double b, double c) { return -(a * b - c); };   // fnmsub
+  auto vertex = [&](u32 out, double x, double y, double z, double u, double v) {
+    stfs(out + 0, x);
+    stfs(out + 4, y);
+    stfs(out + 8, z);
+    stfs(out + 12, u);
+    stfs(out + 16, red);
+    stfs(out + 20, green);
+    stfs(out + 24, blue);
+    stfs(out + 28, v);
+  };
+
+  vertex(quad + 0, nms(w, n, px), nms(w, m, py), pz, u0, one);
+  vertex(quad + 32, fma(w, n, px), fma(w, m, py), pz, one, one);
+  vertex(quad + 64, fma(w, n, qx), fma(w, m, qy), qz, one, one);
+  vertex(quad + 96, nms(w, n, qx), nms(w, m, qy), qz, u0, one);
+
+  vertex(outline + 0, nms(w, n, px), nms(w, m, py), pz, u0, one);
+  vertex(outline + 32, fma(w, n, px), fma(w, m, py), pz, one, one);
+  vertex(outline + 64, nms(w, tx, fma(w, n, px)), nms(w, ty, fma(w, m, py)), nms(w, tz, pz), one, zero);
+  vertex(outline + 96, nms(w, tx, nms(w, n, px)), nms(w, ty, nms(w, m, py)), nms(w, tz, pz), u0, zero);
+  vertex(outline + 128, nms(w, n, qx), nms(w, m, qy), qz, u0, one);
+  vertex(outline + 160, fma(w, n, qx), fma(w, m, qy), qz, one, one);
+  vertex(outline + 192, fma(n + tx, w, qx), fma(m + ty, w, qy), fma(w, tz, qz), one, zero);
+  vertex(outline + 224, fma(w, tx, nms(w, n, qx)), fma(w, ty, nms(w, m, qy)), fma(w, tz, qz), u0, zero);
+}
