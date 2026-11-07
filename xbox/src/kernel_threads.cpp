@@ -295,6 +295,7 @@ u32 gw_thread_create(u32 stack_size, u32 xapi_startup, u32 start_address, u32 st
                      u32 creation_flags, u32* out_thread_id) {
   GwThread* t = setup_thread(stack_size);
   t->start_address = start_address;
+  gw_note_thread(start_address, start_context);
   t->start_context = start_context;
   t->xapi_startup = xapi_startup;
   bool suspended = creation_flags & 1;

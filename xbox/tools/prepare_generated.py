@@ -15,9 +15,11 @@ into xbox/build/gen for nxdk.
 - fctiwz/fctidz (SIMDe's emulated cvttsd) become gw_trunc_i32/i64, and
   std::isnan the compiler builtin (nxdk builds without builtins, so it was a
   library call).
-- Every label gets GW_LABEL_BARRIER, a compiler memory barrier: guest memory
-  accesses are not volatile (pch.h), and loops polling memory jump through a
-  label.
+- Every loop head (a label some later goto jumps back to) gets
+  GW_LABEL_BARRIER, a compiler memory barrier: guest memory accesses are not
+  volatile (pch.h), and a loop polling memory jumps back through its head.
+  Labels reached only by forward jumps (if/else joins) get none, so the
+  compiler can keep guest values in registers across them.
 - generated *_register.cpp is skipped: the Xbox runtime fills its dispatch
   table from PPCFuncMappings instead.
 
@@ -63,6 +65,18 @@ def constants(text):
     return values
 
 
+def barrier_loop_heads(text):
+    out, last = [], 0
+    for m in LABEL.finditer(text):
+        name = m[1][:-1]
+        out.append(text[last:m.end()])
+        if text.find(f'goto {name};', m.end()) >= 0:  # jumped to from below: a loop
+            out.append('\n\tGW_LABEL_BARRIER();')
+        last = m.end()
+    out.append(text[last:])
+    return ''.join(out)
+
+
 def write_if_changed(path, text):
     if path.exists() and path.read_text(encoding='utf-8') == text:
         return False
@@ -94,7 +108,7 @@ def main():
             text = REVERSED_COPY.sub(r'gw_copy_reversed(\1, \2);', text)
             text = TRUNCATE.sub(r'gw_trunc_i\1(\2)', text)
             text = text.replace('std::isnan(', '__builtin_isnan(')
-            text = LABEL.sub(r'\1\n\tGW_LABEL_BARRIER();', text)
+            text = barrier_loop_heads(text)
         changed += write_if_changed(DST / src.name, text)
     for stale in DST.iterdir():
         if stale.suffix in ('.cpp', '.h') and stale.name not in wanted:

@@ -666,6 +666,11 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
 
   u32 f0 = regs[0x4800 + gp->fetch_slot * 2], f1 = regs[0x4800 + gp->fetch_slot * 2 + 1];
   u32 stream = gw_gpu_to_guest(f0 & ~3u), endian = f1 & 3;
+  // VGT_INDX_OFFSET: added to every vertex index, from the index buffer or
+  // counted. The game draws its grid's lines in two draws from the same
+  // stream, the second with offset 65528; without it the second drew the
+  // first one's rows again and the grid's bottom quarter was missing.
+  const u32 index_offset = regs[0x2102];
   u32 formats[16] = {}, offsets[16] = {};
   auto set_formats = [&](u32 base) {
     for (u32 a = 0; a < gp->attr_count; ++a) {
@@ -683,8 +688,9 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
   // they are, smoothed. Their vertices are x, y, z, brightness, edge; the
   // program's second input (u, v, brightness, edge in the game's layout, of
   // which it uses the last two) reads from y on.
-  if (source == 2 && !rects && gp->attr_count == 2 && gp->stride == 28 && (first % 4) == 0 && (count % 4) == 0) {
-    const u32 start = stream + first * gp->stride;
+  if (source == 2 && !rects && gp->attr_count == 2 && gp->stride == 28 && ((first + index_offset) % 4) == 0 &&
+      (count % 4) == 0) {
+    const u32 start = stream + (first + index_offset) * gp->stride;
     u8* host = gw_grid_line_host(start);
     if (host && count && gw_grid_line_host(start + count * gp->stride - 1)) {
       const u32 base = (u32)MmGetPhysicalAddress(host);
@@ -717,7 +723,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
   // frame and they have left the cache, so each line would otherwise wait
   // on memory (most of the command processor's time on the Xbox).
   if (source == 2 && !rects && endian == 2) {
-    const u32* in = (const u32*)gw_host(stream + first * gp->stride);
+    const u32* in = (const u32*)gw_host(stream + (first + index_offset) * gp->stride);
     const u32 total = count * words;
     for (u32 k = 0; k < total; ++k) {
       if ((k & 7) == 0) _mm_prefetch((const char*)(in + k + 96), _MM_HINT_NTA);
@@ -738,7 +744,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
         index = index_endian ? (u16)((h << 8) | (h >> 8)) : h;
       }
     }
-    const u32* in = (const u32*)gw_host(stream + index * gp->stride);
+    const u32* in = (const u32*)gw_host(stream + (index + index_offset) * gp->stride);
     _mm_prefetch((const char*)in + 4 * gp->stride, _MM_HINT_NTA);
     u32* dst = rects ? corners[i % 3] : out;
     if (endian == 2) {
@@ -1343,7 +1349,7 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
       }
     }
     float clip[4], interp[8][4];
-    xvs_run(vs, regs, index, clip, interp);
+    xvs_run(vs, regs, index + regs[0x2102], clip, interp);  // with VGT_INDX_OFFSET
     // PA_CL_VTE_CNTL: bit 8 = xy already divided, bits 0-3 = viewport
     // x/y scale and offset enables (off when the game sends pixels).
     float x = clip[0], y = clip[1];

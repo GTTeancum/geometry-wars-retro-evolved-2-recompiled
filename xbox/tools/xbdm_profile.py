@@ -4,6 +4,8 @@ monitor (xbdm, port 731).
   python xbox/tools/xbdm_profile.py <console address> [seconds] [--top N] [--function NAME] [--thread ID]
 
 --thread counts only that thread (xbdm's id, as the by-thread table prints).
+--inclusive also prints, for each function, the running samples with it
+anywhere on the stack (2 KB): time including callees, to find subsystems.
 --inside LO HI also counts the running samples with a recompiled function
 sub_LO..sub_HI anywhere on the stack (2 KB from the stack pointer): the
 share of time spent in that range including what it calls, e.g. the game's
@@ -93,6 +95,8 @@ def main():
         m = re.match(r'_sub_([0-9A-F]{8})$', names[i]) if i >= 0 else None
         return int(m[1], 16) if m else None
 
+    inclusive_mode = '--inclusive' in sys.argv
+    inclusive = collections.Counter()
     idle_rounds = 0  # rounds in which every thread was waiting: the CPU had nothing to do
     while time.time() < end:
         running_before = sum(by_thread.values())
@@ -118,6 +122,15 @@ def main():
             i = bisect.bisect_right(addresses, eip) - 1
             name = names[i] if i >= 0 else f'{eip:08X}'
             by_function[name] += 1
+            if inclusive_mode:
+                words = struct.unpack('<512I', x.getmem(regs['Esp'], 2048))
+                seen = set()
+                for w in (eip,) + words:
+                    if CODE_START <= w < CODE_END:
+                        k = bisect.bisect_right(addresses, w) - 1
+                        if k >= 0 and names[k] not in seen:
+                            seen.add(names[k])
+                            inclusive[names[k]] += 1
             if span:
                 words = struct.unpack('<512I', x.getmem(regs['Esp'], 2048))
                 # The outermost function of the range on the stack: the entry
@@ -153,6 +166,10 @@ def main():
     print(f'top {top} functions:')
     for name, n in by_function.most_common(top):
         print(f'  {100.0 * n / max(total, 1):5.1f}%  {n:6d}  {name}')
+    if inclusive_mode:
+        print('inclusive (with callees):')
+        for name, n in inclusive.most_common(60):
+            print(f'  {100.0 * n / max(total, 1):5.1f}%  {n:6d}  {name}')
     if focus:
         print(f'inside {focus} (offset: samples):')
         for offset, n in sorted(inside.items()):

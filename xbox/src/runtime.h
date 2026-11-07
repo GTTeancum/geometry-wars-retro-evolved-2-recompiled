@@ -161,6 +161,8 @@ bool gw_input_read(u32 user, u32 gamepad);
 struct GwThread;
 GwThread* gw_current_thread();
 PPCContext& gw_current_context();
+// src/jobs_native.cpp: records the game's job threads.
+void gw_note_thread(u32 start_address, u32 start_context);
 u32 gw_thread_create(u32 stack_size, u32 xapi_startup, u32 start_address, u32 start_context,
                      u32 creation_flags, u32* out_thread_id);  // returns a handle
 void gw_run_main_thread();
