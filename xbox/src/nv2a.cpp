@@ -658,6 +658,8 @@ struct CensusEntry {
   u32 hash, ps, draws, prim, vertices, gpu, cpu;  // gpu/cpu: vertices drawn by each path
   u32 strokes;  // draws given the line falloff (g_falloff)
   u32 drawn;    // draws that reached the NV2A
+  u32 in_place;     // vertices drawn from a host mirror (gw_vertex_mirror)
+  u32 arena_bytes;  // bytes this kind copied into the vertex arena
   u32 skip;  // why the last skipped draw was skipped (SkipReason), with its detail
   u32 skip_detail;
 };
@@ -817,7 +819,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
                  u32 index_base, u32 index_endian, bool index32, u32 vte, bool rects = false, float tex_w = 1,
                  float tex_h = 1, const float* constant1 = nullptr, const float* colour_scale = nullptr) {
   if (rects && (count % 3 || !gp->attr_count || gp->stride > 64)) return false;
-  const u32 out_count = rects ? count / 3 * 4 : count;
+  u32 out_count = rects ? count / 3 * 4 : count;
   u32 bytes = out_count * gp->stride;
   if (g_loaded_key != gp->key) {
     u32* p = blk_begin();
@@ -939,9 +941,30 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
     if (u8* host = gw_vertex_mirror(start, count * gp->stride)) {
       set_formats((u32)MmGetPhysicalAddress(host));
       draw_arrays(nv_prim, count);
+      if (g_census_entry) g_census_entry->in_place += count;
       return true;
     }
-    mirrored = gw_vertex_mirror(start, gp->stride) != nullptr;
+    // Starting in a mirror and running past it (the busiest frames'
+    // particles): the mirrored part drawn in place, in whole primitives, and
+    // only the rest copied below.
+    if (u8* host = gw_vertex_mirror(start, gp->stride)) {
+      const u32 whole = nv_prim == NV097_SET_BEGIN_END_OP_QUADS       ? 4
+                      : nv_prim == NV097_SET_BEGIN_END_OP_TRIANGLES   ? 3
+                      : nv_prim == NV097_SET_BEGIN_END_OP_LINES       ? 2
+                      : nv_prim == NV097_SET_BEGIN_END_OP_POINTS      ? 1
+                                                                      : 0;
+      const u32 inside = whole ? gw_vertex_mirror_room(start) / gp->stride / whole * whole : 0;
+      if (inside && inside < count) {
+        set_formats((u32)MmGetPhysicalAddress(host));
+        draw_arrays(nv_prim, inside);
+        if (g_census_entry) g_census_entry->in_place += inside;
+        first += inside;
+        count -= inside;
+        out_count = count;
+        bytes = count * gp->stride;
+      }
+      mirrored = gw_vertex_mirror(stream + (first + index_offset) * gp->stride, gp->stride) != nullptr;
+    }
   }
 
   // Otherwise the vertices are copied into the arena, in draw order, words
@@ -999,6 +1022,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
 
   set_formats(((u32)g_arena & 0x03FFFFFF) + g_arena_used);
   g_arena_used += (bytes + 15) & ~15u;
+  if (g_census_entry) g_census_entry->arena_bytes += (bytes + 15) & ~15u;
   draw_arrays(nv_prim, out_count);
   return true;
 }
@@ -1740,6 +1764,7 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   offsets[9] = base + 12;
   set_arrays(formats, offsets);
   g_arena_used += count * 20;
+  if (g_census_entry) g_census_entry->arena_bytes += count * 20;
   draw_arrays(nv_prim, count);
 }
 
@@ -1809,9 +1834,10 @@ void gw_nv2a_swap() {
     gw_log("nv2a: frame %u vertex shaders:\n", g_frames);
     for (const CensusEntry& e : g_census) {
       if (e.hash) {
-        gw_log("  %08X ps %08X: %u draws (%u as strokes), prim %u, %u vertices (%u on the GPU, %u on the CPU)%s%s %X\n",
-               e.hash, e.ps, e.draws, e.strokes, e.prim, e.vertices, e.gpu, e.cpu, e.skip ? "; skipped: " : "",
-               kSkipNames[e.skip], e.skip_detail);
+        gw_log("  %08X ps %08X: %u draws (%u as strokes), prim %u, %u vertices (%u on the GPU, %u on the CPU; "
+               "%u in place, arena %u KiB)%s%s %X\n",
+               e.hash, e.ps, e.draws, e.strokes, e.prim, e.vertices, e.gpu, e.cpu, e.in_place, e.arena_bytes / 1024,
+               e.skip ? "; skipped: " : "", kSkipNames[e.skip], e.skip_detail);
       }
     }
   }

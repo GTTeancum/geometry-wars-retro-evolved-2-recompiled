@@ -9,7 +9,8 @@
 // most of the command processor's time. Only the first bytes of each guest
 // buffer are mirrored (the guest buffers are sized for the worst case); the
 // writers fall back to the guest buffer past the mirror, and a draw reaching
-// past it is copied as before, its mirrored part from the mirror.
+// past it has its mirrored part drawn in place (whole primitives) and the
+// rest copied as before.
 #include "runtime.h"
 
 #include <xboxkrnl/xboxkrnl.h>

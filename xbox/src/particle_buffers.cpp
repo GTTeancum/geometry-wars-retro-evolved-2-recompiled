@@ -16,15 +16,23 @@
 //     particles while the next frame fills the other set);
 //   - the glow-pass buffers likewise (their quads are the light splats of
 //     the grid's colour field, src/nv2a.cpp);
-//   - each buffer's first part has a host mirror (src/vertex_mirror.cpp)
-//     that src/particle_native.cpp fills in the NV2A's order and the
-//     renderer draws in place: 64 KB of a main buffer (512 particles a job),
-//     56 KB of a glow buffer, past which the guest buffer is used.
+//   - the first job's buffers have a host mirror of their first part
+//     (src/vertex_mirror.cpp) that src/particle_native.cpp fills in the
+//     NV2A's order and the renderer draws in place: 640 KB of the main
+//     buffer (5120 particles), 56 KB of the glow buffer (512 splats), past
+//     which the guest buffer is used. Only job 0: the jobs run one after
+//     another, job 0 first (src/jobs_native.cpp), and the first takes every
+//     bucket (src/particle_native.cpp), so the other five never have a
+//     particle (one particle draw a frame on the console, 4-player play:
+//     5225 particles). Their mirrors, 64 KB each before, went to job 0's
+//     (the same memory in all).
 #include "runtime.h"
 
 extern "C" void sub_820E8130(PPCContext& ctx, uint8_t* base);  // game heap allocation
 extern "C" void sub_8206A480(PPCContext& ctx, uint8_t* base);  // physical buffer allocation
 extern "C" void sub_82063EC0(PPCContext& ctx, uint8_t* base);  // particle system set-up (rest)
+extern "C" void sub_820A1800(PPCContext& ctx, uint8_t* base);  // vertex buffer lock
+extern "C" void sub_820A1850(PPCContext& ctx, uint8_t* base);  // vertex buffer unlock
 
 namespace {
 
@@ -32,7 +40,7 @@ constexpr u32 kTableMain = 0x821B0000 + 16000, kTableGlow = 0x821B0000 + 15996;
 constexpr u32 kJobs = 6, kFramesInFlight = 3, kEntries = kJobs * kFramesInFlight;
 constexpr u32 kMainFrames = 2;
 constexpr u32 kMainSize = 0x400000, kGlowSize = 0x380000;
-constexpr u32 kMainMirror = 512 * 128, kGlowMirror = 512 * 112;
+constexpr u32 kMainMirror = 5120 * 128, kGlowMirror = 512 * 112;  // the first job's
 
 // The two sets' buffers by set and job (gw_particle_set_buffer).
 u32 g_set_main[kMainFrames][kJobs], g_set_glow[kMainFrames][kJobs];
@@ -41,6 +49,22 @@ u32 call_alloc(PPCContext& ctx, uint8_t* base, void (*fn)(PPCContext&, uint8_t*)
   ctx.r3.u64 = size;
   fn(ctx, base);
   return ctx.r3.u32;
+}
+
+// A vertex buffer's data (guest address): what the lock returns, where the
+// particle job writes (src/particle_native.cpp) and what the renderer finds
+// from the draw's vertex fetch. The mirror goes there, not at the buffer
+// (its header): mirrored at the header, no write or draw ever matched it.
+u32 buffer_data(PPCContext& ctx, uint8_t* base, u32 buffer) {
+  ctx.r3.u64 = buffer;
+  ctx.r4.u64 = 0;
+  ctx.r5.u64 = 0;
+  ctx.r6.u64 = 0;
+  sub_820A1800(ctx, base);
+  const u32 data = ctx.r3.u32;
+  ctx.r3.u64 = buffer;
+  sub_820A1850(ctx, base);
+  return data;
 }
 
 }  // namespace
@@ -66,8 +90,12 @@ extern "C" void sub_820673C8(PPCContext& ctx, uint8_t* base) {
     if (own == i) {
       const u32 m = call_alloc(ctx, base, sub_8206A480, kMainSize);
       const u32 g = call_alloc(ctx, base, sub_8206A480, kGlowSize);
-      gw_vertex_mirror_add(m, kMainMirror);
-      gw_vertex_mirror_add(g, kGlowMirror);
+      if (i % kJobs == 0) {
+        const u32 md = buffer_data(ctx, base, m), gd = buffer_data(ctx, base, g);
+        gw_vertex_mirror_add(md, kMainMirror);
+        gw_vertex_mirror_add(gd, kGlowMirror);
+        gw_log("particle buffers: set %u job 0 data at %08X and %08X, mirrored\n", i / kJobs, md, gd);
+      }
       g_set_main[i / kJobs][i % kJobs] = m;
       g_set_glow[i / kJobs][i % kJobs] = g;
       gw_store32(main + i * 4, m);
@@ -77,7 +105,8 @@ extern "C" void sub_820673C8(PPCContext& ctx, uint8_t* base) {
       gw_store32(glow + i * 4, gw_load32(glow + own * 4));
     }
   }
-  gw_log("particle buffers: main picture and glow pass %u sets for %u frames in flight, mirrored\n", kMainFrames,
-         kFramesInFlight);
+  gw_log("particle buffers: main picture and glow pass %u sets for %u frames in flight, first job mirrored "
+         "(%u particles, %u splats)\n",
+         kMainFrames, kFramesInFlight, kMainMirror / 128, kGlowMirror / 112);
   sub_82063EC0(ctx, base);
 }

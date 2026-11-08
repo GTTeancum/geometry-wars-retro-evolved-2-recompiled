@@ -24,6 +24,7 @@ Steps:
   sleep S                   wall-clock seconds
   shot NAME                 screenshot to xbox/test-artifacts/pad/NAME.png
   off                       disable the remote pad
+  player N                  the steps after drive player N's pad (1-4; default 1)
 """
 import argparse
 import pathlib
@@ -169,6 +170,13 @@ class Session:
             self.gdb = Gdb(args.gdb_port)
         self.out = XBOX / 'test-artifacts/pad'
         self.buttons, self.left, self.right, self.triggers = 0, (0, 0), (0, 0), (0, 0)
+        self.player = 0  # 0-3: gw_remote_pad[player], 20 bytes each
+        self.states = [(0, (0, 0), (0, 0), (0, 0)) for _ in range(4)]
+
+    def select(self, player):
+        self.states[self.player] = (self.buttons, self.left, self.right, self.triggers)
+        self.player = player
+        self.buttons, self.left, self.right, self.triggers = self.states[player]
 
     def frame(self):
         return self.monitor.word(self.stats)
@@ -179,7 +187,7 @@ class Session:
             return x | (y << 16)
         lt, rt = (int(max(0, min(1, v)) * 255) for v in self.triggers)
         record = [magic, self.buttons, stick(self.left), stick(self.right), lt | (rt << 16)]
-        self.gdb.write(self.pad, b''.join(v.to_bytes(4, 'little') for v in record))
+        self.gdb.write(self.pad + 20 * self.player, b''.join(v.to_bytes(4, 'little') for v in record))
 
     def wait(self, frames):
         start = self.frame()
@@ -231,6 +239,11 @@ class Session:
             time.sleep(float(words[1]))
         elif op == 'shot':
             return str(self.shot(words[1]))
+        elif op == 'player':
+            n = int(words[1])
+            if not 1 <= n <= 4:
+                raise SystemExit('player 1-4')
+            self.select(n - 1)
         elif op == 'off':
             self.buttons, self.left, self.right, self.triggers = 0, (0, 0), (0, 0), (0, 0)
             self.publish(0)

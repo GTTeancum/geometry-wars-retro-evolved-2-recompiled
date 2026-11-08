@@ -63,9 +63,23 @@ extern "C" void sub_82063F08(PPCContext& ctx, uint8_t* base) {
   sub_820632F0(ctx, base);
   gw_store32(object + 496, 0);
 
-  // The six job threads' frame, one after the other.
+  // The six job threads' frame, one after the other, in job index order
+  // (+4), not the threads' creation order: the first share run takes every
+  // particle bucket, and job 0's buffers are the ones with the large host
+  // mirror (src/particle_buffers.cpp).
+  u32 order[kJobs];
+  int ordered = 0;
+  for (u32 index = 0; index < (u32)kJobs; ++index)
+    for (int i = 0; i < kJobs; ++i)
+      if (gw_load32(g_job_context[i] + 4) == index) {
+        order[ordered++] = g_job_context[i];
+        break;
+      }
+  if (ordered != kJobs) {  // indices not 0..5: the creation order
+    for (int i = 0; i < kJobs; ++i) order[i] = g_job_context[i];
+  }
   for (int i = 0; i < kJobs; ++i) {
-    const u32 job = g_job_context[i];
+    const u32 job = order[i];
     ctx.r3.u64 = gw_load32(job + 8);
     ctx.r4.u64 = job;
     sub_82063A38(ctx, base);

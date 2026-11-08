@@ -274,5 +274,21 @@ native engine that plays the game's sound graphs (src/sound_native.cpp).
 
 ## 8. Housekeeping
 
-- [ ] Saves and profile settings persist only for the session.
-- [ ] Push the `xbox/nxdk-port` branch when ready (nothing pushed yet).
+- [ ] Push `main` when ready (nothing pushed yet; all work is on `main`,
+      no branches).
+
+## 9. Console integration
+
+- [ ] Saving and loading: confirm on the console that saves and profile
+      settings are written and read back after a restart (today they persist
+      only for the session). Give the XBE the 360 game's title ID,
+      `0x584108FF` (the STFS header, the XEX execution info and the XDBF all
+      agree on it; see `docs\package-analysis.md`), so the saves have their
+      own folder on the hard disk. The XBE sets no title ID today (only
+      `XBE_TITLE` in the `Makefile`), so cxbe's default is used.
+- [ ] Dashboard icon: use the 360 game's icon as the XBE's title image (the
+      original Xbox dashboard's game icon). Source: the icon in the XEX's XDBF
+      resource or the package's thumbnail.
+- [ ] Menu items for 360-only features (Xbox LIVE, leaderboards,
+      marketplace and the like): selecting one opens a popup in the game's
+      own style saying NOT IMPLEMENTED, instead of doing nothing or failing.
