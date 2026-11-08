@@ -115,6 +115,8 @@ u32 gw_stack_alloc(u32 size);                // returns the low end
 inline u32 gw_gpu_to_guest(u32 gpu) { return kGuestPhysicalBase + (gpu & 0x1FFFFFFF); }
 inline u32 gw_guest_to_gpu(u32 guest) { return guest & 0x1FFFFFFF; }
 u32 gw_memory_committed();                   // bytes committed by the guest
+void gw_video_set();        // the video mode (src/status.cpp): the highest the console allows
+bool gw_video_letterbox();  // 4:3 at 480 lines: the 16:9 picture letterboxed
 void gw_log_memory(const char* when);        // Xbox kernel memory breakdown
 void gw_dump_allocations();                   // largest guest allocations
 bool gw_census_due();                         // committed memory passed another 4 MB step

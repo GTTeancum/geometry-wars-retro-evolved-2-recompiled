@@ -145,8 +145,13 @@ void decode(Instruction& in, bool fetch, const u32* w) {
   in.predicated = bits(d1, 27, 1);
   in.pred_condition = bits(d1, 28, 1);
   in.vdst = (u8)bits(d0, 0, 6);
-  in.sdst = (u8)bits(d0, 8, 6);
   in.export_data = bits(d0, 15, 1);
+  // An exporting instruction's scalar result goes to the vector destination
+  // too (the scalar destination field is for temporaries only): the line
+  // shaders export their across-the-stroke coordinate as "maxs" with the
+  // vector write mask empty, to o1 by the vector field while the scalar
+  // field says 0; read as o0, the colour written next replaced it.
+  in.sdst = in.export_data ? in.vdst : (u8)bits(d0, 8, 6);
   in.vmask = (u8)bits(d0, 16, 4);
   in.smask = (u8)bits(d0, 20, 4);
   in.vclamp = bits(d0, 24, 1);

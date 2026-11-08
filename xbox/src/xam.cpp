@@ -234,7 +234,20 @@ GW_EXPORT(XMsgInProcessCall) {
 
 // XMsgStartIORequest(app, message, overlapped, buffer, buffer_length)
 GW_EXPORT(XMsgStartIORequest) {
-  gw_log("XMsgStartIORequest(app %08X, message %08X)\n", GW_ARG(3), GW_ARG(4));
+  // Logged once per message kind: the menus send these continuously, and a
+  // line each filled the log.
+  static u32 seen[16];
+  const u32 kind = GW_ARG(3) ^ GW_ARG(4);
+  bool known = false;
+  for (u32 s : seen) known |= s == kind;
+  if (!known) {
+    for (u32& s : seen)
+      if (!s) {
+        s = kind;
+        break;
+      }
+    gw_log("XMsgStartIORequest(app %08X, message %08X) (first of its kind)\n", GW_ARG(3), GW_ARG(4));
+  }
   GW_RETURN(complete(GW_ARG(5), X_ERROR_SUCCESS));
 }
 

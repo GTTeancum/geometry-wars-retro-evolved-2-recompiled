@@ -93,13 +93,21 @@ starfield 2, the rest (the game's own code) about 17.
 
 ## 2. Readable text
 
-- [ ] **Unreadable at 720p (seen on the TV, 2026-11-07).** In the menus at
-      1280x720 the text is thick and smeared (the Single Player screen:
-      "Game mode locked", "Unlock progress", the button prompts): letters run
-      together. It read cleanly at 640x480. Suspects: our own glow over the
-      whole frame (src/nv2a.cpp, apply_glow) blurring and brightening small
-      text; the mipmap / filter choice now that text is drawn at 720p size;
-      the font textures' conversion. Compare with GLOW=n first.
+- [x] **Unreadable at 720p (fixed 2026-11-07).** The HUD and the vector
+      shapes are glowing lines whose pixel shaders (ED8C5D26, 30398AC8,
+      CABF22DB) fade each stroke as (1 - |u|)^4 across it, the outlines also
+      by alpha^6, with colours far brighter than white. The stroke coordinate
+      u was lost (an exporting instruction's scalar result goes to the vector
+      destination; the decoder used the scalar field) and the strokes were
+      drawn flat: solid bars. Now: u reaches the texture coordinate, a
+      64-texel curve stands in for the power, and the combiners scale the
+      colour (sent at 1/16, constant 64) back up before clamping
+      (use_stroke_combiner). 30398AC8's red-from-alpha is still left out.
+      Font textures are now kept pixel for pixel (padded, not resampled) and
+      without made-up mipmaps, as the game has them.
+- [x] **Menus flickering (2026-11-07).** At a screen change the game draws
+      about a quarter of a second without the menu's foreground; those frames
+      are now not shown (the last frame stays up, at most 12 frames).
 
 - [ ] Fonts and UI art were converted at 512x512 at most, halving the
       1024x1024 atlas. Now (not yet seen in XEMU): up to 1024, and textures

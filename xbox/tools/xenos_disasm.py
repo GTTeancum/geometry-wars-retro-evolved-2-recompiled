@@ -107,6 +107,8 @@ def alu(w, shader_type):
     d0, d1, d2 = w
     vdst, sdst = bits(d0, 0, 6), bits(d0, 8, 6)
     export = bits(d0, 15, 1)
+    if export:  # an export's scalar result goes to the vector destination
+        sdst = vdst
     vmask, smask = bits(d0, 16, 4), bits(d0, 20, 4)
     vclamp, sclamp = bits(d0, 24, 1), bits(d0, 25, 1)
     sop = bits(d0, 26, 6)

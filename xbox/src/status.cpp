@@ -81,6 +81,42 @@ DWORD WINAPI status_thread(LPVOID) {
     u32 swaps = gw_stats.swaps;
     fps = (swaps - last_swaps) * 1000 / (now - last_tick ? now - last_tick : 1);
     if (gw_nv2a_active) gw_crtc_pitch();
+    // The display's mode registers, logged when they change: after hours the
+    // console was found scanning 640x480 timing while the game drew 720p
+    // (a black screen on the TV). Memory-mapped (no index port), read only.
+    if (gw_nv2a_active) {
+      static const u32 kRegs[] = {0xFD680800, 0xFD680804, 0xFD680808, 0xFD680820, 0xFD680824,
+                                  0xFD680828, 0xFD680600, 0xFD600804};
+      static u32 seen[sizeof(kRegs) / 4];
+      static bool have = false;
+      bool changed = false;
+      for (u32 i = 0; i < sizeof(kRegs) / 4; ++i) {
+        const u32 v = *(volatile u32*)kRegs[i];
+        if (!have) seen[i] = v;
+        else if (v != seen[i]) {
+          gw_log("display: %08X changed %08X -> %08X at %u s (frame %u)\n", kRegs[i], seen[i], v, seconds,
+                 gw_stats.swaps);
+          changed = true;
+        }
+      }
+      // Changed under the game (the console found scanning 640x480 timing
+      // after hours, the game's 720p frames black on the TV): the mode set
+      // again (at most every 10 s), then the registers read afresh.
+      static u32 last_fix;
+      if (changed && seconds - last_fix >= 10) {
+        last_fix = seconds;
+        gw_video_set();
+        gw_crtc_pitch();
+        for (u32 i = 0; i < sizeof(kRegs) / 4; ++i) seen[i] = *(volatile u32*)kRegs[i];
+      } else if (changed) {
+        for (u32 i = 0; i < sizeof(kRegs) / 4; ++i) seen[i] = *(volatile u32*)kRegs[i];
+      }
+      if (!have) {
+        gw_log("display: FP %08X %08X %08X / %08X %08X %08X, general %08X, crtc config %08X\n", seen[0], seen[1],
+               seen[2], seen[3], seen[4], seen[5], seen[6], seen[7]);
+        have = true;
+      }
+    }
     static u32 last_drawn;
     const u32 drawn = gw_stats.drawn;
     g_drawn_per_second = (drawn - last_drawn) * 1000 / (now - last_tick ? now - last_tick : 1);
@@ -92,6 +128,7 @@ DWORD WINAPI status_thread(LPVOID) {
     if (swaps != last_swaps) stalled_seconds = 0;
     last_swaps = swaps;
     last_tick = now;
+    if (seconds % 300 == 299) gw_log_memory("every 5 minutes");  // (a soak's memory over time)
     if (++seconds % 5 == 0) {
       // ms of CPU per frame for each timed part, at 733 MHz.
       static u64 last_cycles[kPartCount];
@@ -188,28 +225,52 @@ void gw_fatal(const char* fmt, ...) {
   for (;;) Sleep(1000);
 }
 
+// The video mode: the highest the console's video settings allow of 720p,
+// 480p and 480i (16-bit: pbkit sizes its back buffers from this mode, and
+// memory is tight). 1080i is left out: its frame buffers would take about
+// 14 MB more than 720p's. On a 4:3 setting at 480 lines the 16:9 picture
+// is letterboxed (gw_video_letterbox, used by src/nv2a.cpp). make VIDEO=480
+// asks for 640x480 only. Also called again if the display's mode changes
+// under the game (status_thread).
+namespace {
+int g_video_w, g_video_h;
+}  // namespace
+
+bool gw_video_letterbox() { return g_video_h == 480 && !(XVideoGetEncoderSettings() & VIDEO_WIDESCREEN); }
+
+void gw_video_set() {
+  const DWORD settings = XVideoGetEncoderSettings();
+  if (g_video_w) {  // again: the mode chosen at start
+    const bool ok = XVideoSetMode(g_video_w, g_video_h, 16, REFRESH_DEFAULT);
+    gw_log("video: %dx%d set again %s\n", g_video_w, g_video_h, ok ? "" : "(failed)");
+    return;
+  }
+  int modes[3][2];
+  int n = 0;
+#ifndef GW_VIDEO_480
+  if (settings & VIDEO_MODE_720P) modes[n][0] = 1280, modes[n++][1] = 720;
+  if (settings & VIDEO_MODE_480P) modes[n][0] = 720, modes[n++][1] = 480;
+#endif
+  modes[n][0] = 640, modes[n++][1] = 480;
+  gw_log("video: console settings %08X (720p %s, 1080i %s, 480p %s, %s)\n", (u32)settings,
+         settings & VIDEO_MODE_720P ? "on" : "off", settings & VIDEO_MODE_1080I ? "on" : "off",
+         settings & VIDEO_MODE_480P ? "on" : "off", settings & VIDEO_WIDESCREEN ? "widescreen" : "4:3");
+  for (int i = 0; i < n; ++i) {
+    const bool ok = XVideoSetMode(modes[i][0], modes[i][1], 16, REFRESH_DEFAULT);
+    gw_log("video: %dx%d %s\n", modes[i][0], modes[i][1], ok ? "set" : "not available");
+    if (ok) {
+      g_video_w = modes[i][0];
+      g_video_h = modes[i][1];
+      break;
+    }
+  }
+  if (gw_video_letterbox()) gw_log("video: 4:3, the picture letterboxed\n");
+}
+
 void gw_status_init() {
   InitializeCriticalSection(&g_log_lock);
   g_log_ready = true;
-  // 16-bit: pbkit sizes its back buffers from this mode (memory is tight).
-  // make VIDEO=720p asks for 1280x720 (the game's own resolution; needs a
-  // component or HDMI connection with 720p enabled in the console settings)
-  // and falls back to 640x480. It costs about 6 MB more than 640x480: three
-  // 1280x720 colour buffers and pbkit's 32-bit depth buffer.
-  // The first mode the console's video settings allow: 720p (on a console
-  // set to 720p a 640x480 request may not take, and the display then scans
-  // the 640-wide frames at another width), then 480p widescreen, then
-  // 640x480. make VIDEO=480 asks for 640x480 only.
-#ifdef GW_VIDEO_480
-  static const int kModes[][2] = {{640, 480}};
-#else
-  static const int kModes[][2] = {{1280, 720}, {720, 480}, {640, 480}};
-#endif
-  for (const auto& m : kModes) {
-    const bool ok = XVideoSetMode(m[0], m[1], 16, REFRESH_DEFAULT);
-    gw_log("video: %dx%d %s\n", m[0], m[1], ok ? "set" : "not available");
-    if (ok) break;
-  }
+  gw_video_set();
   const VIDEO_MODE mode = XVideoGetMode();
   gw_log("video: in use %dx%d, %d bpp, %d Hz\n", mode.width, mode.height, mode.bpp, mode.refresh);
   CreateThread(nullptr, 0, status_thread, nullptr, 0, nullptr);

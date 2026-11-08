@@ -29,6 +29,7 @@ using xenos::Program;
 using xenos::Source;
 
 enum : u8 { kNone = 0, kTemp = 1, kInput = 2, kConst = 3 };
+constexpr u8 kColourScaleConstant = 64;  // past the shader constants (4..63); see draw_on_gpu
 enum Mac : u8 { MOV = 1, MUL = 2, ADD = 3, MAD = 4, DP3 = 5, DP4 = 7, MIN = 9, MAX = 10, SLT = 11, SGE = 12 };
 enum Ilu : u8 { IMOV = 1, RCP = 2, RCC = 3, RSQ = 4, EXP = 5, LOG = 6 };
 
@@ -462,9 +463,11 @@ const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool div
         return;
       }
       if (d.output == kOutD0 && scale_colour) {
-        // Colours brighter than 1 (the grid's colour field) scaled by
-        // constant 1 before the NV2A clamps them.
-        b.mac(MUL, value, cnst(1, "xyzw"), Op(), d);
+        // Colours brighter than 1 (the grid's colour field, the glowing
+        // lines) scaled by constant 64 before the NV2A clamps them. (Not 1:
+        // constants 1 and 2 hold the sine approximation's coefficients, and
+        // the HUD's vertex shader takes sines.)
+        b.mac(MUL, value, cnst(kColourScaleConstant, "xyzw"), Op(), d);
         return;
       }
       if (d.output == kOutT0) {

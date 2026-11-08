@@ -96,7 +96,8 @@ float g_scale_x, g_scale_y;
 // Viewport scale for the current target: g_scale_x/y for the screen, the
 // colour field's own size for its splats (see the colour field below).
 float g_target_scale_x, g_target_scale_y;
-float g_target_row;  // added to y: the colour field's work area (its splats)
+float g_target_row;  // added to y: the colour field's work area (its splats), or the letterbox's top bar
+float g_screen_row;  // the letterbox's top bar (rows), 0 when the picture fills the screen
 // Our own glow over each frame (on unless make GLOW=n; see apply_glow).
 #ifdef GW_GLOW
 constexpr bool kGlow = true;
@@ -106,6 +107,10 @@ constexpr bool kGlow = false;
 constexpr float kGlowStrength = 0.7f;
 constexpr u32 kGlowProgramSlot = 128;  // nv2a_glow_vs.vs.cg (after the translated programs)
 u32 g_frames;
+// This frame's texture conversions and failures, and vertex arena refills
+// (the flicker detector in gw_nv2a_swap reports them with a frame that lost
+// draws).
+u32 g_frame_conversions, g_frame_conversion_failures, g_frame_arena_refills;
 // The glow's and the colour field's work areas: rows of pbkit's extra
 // buffers (chosen in gw_nv2a_init). 0 the glow's quarter-size picture, 1 its
 // blur, 2-4 the colour field's three regions (each 160x116 at most).
@@ -120,9 +125,25 @@ struct Texture {
   u32* pixels;
   u32 format;
   u32 filter;  // NV097_SET_TEXTURE_FILTER
+  float u_scale = 1, v_scale = 1;  // the image's share of the (padded) texture
+  u32 address = 0x00030303;        // NV097_SET_TEXTURE_ADDRESS (clamp)
+  u32 last_used = 0;               // the frame it was last drawn with (g_frames)
+  u32 bytes = 0;
+  bool source_released = false;    // the 360 original's memory given back: never evicted (it could
+                                   // not be converted again: the original reads as zeros now)
 };
 Texture g_textures[32];
 Texture g_white;
+// The glowing lines' (and the vector font's) brightness across a stroke: the
+// game's pixel shaders (ED8C5D26 and 30398AC8 for the lines, CABF22DB for
+// their glow outlines) multiply the colour by (1 - |u|)^4, u running -1..1 across the
+// stroke, so a stroke is a thin bright core fading to nothing at its edges.
+// The NV2A's combiners cannot raise to a power per pixel, so the curve is a
+// 64-texel texture read with u: coordinate u / 2, wrapping (texel s holds
+// u = 2s for s < 1/2, 2s - 2 above), through the texture-times-colour
+// combiner. Drawn flat (no curve) the strokes were solid bars.
+Texture g_falloff;
+constexpr u32 kFalloffSize = 64;
 
 u32 swizzle_offset(u32 x, u32 y, u32 w, u32 h) {
   u32 out = 0, dest = 1;
@@ -174,11 +195,34 @@ u32 nv_format(u32 w, u32 h, u32 colour = NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G
          (log2_ceil(w) << 20) | (log2_ceil(h) << 24);
 }
 
-// Converts a k_8_8_8_8 texture to an NV2A texture, cached by address: sides
-// rounded to powers of two (down where up would grow them by over half), at
-// most 1024. Grey ones (the fonts) as swizzled A8Y8, exact; other colour
-// ones up to 256x256 as swizzled A8R8G8B8, larger ones (title art) as DXT5,
-// which keeps their full resolution in a quarter of the memory.
+// Converts a k_8_8_8_8 texture to an NV2A texture, cached by address. The
+// image is kept at its own size, pixel for pixel: padded out to powers of
+// two (its edge pixels repeated) with the draw's texture coordinates scaled
+// to the image's share (u_scale, v_scale), not resampled (resampling to a
+// power of two dropped and doubled rows and columns of the fonts: uneven,
+// misshapen letters). Sides over 2048 are scaled down. Mip levels only as
+// the game has them (none of its textures do: the 360 samples them at full
+// detail; made-up mipmaps with trilinear filtering washed thin strokes out).
+// Grey ones (the fonts) as swizzled A8Y8, exact; other colour ones up to
+// 256x256 as swizzled A8R8G8B8, larger ones (title art) as DXT5, which keeps
+// their full resolution in a quarter of the memory.
+// Frees the converted texture drawn with longest ago (not this frame, and
+// not one whose original is gone); false if there is none. For a conversion
+// that found no slot or no memory: the draw goes ahead instead of being
+// skipped for the frame.
+bool evict_oldest_texture() {
+  Texture* oldest = nullptr;
+  for (Texture& t : g_textures) {
+    if (!t.pixels || t.source_released || t.last_used == g_frames) continue;
+    if (!oldest || t.last_used < oldest->last_used) oldest = &t;
+  }
+  if (!oldest) return false;
+  gw_log("nv2a: texture %08X given back (%u KiB) to make room\n", oldest->key, oldest->bytes / 1024);
+  MmFreeContiguousMemory(oldest->pixels);
+  oldest->pixels = nullptr;
+  return true;
+}
+
 Texture* texture_from_fetch(const u32* f) {
   u32 format = f[1] & 0x3F;
   // 6: k_8_8_8_8; 2: k_8 (one byte, e.g. the grid colour field's light spot).
@@ -202,23 +246,33 @@ Texture* texture_from_fetch(const u32* f) {
   u32 width = (f[2] & 0x1FFF) + 1, height = ((f[2] >> 13) & 0x1FFF) + 1;
   u32 key = base ^ (width << 1) ^ (height << 17) ^ (format << 26);
   for (Texture& t : g_textures) {
-    if (t.pixels && t.key == key) return &t;
-  }
-  Texture* slot = nullptr;
-  for (Texture& t : g_textures) {
-    if (!t.pixels) {
-      slot = &t;
-      break;
+    if (t.pixels && t.key == key) {
+      t.last_used = g_frames;
+      return &t;
     }
   }
-  if (!slot) return nullptr;
+  Texture* slot = nullptr;
+  for (int attempt = 0; attempt < 2 && !slot; ++attempt) {
+    for (Texture& t : g_textures) {
+      if (!t.pixels) {
+        slot = &t;
+        break;
+      }
+    }
+    if (!slot && !evict_oldest_texture()) break;
+  }
+  if (!slot) {
+    ++g_frame_conversion_failures;
+    static u32 told = 0;
+    if (told++ < 8) gw_log("nv2a: texture %08X %ux%u not converted: all %u slots in use\n", base, width, height,
+                           (u32)(sizeof(g_textures) / sizeof(g_textures[0])));
+    return nullptr;
+  }
   u32 tw = 1u << log2_ceil(width), th = 1u << log2_ceil(height);
-  // Round a side down instead when rounding up would grow it by over half
-  // (300 -> 256, not 512): converted textures are a large share of memory.
-  if (tw > width + width / 2) tw >>= 1;
-  if (th > height + height / 2) th >>= 1;
-  if (tw > 1024) tw = 1024;
-  if (th > 1024) th = 1024;
+  if (tw > 2048) tw = 2048;
+  if (th > 2048) th = 2048;
+  const bool scale_x = tw < width, scale_y = th < height;  // (only past 2048)
+  const u32 guest_mips = (f[4] >> 6) & 15;  // the game's own mip levels beyond the first
   bool tiled = f[0] >> 31;
   u32 pitch = ((f[0] >> 22) & 0x1FF) * 32;
   u32 endian = (f[1] >> 6) & 3;
@@ -230,7 +284,9 @@ Texture* texture_from_fetch(const u32* f) {
   const u32 swizzle = (f[3] >> 1) & 0xFFF;
   const u32 byte_flip = endian == 1 ? 1 : endian == 2 ? 3 : endian == 3 ? 2 : 0;
   auto texel = [&](u32 x, u32 y) {
-    const u32 sx = x * width / tw, sy = y * height / th;
+    // Pixel for pixel; the padding repeats the last column and row.
+    const u32 sx = scale_x ? x * width / tw : x < width ? x : width - 1;
+    const u32 sy = scale_y ? y * height / th : y < height ? y : height - 1;
     if (format == 2) {
       const u32 offset = tiled ? tiled_column(sx, sy, 0, tiled_row(sy, pitch, 0)) : sy * pitch + sx;
       const u32 v = src[offset ^ byte_flip];
@@ -268,12 +324,23 @@ Texture* texture_from_fetch(const u32* f) {
   u32 levels = 1, bytes = 0;
   for (u32 w = tw, h = th;; w >>= 1, h >>= 1) {
     bytes += compressed ? w * h : grey ? w * h * 2 : w * h * 4;
-    if (w / 2 < smallest || h / 2 < smallest || levels == 10) break;
+    if (levels > guest_mips || w / 2 < smallest || h / 2 < smallest || levels == 10) break;
     ++levels;
   }
   bytes = (bytes + 3) & ~3u;
   u32* pixels = (u32*)MmAllocateContiguousMemoryEx(bytes, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
-  if (!pixels) return nullptr;
+  while (!pixels && evict_oldest_texture())
+    pixels = (u32*)MmAllocateContiguousMemoryEx(bytes, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
+  if (!pixels) {
+    ++g_frame_conversion_failures;
+    static u32 told = 0;
+    if (told++ < 8) {
+      gw_log("nv2a: texture %08X %ux%u not converted: no memory for %u KiB in one piece\n", base, width, height,
+             bytes / 1024);
+      gw_log_memory("texture conversion failed");
+    }
+    return nullptr;
+  }
   // Writes one level (w x h) from get(x, y) at 'out'; returns the bytes used.
   auto write_level = [&](u8* out, u32 w, u32 h, auto&& get) {
     if (compressed) {
@@ -345,12 +412,18 @@ Texture* texture_from_fetch(const u32* f) {
   }
   slot->key = key;
   slot->pixels = pixels;
+  slot->last_used = g_frames;
+  slot->bytes = bytes;
+  slot->source_released = false;
+  ++g_frame_conversions;
   slot->format = nv_format(tw, th,
                            compressed ? NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8
                            : grey     ? NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8Y8
                                       : NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8,
                            levels);
   slot->filter = levels > 1 ? 0x02062000 : 0x02022000;  // trilinear with mipmaps, else bilinear
+  slot->u_scale = scale_x ? 1.0f : (float)width / (float)tw;
+  slot->v_scale = scale_y ? 1.0f : (float)height / (float)th;
   gw_log("nv2a: texture %08X %ux%u%s -> %ux%u%s, %u levels\n", base, width, height, tiled ? " tiled" : "", tw, th,
          compressed ? " DXT5" : grey ? " grey" : "", levels);
   // Large images (the title screens) are only read by the GPU: once
@@ -359,6 +432,7 @@ Texture* texture_from_fetch(const u32* f) {
   u32 guest = gw_gpu_to_guest(base);
   if (gw_allocation_base(guest) == guest && gw_virtual_size(guest) >= 0x40000) {
     gw_virtual_decommit(guest, gw_virtual_size(guest));
+    slot->source_released = true;
   }
   return slot;
 }
@@ -379,7 +453,14 @@ void begin_frame() {
   blk_flush();
   gw_nv2a_stage = 1;
   const u64 start = gw_wait_begin();
-  pb_reset();  // waits for the GPU to finish the previous frame
+  // The GPU done with the previous frame before its vertex arena is written
+  // again: pb_reset only waits until the GPU has read the commands, and the
+  // previous frame's last draws (the menus' foreground, on the screens that
+  // fill the arena) could still be reading their vertices when this frame's
+  // first draws overwrote them (single frames without the foreground).
+  pb_reset();
+  while (pb_busy()) {
+  }
   gw_wait_end(start, 0, "renderer: GPU finishing the previous frame");
   gw_nv2a_stage = 2;
   blk_flush();
@@ -403,7 +484,7 @@ void begin_frame() {
 void bind_texture(const Texture* t) {
   u32* p = blk_begin();
   p = pb_push2(p, NV097_SET_TEXTURE_OFFSET, (u32)t->pixels & 0x03FFFFFF, t->format);
-  p = pb_push1(p, NV097_SET_TEXTURE_ADDRESS, 0x00030303);  // clamp
+  p = pb_push1(p, NV097_SET_TEXTURE_ADDRESS, t->address);
   p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0, 0x4003FFC0);
   p = pb_push1(p, NV097_SET_TEXTURE_FILTER, t->filter);
   blk_end(p);
@@ -533,11 +614,35 @@ void gw_nv2a_init() {
   for (int i = 0; i < 4; ++i) g_white.pixels[i] = 0xFFFFFFFF;
   g_white.format = nv_format(2, 2);
   g_white.filter = 0x02022000;
+  g_falloff.pixels = (u32*)MmAllocateContiguousMemoryEx(kFalloffSize * 4 * 4, 0, 0x03FFAFFF, 0,
+                                                         PAGE_READWRITE | PAGE_WRITECOMBINE);
+  if (g_falloff.pixels) {
+    for (u32 i = 0; i < kFalloffSize; ++i) {
+      const float sc = ((float)i + 0.5f) / (float)kFalloffSize;
+      const float u = sc < 0.5f ? 2 * sc : 2 * sc - 2;
+      const float f = 1 - (u < 0 ? -u : u);
+      const u32 b = (u32)(f * f * f * f * 255.0f + 0.5f);
+      for (u32 y = 0; y < 4; ++y) g_falloff.pixels[swizzle_offset(i, y, kFalloffSize, 4)] = b << 24 | b << 16 | b << 8 | b;
+    }
+    g_falloff.format = nv_format(kFalloffSize, 4);
+    g_falloff.filter = 0x02022000;  // bilinear
+    g_falloff.address = 0x00030301;  // wrap across, clamp along
+    g_falloff.u_scale = 0.5f;
+    g_falloff.v_scale = 0.0f;
+  }
 
+  // The game's 1280x720 picture over the screen; on a 4:3 setting at 480
+  // lines letterboxed: the full width, three quarters of the height, centred
+  // (the bars are left black: each frame starts cleared).
   g_scale_x = (float)pb_back_buffer_width() / 1280.0f;
   g_scale_y = (float)pb_back_buffer_height() / 720.0f;
+  if (gw_video_letterbox()) {
+    g_scale_y *= 0.75f;
+    g_screen_row = (float)pb_back_buffer_height() / 8;
+  }
   g_target_scale_x = g_scale_x;
   g_target_scale_y = g_scale_y;
+  g_target_row = g_screen_row;
   blk_flush();
   pb_show_front_screen();
   g_ready = true;
@@ -550,11 +655,30 @@ namespace {
 // Per-frame census of vertex shaders (logged every 300 frames) to find the
 // draws that make up whatever screen is showing.
 struct CensusEntry {
-  u32 hash, draws, prim, vertices, gpu, cpu;  // gpu/cpu: vertices drawn by each path
+  u32 hash, ps, draws, prim, vertices, gpu, cpu;  // gpu/cpu: vertices drawn by each path
+  u32 strokes;  // draws given the line falloff (g_falloff)
+  u32 drawn;    // draws that reached the NV2A
   u32 skip;  // why the last skipped draw was skipped (SkipReason), with its detail
   u32 skip_detail;
 };
 CensusEntry g_census[32];
+CensusEntry g_census_last[32];  // the previous drawn frame's (the flicker detector)
+// The order of this frame's draws that reached the NV2A, each kind (vertex
+// and pixel shader) at its first draw, and the previous frame's: a kind that
+// moved (a black menu panel after the menu's text) would hide what it now
+// covers for that frame.
+constexpr u32 kOrderMax = 24;
+u32 g_order[kOrderMax][2], g_order_last[kOrderMax][2];
+u32 g_order_count, g_order_last_count;
+void note_order(u32 vs, u32 ps) {
+  for (u32 i = 0; i < g_order_count; ++i)
+    if (g_order[i][0] == vs && g_order[i][1] == ps) return;
+  if (g_order_count < kOrderMax) {
+    g_order[g_order_count][0] = vs;
+    g_order[g_order_count][1] = ps;
+    ++g_order_count;
+  }
+}
 CensusEntry* g_census_entry;
 
 enum SkipReason : u32 { kDrawn, kNotMainTarget, kPrimitive, kComputedUv, kTextureFormat };
@@ -629,9 +753,13 @@ u32 float_bits(float f) {
 }
 
 // Room for 'bytes' more in the vertex arena. When a busy frame fills it, the
-// GPU finishes what it has been given (pb_reset waits for that; render state
-// carries over) and the arena starts again from the beginning: one stall
-// instead of dropping draws or falling back to the CPU interpreter.
+// GPU finishes what it has been given and the arena starts again from the
+// beginning: one stall instead of dropping draws or falling back to the CPU
+// interpreter. pb_reset only waits until the GPU has read the commands, not
+// until it has drawn them: the draws still in its queue read their vertices
+// from the arena, so it also waits for the GPU to be idle before the arena is
+// written again (without, the menus, the screens that fill it, lost their
+// foreground for single frames).
 bool arena_room(u32 bytes) {
   if (g_arena_used + bytes <= kArenaBytes) return true;
   if (bytes > kArenaBytes) return false;
@@ -640,6 +768,9 @@ bool arena_room(u32 bytes) {
   blk_flush();
   const u64 start = gw_wait_begin();
   pb_reset();
+  while (pb_busy()) {
+  }
+  ++g_frame_arena_refills;
   gw_wait_end(start, 0, "renderer: vertex arena full mid-frame");
   g_arena_used = 0;
   return true;
@@ -684,7 +815,7 @@ void rect_to_quad(const u32* v[3], const XvpProgram* gp, u32* out) {
 // that use it (xvp_get's line_i and scale_colour).
 bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, u32 count, u32 source,
                  u32 index_base, u32 index_endian, bool index32, u32 vte, bool rects = false, float tex_w = 1,
-                 float tex_h = 1, const float* constant1 = nullptr) {
+                 float tex_h = 1, const float* constant1 = nullptr, const float* colour_scale = nullptr) {
   if (rects && (count % 3 || !gp->attr_count || gp->stride > 64)) return false;
   const u32 out_count = rects ? count / 3 * 4 : count;
   u32 bytes = out_count * gp->stride;
@@ -715,7 +846,10 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
   memcpy(c, kFixed, sizeof(kFixed));
   c[2] = float_bits(tex_w);
   c[3] = float_bits(tex_h);
-  if (constant1) memcpy(&c[4], constant1, 16);  // in place of the sine constants
+  // constant1: the grid lines' constants, in place of the sine constants
+  // (their shader takes no sines); colour_scale: constant 64, the colour
+  // scale of the colour field's splats and the glowing lines.
+  if (constant1) memcpy(&c[4], constant1, 16);
   float vx_scale = as_float(regs[0x210F]), vx_off = as_float(regs[0x2110]);
   float vy_scale = as_float(regs[0x2111]), vy_off = as_float(regs[0x2112]);
   c[12] = float_bits((vte & 1 ? vx_scale : 1.0f) * g_target_scale_x);
@@ -724,6 +858,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
   c[15] = float_bits((vte & 8 ? vy_off : 0.0f) * g_target_scale_y + g_target_row);
   for (u32 i = 0; i < gp->const_count; ++i) memcpy(&c[(4 + i) * 4], &regs[0x4000 + gp->const_xenos[i] * 4], 16);
   upload_constants(0, c, 4 + gp->const_count);
+  if (colour_scale) upload_constants(64, (const u32*)colour_scale, 1);
 
   u32 f0 = regs[0x4800 + gp->fetch_slot * 2], f1 = regs[0x4800 + gp->fetch_slot * 2 + 1];
   u32 stream = gw_gpu_to_guest(f0 & ~3u), endian = f1 & 3;
@@ -954,7 +1089,7 @@ void use_sum_combiner() {
 }
 
 // Which combiner setup is loaded, so draws switch only when it changes.
-enum Combiner { kTextureTimesColour, kGridLine, kOther };
+enum Combiner { kTextureTimesColour, kGridLine, kStrokeCore, kStrokeGlow, kOther };
 Combiner g_combiner = kTextureTimesColour;
 
 void use_default_combiner() {
@@ -1066,6 +1201,74 @@ void use_line_combiner() {
                    MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_ALPHA, 1));
   blk_end(p);
   g_combiner = kGridLine;
+}
+
+// The glowing lines' pixel shaders (ED8C5D26, 30398AC8 the lines, CABF22DB
+// their glow outlines):
+//   colour = C * (1 - |u|)^4             (the lines)
+//   colour = C * (1 - |u|)^4 * a^6       (the outlines: a runs from 1 at the
+//                                         line to 0 at the outline's edge)
+// with C brighter than 1 (the sparks are 18 times white): on the 360 the
+// line stays at full brightness over half its width before fading. The
+// NV2A clamps vertex colours to 1, so the vertex program sends C / 16
+// (kStrokeConstant1) and the combiners scale back up before clamping:
+//   stage 0: spare1.rgb = 4 * t0 * diffuse  (t0 the curve, g_falloff)    spare0.a = a * a
+//   stage 1: spare1.rgb = 4 * spare1         = min(1, C * curve)          spare1.a = spare0.a ^ 2 = a^4
+//   stage 2:                                                              spare0.a = spare1.a * spare0.a = a^6
+//                                                                         (1 for the lines)
+//   stage 3: spare0.rgb = spare1.rgb * spare0.a
+// The lines' 30398AC8 also replaces red with a function of alpha; left out.
+const float kStrokeConstant1[4] = {1.0f / 16, 1.0f / 16, 1.0f / 16, 1};
+
+void use_stroke_combiner(bool glow) {
+  const Combiner want = glow ? kStrokeGlow : kStrokeCore;
+  if (g_combiner == want) return;
+  constexpr u32 kZero = 0, kDiffuse = 4, kTexture0 = 8, kSpare0 = 0xC, kSpare1 = 0xD, kInvert = 1;
+  auto alpha_in = [](u32 a, u32 a_map, u32 b, u32 b_map) {
+    return MASK(NV097_SET_COMBINER_ALPHA_ICW_A_SOURCE, a) | MASK(NV097_SET_COMBINER_ALPHA_ICW_A_ALPHA, 1) |
+           MASK(NV097_SET_COMBINER_ALPHA_ICW_A_MAP, a_map) | MASK(NV097_SET_COMBINER_ALPHA_ICW_B_SOURCE, b) |
+           MASK(NV097_SET_COMBINER_ALPHA_ICW_B_ALPHA, 1) | MASK(NV097_SET_COMBINER_ALPHA_ICW_B_MAP, b_map);
+  };
+  auto alpha_out = [](u32 ab) { return MASK(NV097_SET_COMBINER_ALPHA_OCW_AB_DST, ab); };
+  auto colour_in = [](u32 a, u32 a_map, u32 b, u32 b_map, bool b_alpha) {
+    return MASK(NV097_SET_COMBINER_COLOR_ICW_A_SOURCE, a) | MASK(NV097_SET_COMBINER_COLOR_ICW_A_MAP, a_map) |
+           MASK(NV097_SET_COMBINER_COLOR_ICW_B_SOURCE, b) | MASK(NV097_SET_COMBINER_COLOR_ICW_B_MAP, b_map) |
+           MASK(NV097_SET_COMBINER_COLOR_ICW_B_ALPHA, b_alpha ? 1 : 0);
+  };
+  const u32 times4_spare1 = MASK(NV097_SET_COMBINER_COLOR_OCW_AB_DST, kSpare1) |
+                            MASK(NV097_SET_COMBINER_COLOR_OCW_OP, NV097_SET_COMBINER_COLOR_OCW_OP_SHIFTLEFTBY2);
+  const u32 stages[4][4] = {
+      {colour_in(kTexture0, 0, kDiffuse, 0, false), times4_spare1, alpha_in(kDiffuse, 0, kDiffuse, 0),
+       alpha_out(kSpare0)},
+      {colour_in(kSpare1, 0, kZero, kInvert, false), times4_spare1, alpha_in(kSpare0, 0, kSpare0, 0),
+       alpha_out(kSpare1)},
+      // a^6 for the outlines; 1 (zero inverted) for the lines
+      {0, 0, glow ? alpha_in(kSpare1, 0, kSpare0, 0) : alpha_in(kZero, kInvert, kZero, kInvert), alpha_out(kSpare0)},
+      {colour_in(kSpare1, 0, kSpare0, 0, true), MASK(NV097_SET_COMBINER_COLOR_OCW_AB_DST, kSpare0), 0, 0},
+  };
+  u32* p = blk_begin();
+  p = pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT, 0);
+  p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM,
+               MASK(NV097_SET_SHADER_STAGE_PROGRAM_STAGE0, NV097_SET_SHADER_STAGE_PROGRAM_STAGE0_2D_PROJECTIVE));
+  blk_end(p);
+  for (u32 stage = 0; stage < 4; ++stage) {
+    p = blk_begin();
+    p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW + stage * 4, stages[stage][0]);
+    p = pb_push1(p, NV097_SET_COMBINER_COLOR_OCW + stage * 4, stages[stage][1]);
+    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW + stage * 4, stages[stage][2]);
+    p = pb_push1(p, NV097_SET_COMBINER_ALPHA_OCW + stage * 4, stages[stage][3]);
+    blk_end(p);
+  }
+  p = blk_begin();
+  p = pb_push1(p, NV097_SET_COMBINER_CONTROL,
+               MASK(NV097_SET_COMBINER_CONTROL_ITERATION_COUNT, 4) |
+                   MASK(NV097_SET_COMBINER_CONTROL_MUX_SELECT, NV097_SET_COMBINER_CONTROL_MUX_SELECT_MSB));
+  p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW0, MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW0_D_SOURCE, kSpare0));
+  p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW1,
+               MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_SOURCE, kSpare0) |
+                   MASK(NV097_SET_COMBINER_SPECULAR_FOG_CW1_G_ALPHA, 1));
+  blk_end(p);
+  g_combiner = want;
 }
 
 // One screen-aligned quad from (x0, y0) to (x1, y1); unit k's texture
@@ -1231,7 +1434,7 @@ void field_end() {
   g_field_open = false;
   g_target_scale_x = g_scale_x;
   g_target_scale_y = g_scale_y;
-  g_target_row = 0;
+  g_target_row = g_screen_row;
   field_pass_state(true);
   // Each level a bilinear sample between 2x2 texels of the one before.
   const FieldTap l1 = {0, 0, 0, 74, 50, 1};
@@ -1325,8 +1528,9 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   u32 prim = initiator & 0x3F, source = (initiator >> 6) & 3, count = initiator >> 16;
   g_census_entry = nullptr;
   for (CensusEntry& e : g_census) {
-    if (!e.hash || e.hash == vs_hash) {
+    if (!e.hash || (e.hash == vs_hash && e.ps == ps_hash)) {
       e.hash = vs_hash;
+      e.ps = ps_hash;
       ++e.draws;
       e.prim = prim;
       e.vertices += count;
@@ -1384,7 +1588,15 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   int uv_i = -1, tex_const = 0;
   xps_info(ps_hash, &uv_i, &tex_const);
   const Texture* texture = &g_white;
-  if (prim != 1 && !grid_lines) {
+  // The glowing lines and the vector font: u (interpolator 1) through the
+  // falloff curve (see g_falloff).
+  const bool stroke =
+      (ps_hash == 0xED8C5D26 || ps_hash == 0xCABF22DB || ps_hash == 0x30398AC8) && g_falloff.pixels;
+  if (stroke) {
+    uv_i = 1;
+    texture = &g_falloff;
+    if (g_census_entry) ++g_census_entry->strokes;
+  } else if (prim != 1 && !grid_lines) {
     // A draw whose texture can't be reproduced yet (render targets, float
     // formats, computed coordinates) is skipped: many use replace blending
     // and would paint flat shapes over the scene.
@@ -1406,6 +1618,9 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   if (grid_lines) {
     bind_linear(0, work_pixels(4), kFieldW, kFieldH, pb_back_buffer_pitch());  // the colour field
     use_line_combiner();
+  } else if (stroke) {
+    bind_texture(texture);
+    use_stroke_combiner(ps_hash == 0xCABF22DB);
   } else {
     bind_texture(texture);
     use_default_combiner();
@@ -1427,7 +1642,7 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
   // whole quads, triangles, lines and rectangles); the grid's lines are a
   // 65528-vertex draw.
   if (g_use_gpu_vertex) {
-    const XvpProgram* gp = xvp_get(vs, uv_i, color_i, !(vte & 0x100), grid_lines ? 0 : -1, field_splat);
+    const XvpProgram* gp = xvp_get(vs, uv_i, color_i, !(vte & 0x100), grid_lines ? 0 : -1, field_splat || stroke);
     // The particles' splats are only in the glow buffers' mirrors
     // (src/particle_native.cpp): a splat draw reaching past its mirror draws
     // the mirrored part.
@@ -1443,11 +1658,16 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
       for (u32 first = 0; first < count && drawn; first += piece) {
         const u32 n = count - first < piece ? count - first : piece;
         drawn = draw_on_gpu(gp, regs, nv_prim, first, n, source, index_base, index_endian, index32, vte, false,
-                            grid_lines ? (float)kFieldW : 1, grid_lines ? (float)kFieldH : 1,
-                            grid_lines ? kLineConstant1 : field_splat ? kSplatConstant1 : nullptr);
+                            grid_lines ? (float)kFieldW : texture->u_scale, grid_lines ? (float)kFieldH : texture->v_scale,
+                            grid_lines ? kLineConstant1 : nullptr,
+                            field_splat ? kSplatConstant1 : stroke ? kStrokeConstant1 : nullptr);
       }
       if (drawn) {
-        if (g_census_entry) g_census_entry->gpu += count;
+        if (g_census_entry) {
+          g_census_entry->gpu += count;
+          ++g_census_entry->drawn;
+        }
+        note_order(vs_hash, ps_hash);
         return;
       }
     }
@@ -1463,7 +1683,11 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     }
     return;
   }
-  if (g_census_entry) g_census_entry->cpu += count;
+  if (g_census_entry) {
+    g_census_entry->cpu += count;
+    ++g_census_entry->drawn;
+  }
+  note_order(vs_hash, ps_hash);
   set_program_start(0);
   u32* out = (u32*)(g_arena + g_arena_used);
   for (u32 i = 0; i < count; ++i) {
@@ -1493,9 +1717,11 @@ void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_h
     if (vte & 2) x += vx_off;
     if (vte & 4) y *= vy_scale;
     if (vte & 8) y += vy_off;
-    float sx = x * g_scale_x, sy = y * g_scale_y;
-    const float* c = interp[color_i];
-    float u = uv_i >= 0 ? interp[uv_i][0] : 0, t = uv_i >= 0 ? interp[uv_i][1] : 0;
+    float sx = x * g_scale_x, sy = y * g_scale_y + g_screen_row;
+    float c[4] = {interp[color_i][0], interp[color_i][1], interp[color_i][2], interp[color_i][3]};
+    if (stroke)
+      for (int k = 0; k < 3; ++k) c[k] *= kStrokeConstant1[k];
+    float u = uv_i >= 0 ? interp[uv_i][0] * texture->u_scale : 0, t = uv_i >= 0 ? interp[uv_i][1] * texture->v_scale : 0;
     // Packed vertex: x, y, D3DCOLOR, u, v.
     memcpy(&out[0], &sx, 4);
     memcpy(&out[1], &sy, 4);
@@ -1565,17 +1791,111 @@ void gw_nv2a_swap() {
   // render, src/render_native.cpp): the frame on screen stays.
   if (!g_in_frame) return;
   ++g_frames;
+  // Converted textures not drawn with for 10 s (300 drawn frames) give their
+  // memory back: the menus' large images (title art, a 1280x720 one, the
+  // fonts) were held all through play, and with them the console had well
+  // under 1 MB to spare in a level. One coming back is converted again. The
+  // GPU finished with it long ago.
+  if (g_frames % 30 == 0) {
+    for (Texture& t : g_textures) {
+      if (!t.pixels || t.source_released || g_frames - t.last_used < 300) continue;
+      gw_log("nv2a: texture %08X unused for 10 s, %u KiB given back\n", t.key, t.bytes / 1024);
+      MmFreeContiguousMemory(t.pixels);
+      t.pixels = nullptr;
+    }
+  }
   ++gw_stats.drawn;
   if (g_frames % 300 == 0) {
     gw_log("nv2a: frame %u vertex shaders:\n", g_frames);
     for (const CensusEntry& e : g_census) {
       if (e.hash) {
-        gw_log("  %08X: %u draws, prim %u, %u vertices (%u on the GPU, %u on the CPU)%s%s %X\n", e.hash, e.draws,
-               e.prim, e.vertices, e.gpu, e.cpu, e.skip ? "; skipped: " : "", kSkipNames[e.skip],
-               e.skip_detail);
+        gw_log("  %08X ps %08X: %u draws (%u as strokes), prim %u, %u vertices (%u on the GPU, %u on the CPU)%s%s %X\n",
+               e.hash, e.ps, e.draws, e.strokes, e.prim, e.vertices, e.gpu, e.cpu, e.skip ? "; skipped: " : "",
+               kSkipNames[e.skip], e.skip_detail);
       }
     }
   }
+  // Flicker detector: a drawn frame with far fewer draws reaching the NV2A
+  // than the one before (the menus lost their foreground for single frames)
+  // is logged with what changed: each kind of draw's count now and before,
+  // why any were skipped, and this frame's texture conversions (and
+  // failures) and vertex arena refills.
+  // A frame missing most of the last shown frame's draws is not shown: at a
+  // screen change the menus draw about a quarter of a second of frames
+  // without their foreground (seen on the console: 7 drawn frames), a
+  // visible flicker. The last frame stays up instead, for up to kMaxHeld
+  // frames; a drop that lasts longer is a real change and is shown. (Drawing
+  // every update meanwhile made the game's gap longer: it is not done.)
+  bool skip_frame = false;
+  {
+    // Up to kMaxHeld frames in a row; a drop that lasts longer is a real
+    // change of screen and is shown.
+    constexpr u32 kMaxHeld = 12;
+    static u32 held = 0, low_run = 0;
+    u32 now = 0, before = 0;
+    for (const CensusEntry& e : g_census) now += e.drawn;
+    for (const CensusEntry& e : g_census_last) before += e.drawn;
+    const bool low = before >= 12 && now * 2 < before;
+    skip_frame = low && held < kMaxHeld;
+    held = skip_frame ? held + 1 : 0;
+    static u32 told = 0, told_runs = 0;
+    if (low) {
+      ++low_run;
+    } else if (low_run) {
+      if (told_runs++ < 20) gw_log("nv2a: frame %u: the foreground back after %u frames without\n", g_frames, low_run);
+      low_run = 0;
+    }
+    if (skip_frame && told < 20) {
+      ++told;
+      gw_log("nv2a: frame %u not shown (%u draws, the last one shown %u)\n",
+             g_frames, now, before);
+    }
+    if (before >= 12 && now * 10 < before * 7 && told < 40) {
+      ++told;
+      gw_log("nv2a: frame %u drew %u draws, the one before %u (textures converted %u, failed %u; arena refills %u)\n",
+             g_frames, now, before, g_frame_conversions, g_frame_conversion_failures, g_frame_arena_refills);
+      for (const CensusEntry& e : g_census_last) {
+        if (!e.hash || !e.drawn) continue;
+        const CensusEntry* c = nullptr;
+        for (const CensusEntry& n : g_census)
+          if (n.hash == e.hash && n.ps == e.ps) c = &n;
+        const u32 drawn_now = c ? c->drawn : 0;
+        if (drawn_now >= e.drawn) continue;
+        gw_log("  %08X ps %08X: drawn %u -> %u (issued now %u)%s%s %X\n", e.hash, e.ps, e.drawn, drawn_now,
+               c ? c->draws : 0, c && c->skip ? "; skipped: " : "", c ? kSkipNames[c->skip] : "",
+               c ? c->skip_detail : 0);
+      }
+    }
+  }
+  // Order check: the kinds both frames drew, in each frame's order; logged
+  // when the sequence differs (a black panel moving after the text, say).
+  {
+    u32 a[kOrderMax], b[kOrderMax], na = 0, nb = 0;
+    auto in = [](u32 (*list)[2], u32 n, u32 vs, u32 ps) {
+      for (u32 i = 0; i < n; ++i)
+        if (list[i][0] == vs && list[i][1] == ps) return true;
+      return false;
+    };
+    for (u32 i = 0; i < g_order_count; ++i)
+      if (in(g_order_last, g_order_last_count, g_order[i][0], g_order[i][1])) a[na++] = i;
+    for (u32 i = 0; i < g_order_last_count; ++i)
+      if (in(g_order, g_order_count, g_order_last[i][0], g_order_last[i][1])) b[nb++] = i;
+    bool moved = false;
+    for (u32 k = 0; k < na && k < nb; ++k)
+      moved |= g_order[a[k]][0] != g_order_last[b[k]][0] || g_order[a[k]][1] != g_order_last[b[k]][1];
+    static u32 told = 0;
+    if (moved && told < 20) {
+      ++told;
+      gw_log("nv2a: frame %u drew its kinds of draw in another order than the frame before:\n", g_frames);
+      for (u32 i = 0; i < g_order_last_count; ++i) gw_log("  before %u: %08X ps %08X\n", i, g_order_last[i][0], g_order_last[i][1]);
+      for (u32 i = 0; i < g_order_count; ++i) gw_log("  now    %u: %08X ps %08X\n", i, g_order[i][0], g_order[i][1]);
+    }
+    memcpy(g_order_last, g_order, sizeof(g_order));
+    g_order_last_count = g_order_count;
+    g_order_count = 0;
+  }
+  if (!skip_frame) memcpy(g_census_last, g_census, sizeof(g_census));
+  g_frame_conversions = g_frame_conversion_failures = g_frame_arena_refills = 0;
   memset(g_census, 0, sizeof(g_census));
   if (gw_census_due()) {
     gw_log_memory("census");
@@ -1597,6 +1917,11 @@ void gw_nv2a_swap() {
   // is only reused once the GPU is done with it. Here the flip is queued,
   // which only waits while all three buffers are still on their way to the
   // screen. Bounded: a stuck NV2A is reported instead of freezing the game.
+  if (skip_frame) {
+    gw_nv2a_stage = 0;
+    g_in_frame = false;
+    return;
+  }
   gw_nv2a_stage = 4;
   const u64 queued = gw_wait_begin();
   DWORD start = GetTickCount();
