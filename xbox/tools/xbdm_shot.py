@@ -71,9 +71,40 @@ def pbkit_frame(x):
     return tuple(values)
 
 
+def check_build(x):
+    """Refuses to go on unless the running game is the build that
+    xbox/build/gw2.map describes: its stamp (gw_build_stamp, src/build_stamp.cpp)
+    read from the console must equal the one in the built xbox/main.exe. A map
+    from another build names other addresses: reading through them gives
+    nonsense, writing (the pad tool) hits whatever the running build keeps
+    there."""
+    xbox = pathlib.Path(__file__).resolve().parents[1]
+    text = (xbox / 'build' / 'gw2.map').read_text(errors='replace')
+    m = re.search(r'\s_gw_build_stamp\s+([0-9a-fA-F]+)\s', text)
+    if not m:
+        raise SystemExit('gw_build_stamp not in xbox/build/gw2.map')
+    va = int(m[1], 16)
+    image = (xbox / 'main.exe').read_bytes()
+    pe = struct.unpack_from('<I', image, 0x3C)[0]
+    sections, optional_size = struct.unpack_from('<H', image, pe + 6)[0], struct.unpack_from('<H', image, pe + 20)[0]
+    image_base = struct.unpack_from('<I', image, pe + 24 + 28)[0]
+    rva, built = va - image_base, None
+    for s in range(sections):
+        at = pe + 24 + optional_size + s * 40
+        size, address, raw_size, raw = struct.unpack_from('<IIII', image, at + 8)
+        if address <= rva < address + max(size, raw_size):
+            built = image[raw + rva - address:raw + rva - address + 8]
+            break
+    running = x.getmem(va, 8)
+    if built is None or running != built:
+        raise SystemExit(f'the console runs another build than xbox/build/gw2.map describes (stamp '
+                         f'{running.hex()}, built {built.hex() if built else "?"}): deploy the build first')
+
+
 def main():
     host, out = sys.argv[1], sys.argv[2]
     x = Xbdm(host)
+    check_build(x)
     if len(sys.argv) > 4:
         width, height = int(sys.argv[3]), int(sys.argv[4])
         pitch = next(p for p in TILE_PITCHES if p >= width * 2)

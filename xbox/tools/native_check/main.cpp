@@ -139,8 +139,26 @@ jmp_buf* gw_jmp_buf_for(u32, bool) { return nullptr; }
 // buffer, where the comparison reads them.
 u8* gw_grid_line_host(u32) { return nullptr; }
 u8* gw_grid_line_block(u32, u32) { return nullptr; }
-u8* gw_vertex_mirror(u32, u32) { return nullptr; }
+// Host mirrors for the particle tests (the native update writes the glow
+// splat only into a mirror, and the streak into one when there is one):
+// mirror 0 at g_test_mirror_guest, mirror 1 at g_test_mirror2_guest.
+u32 g_test_mirror_guest, g_test_mirror_size, g_test_mirror2_guest, g_test_mirror2_size;
+alignas(16) u8 g_test_mirror_host[8192];
+alignas(16) u8 g_test_mirror2_host[8192];
+u8* gw_vertex_mirror(u32 guest, u32 bytes) {
+  const u32 at = guest - g_test_mirror_guest, at2 = guest - g_test_mirror2_guest;
+  if (g_test_mirror_size && at < g_test_mirror_size && bytes <= g_test_mirror_size - at) return g_test_mirror_host + at;
+  if (g_test_mirror2_size && at2 < g_test_mirror2_size && bytes <= g_test_mirror2_size - at2)
+    return g_test_mirror2_host + at2;
+  return nullptr;
+}
 u8* gw_vertex_mirror_add(u32, u32) { return nullptr; }
+u32 gw_vertex_mirror_room(u32 guest) {
+  const u32 at = guest - g_test_mirror_guest, at2 = guest - g_test_mirror2_guest;
+  if (g_test_mirror_size && at < g_test_mirror_size) return g_test_mirror_size - at;
+  if (g_test_mirror2_size && at2 < g_test_mirror2_size) return g_test_mirror2_size - at2;
+  return 0;
+}
 bool gw_frame_drawn() { return true; }  // every frame drawn here
 u32 gw_drawn_index() { return 0; }
 u32 gw_particle_set_buffer(u32, u32, bool) { return 0; }  // the game's tables as they are
@@ -417,12 +435,27 @@ int main(int argc, char** argv) {
         ctx.r5.u64 = kOut;
         ctx.r6.u64 = kStreak;
         ctx.r7.u64 = kGlowQuad;
+        // The native pass: the glow quad goes to a host mirror (host-order
+        // floats), compared big-endian like the original's.
+        memset(g_test_mirror_host, 0, sizeof(g_test_mirror_host));
+        g_test_mirror_guest = kGlowQuad;
+        g_test_mirror_size = pass == 0 ? 0 : 112;
         if (pass == 0) original_sub_82063448(ctx, gw_host(0));
         else sub_82063448(ctx, gw_host(0));
+        g_test_mirror_size = 0;
         u8(*dst)[128] = pass == 0 ? want : got;
         memcpy(dst[0], gw_host(kOut), 44);
         memcpy(dst[1], gw_host(kStreak), 128);
-        memcpy(dst[2], gw_host(kGlowQuad), 112);
+        if (pass == 0) {
+          memcpy(dst[2], gw_host(kGlowQuad), 112);
+        } else {
+          for (u32 o = 0; o < 112; o += 4) {
+            u32 v;
+            memcpy(&v, g_test_mirror_host + o, 4);
+            v = __builtin_bswap32(v);
+            memcpy(dst[2] + o, &v, 4);
+          }
+        }
       }
       const u32 sizes[3] = {44, 128, 112};
       for (int r = 0; r < 3; ++r) {
@@ -458,9 +491,17 @@ int main(int argc, char** argv) {
     int differ = 0;
     for (int round = 0; round < 6; ++round) {
       const u32 n = 4 + rand() % 26;  // buckets
-      // Wells and holes off; the particle constants are the last test's.
-      gw_store32(kSys + 40 + 448, 0);
-      gw_store32(kSys + 40 + 452, 0);
+      // Some wells and holes (off in the first round); the particle constants
+      // are the last test's. Both passes run the native particle update (the
+      // original job calls sub_82063448, the native one particle at a time),
+      // so this compares the native job's batches of four with it, bit for bit.
+      gw_store32(kSys + 40 + 448, round == 0 ? 0 : (u32)(rand() % 4));
+      gw_store32(kSys + 40 + 452, round == 0 ? 0 : (u32)(rand() % 3));
+      for (u32 w = 0; w < 4; ++w) {
+        for (u32 c = 0; c < 3; ++c) sf(kSys + 40 + w * 12 + c * 4, frand(-500, 500));
+        for (u32 c = 0; c < 3; ++c) sf(kSys + 40 + 192 + w * 12 + c * 4, frand(-500, 500));
+        sf(kSys + 40 + 384 + w * 4, frand(-3, 3));
+      }
       gw_store32(kSys + 0, n);
       gw_store32(kSys + 4, kBuckets);
       gw_store32(kSys + 8, kIndex);
@@ -502,9 +543,19 @@ int main(int argc, char** argv) {
       u8* want_part = (u8*)malloc(0x32000);
       u8* want_verts = (u8*)malloc(0x600000);
       u8 want_live[24];
+      // Host mirrors for job 0's streak and glow buffers (frame 1: table
+      // entry 6, locked at +kLockedOffset), 40 particles: the first
+      // particles' quads go there, the rest big-endian to the buffers.
+      static u8 want_mirror[2][8192];
       for (int pass = 0; pass < 2; ++pass) {
         memcpy(gw_host(kPart), before_part, 0x32000);
         memcpy(gw_host(kVerts), before_verts, 0x600000);
+        memset(g_test_mirror_host, 0, sizeof(g_test_mirror_host));
+        memset(g_test_mirror2_host, 0, sizeof(g_test_mirror2_host));
+        g_test_mirror_guest = kVerts + 6 * 0x40000 + kLockedOffset;
+        g_test_mirror_size = 40 * 128;
+        g_test_mirror2_guest = kVerts + 0x300000 + 6 * 0x40000 + kLockedOffset;
+        g_test_mirror2_size = 40 * 112;
         for (u32 job = 0; job < 6; ++job) {
           static PPCContext ctx;
           ctx = PPCContext{};
@@ -526,11 +577,18 @@ int main(int argc, char** argv) {
           memcpy(want_part, gw_host(kPart), 0x32000);
           memcpy(want_verts, gw_host(kVerts), 0x600000);
           memcpy(want_live, gw_host(0x821B3E88), 24);
+          memcpy(want_mirror[0], g_test_mirror_host, sizeof(want_mirror[0]));
+          memcpy(want_mirror[1], g_test_mirror2_host, sizeof(want_mirror[1]));
         } else {
           for (u32 o = 0; o < 0x32000; o += 4) differ += memcmp(want_part + o, gw_host(kPart + o), 4) != 0;
           for (u32 o = 0; o < 0x600000; o += 4) differ += memcmp(want_verts + o, gw_host(kVerts + o), 4) != 0;
           differ += memcmp(want_live, gw_host(0x821B3E88), 24) != 0;
+          for (u32 o = 0; o < sizeof(want_mirror[0]); o += 4) {
+            differ += memcmp(want_mirror[0] + o, g_test_mirror_host + o, 4) != 0;
+            differ += memcmp(want_mirror[1] + o, g_test_mirror2_host + o, 4) != 0;
+          }
         }
+        g_test_mirror_size = g_test_mirror2_size = 0;
       }
       (void)sizes;
       (void)starts;

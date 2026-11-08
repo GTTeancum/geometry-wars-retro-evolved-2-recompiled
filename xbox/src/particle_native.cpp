@@ -55,7 +55,20 @@ inline float ld(u32 a) {  // a double constant, as float
   return (float)d;
 }
 
-inline float sel(float a, float b, float c) { return a >= 0.0f ? b : c; }  // fsel
+// fsel: a >= 0 ? b : c (NaN: c), without a branch: a compare mask and
+// and/andn/or. The particle data makes many of these unpredictable, and as
+// branches the mispredictions cost about 15% of the particle update on the
+// console.
+inline float sel(float a, float b, float c) {
+  float m = 0.0f;
+  __asm__("cmpless %[a], %[m]\n\t"  // m = 0 <= a, all bits or none (false for NaN)
+          "andps %[m], %[b]\n\t"
+          "andnps %[c], %[m]\n\t"
+          "orps %[b], %[m]"
+          : [m] "+x"(m), [b] "+x"(b)
+          : [a] "x"(a), [c] "x"(c));
+  return m;
+}
 inline float recip(float x) { return 1.0f / x; }                         // fres
 #ifdef GW_GRID_EXACT_RSQ
 inline float rsq(float x) { return (float)(1.0 / __builtin_sqrt((double)x)); }
@@ -86,6 +99,76 @@ inline void glow_vertex(u32 out, float x, float y, float z, float u, float r, fl
   sf(out + 24, b);
 }
 
+// The update's inputs that are the same for every particle of a frame: the
+// game's constants, the play area, the time step, the trail's size, and the
+// gravity wells and black holes. Read once per call of the particle job
+// instead of once per particle (each a big-endian load through gw_host:
+// about 30 a particle, plus the wells and holes, in the hottest loop).
+struct ParticleConstants {
+  static constexpr int kCopied = 16;  // wells and holes the layout has room for; more are read in place
+  float one, zero, half, bounce, reverse;
+  float max_x, max_y, dt;
+  float bias, pull, push;
+  float smoothing, cap, lo, hi, fade, trail_offset, glow_k, alpha_min, brightness_bias;
+  float length, width, u0, size;
+  int wells, holes;
+  u32 system;  // particle system + 40: wells (x, y, z) from +0, holes from +192, strengths from +384
+  bool drawn;  // gw_frame_drawn: the quads written
+  float well[kCopied][3], hole[kCopied][3], strength[kCopied];
+};
+
+void particle_constants(u32 particle_system, ParticleConstants& k) {
+  const u32 system = particle_system + 40;
+  k.system = system;
+  k.one = lf(C + 1732);       // f0 in the PowerPC code
+  k.zero = lf(C + 1740);      // f1
+  k.half = lf(C + 1828);      // f7
+  k.bounce = ld(C + 10112);   // f23
+  k.reverse = ld(C + 10856);  // velocity factor on hitting a wall
+  k.max_x = lf(D + 9652);
+  k.max_y = lf(D + 9656);
+  k.dt = lf(kDeltaTime);
+  k.bias = lf(C + 9080);
+  k.pull = lf(C + 6660);
+  k.push = lf(C + 4356);
+  k.smoothing = lf(C + 1816);
+  k.cap = lf(C + 3216);
+  k.lo = ld(C + 3376);
+  k.hi = ld(C + 3192);
+  k.fade = lf(C + 10852);
+  k.trail_offset = lf(C + 1788);
+  k.glow_k = lf(C + 1824);
+  k.alpha_min = lf(C + 6680);
+  k.brightness_bias = lf(kBrightnessBias);
+  k.length = lf(kTrailLength);
+  k.width = lf(kTrailWidth);
+  k.u0 = lf(C + 3208);
+  k.size = lf(C + 3364);
+  k.drawn = gw_frame_drawn();
+  k.wells = (int)gw_load32(system + 448);
+  k.holes = (int)gw_load32(system + 452);
+  for (int n = 0; n < k.wells && n < ParticleConstants::kCopied; ++n)
+    for (int c = 0; c < 3; ++c) k.well[n][c] = lf(system + (u32)n * 12 + (u32)c * 4);
+  for (int n = 0; n < k.holes && n < ParticleConstants::kCopied; ++n) {
+    for (int c = 0; c < 3; ++c) k.hole[n][c] = lf(system + 192 + (u32)n * 12 + (u32)c * 4);
+    k.strength[n] = lf(system + 384 + (u32)n * 4);
+  }
+}
+
+// A well's or hole's coordinate (c: 0 x, 1 y, 2 z), past the copied ones
+// read from the guest as the original does.
+inline float well_at(const ParticleConstants& k, int n, int c) {
+  return n < ParticleConstants::kCopied ? k.well[n][c] : lf(k.system + (u32)n * 12 + (u32)c * 4);
+}
+inline float hole_at(const ParticleConstants& k, int n, int c) {
+  return n < ParticleConstants::kCopied ? k.hole[n][c] : lf(k.system + 192 + (u32)n * 12 + (u32)c * 4);
+}
+inline float strength_at(const ParticleConstants& k, int n) {
+  return n < ParticleConstants::kCopied ? k.strength[n] : lf(k.system + 384 + (u32)n * 4);
+}
+
+void particle_update(const ParticleConstants& k, u32 in, u32 out, u32 streak, u8* streak_host, u8* glow_host);
+
 }  // namespace
 
 // r3 particle system, r4 particle (read), r5 particle (written; may be the
@@ -98,25 +181,31 @@ extern "C" void sub_82063448(PPCContext& ctx, uint8_t* base) {
 
 // The particle update itself (sub_82063448's arguments: the particle
 // system, the particle, its slot after compaction, its streak and glow
-// vertices).
+// vertices), for a single particle: the job (sub_82063A38 below) reads the
+// constants and finds the mirrors once for all its particles.
 void gw_particle(u32 particle_system, u32 in, u32 out, u32 streak, u32 glow) {
-  const u32 system = particle_system + 40;
+  ParticleConstants k;
+  particle_constants(particle_system, k);
+  particle_update(k, in, out, streak, gw_vertex_mirror(streak, 128), gw_vertex_mirror(glow, 112));
+}
 
+namespace {
+
+// streak_host, glow_host: the quads' places in the buffers' host mirrors
+// (src/vertex_mirror.cpp), or null: the streak then goes big-endian into the
+// guest buffer at 'streak', the glow splat is left out.
+void particle_update(const ParticleConstants& k, u32 in, u32 out, u32 streak, u8* streak_host, u8* glow_host) {
   // Everything read from the particle before anything is written.
   const float px = lf(in + 0), py = lf(in + 4), pz = lf(in + 8);
   const float vx = lf(in + 12), vy = lf(in + 16), vz = lf(in + 20);
   const float red = lf(in + 24), green = lf(in + 28), blue = lf(in + 32);
   const float brightness = lf(in + 36), speed_smoothed = lf(in + 40);
 
-  const float one = lf(C + 1732);       // f0 in the PowerPC code
-  const float zero = lf(C + 1740);      // f1
-  const float half = lf(C + 1828);      // f7
-  const float bounce = ld(C + 10112);   // f23
-  const float reverse = ld(C + 10856);  // velocity factor on hitting a wall
+  const float one = k.one, zero = k.zero, half = k.half, bounce = k.bounce, reverse = k.reverse;
 
   // 1. Move, and reflect off the walls (+-max_x, +-max_y).
-  const float max_x = lf(D + 9652), max_y = lf(D + 9656);
-  const float dt = lf(kDeltaTime);
+  const float max_x = k.max_x, max_y = k.max_y;
+  const float dt = k.dt;
   const float dx = vx * dt, dy = vy * dt;
   float dz = vz * dt;
   const float nx = px + dx, ny = py + dy, z = pz + dz;
@@ -134,12 +223,11 @@ void gw_particle(u32 particle_system, u32 in, u32 out, u32 streak, u32 glow) {
   float my = sel(inside, dy, factor_y * dy);
 
   // 2. Gravity wells (x, y, z; 12 bytes each from +0).
-  const int wells = (int)gw_load32(system + 448);
+  const int wells = k.wells;
   if (wells > 0) {
-    const float bias = lf(C + 9080), pull = lf(C + 6660);
+    const float bias = k.bias, pull = k.pull;
     for (int n = 0; n < wells; ++n) {
-      const u32 w = system + (u32)n * 12;
-      float tz = lf(w + 8) - z, tx = lf(w + 0) - x, ty = lf(w + 4) - y;
+      float tz = well_at(k, n, 2) - z, tx = well_at(k, n, 0) - x, ty = well_at(k, n, 1) - y;
       const float d2 = tx * tx + tz * tz + ty * ty;  // fmadds order: z, then x, then y
       const float reach = d2 - one;
       float s = recip(d2) * pull;
@@ -158,13 +246,12 @@ void gw_particle(u32 particle_system, u32 in, u32 out, u32 streak, u32 glow) {
   }
 
   // 3. Black holes (x, y, z from +192; strength from +384).
-  const int holes = (int)gw_load32(system + 452);
+  const int holes = k.holes;
   if (holes > 0) {
-    const float push = lf(C + 4356);
+    const float push = k.push;
     for (int n = 0; n < holes; ++n) {
-      const u32 h = system + 192 + (u32)n * 12;
-      const float ty = lf(h + 4) - y, tz = lf(h + 8) - z, tx = lf(h + 0) - x;
-      const float strength = lf(system + 384 + (u32)n * 4);
+      const float ty = hole_at(k, n, 1) - y, tz = hole_at(k, n, 2) - z, tx = hole_at(k, n, 0) - x;
+      const float strength = strength_at(k, n);
       const float dist = __builtin_sqrtf((ty * ty + tz * tz) + tx * tx);
       const float inv = one / dist;
       const float outside = dist - one;
@@ -180,7 +267,7 @@ void gw_particle(u32 particle_system, u32 in, u32 out, u32 streak, u32 glow) {
 
   // 4. New state.
   const float speed = __builtin_sqrtf(mx * mx + (dz * dz + my * my));
-  const float smoothing = lf(C + 1816);
+  const float smoothing = k.smoothing;
   const float smoothed = (speed - speed_smoothed) * smoothing + speed_smoothed;
   sf(out + 0, x);
   sf(out + 4, y);
@@ -194,17 +281,17 @@ void gw_particle(u32 particle_system, u32 in, u32 out, u32 streak, u32 glow) {
   sf(out + 40, smoothed);
 
   // Brightness: grows with the trail, fades with the particle's own value.
-  const float cap = lf(C + 3216), lo = ld(C + 3376), hi = ld(C + 3192);
-  const float faded = brightness * lf(C + 10852);
+  const float cap = k.cap, lo = k.lo, hi = k.hi;
+  const float faded = brightness * k.fade;
   const float limit = sel(cap - faded, faded, cap);
   const float trail = smoothed * smoothing;
   const float trail_clamped = sel(one - trail, trail, one);
-  float t = (trail - lf(C + 1788)) * half;
+  float t = (trail - k.trail_offset) * half;
   t = sel(-t, lo, t);
   t = sel(t - one, hi, t);
-  const float glow_k = lf(C + 1824);
+  const float glow_k = k.glow_k;
   const float intensity = limit * (t * t * t * glow_k + one) * (trail_clamped * trail_clamped);
-  const float alpha = sel(intensity - lf(C + 6680), hi, bounce) * brightness - lf(kBrightnessBias);
+  const float alpha = sel(intensity - k.alpha_min, hi, bounce) * brightness - k.brightness_bias;
   sf(out + 36, alpha);
 
   // Direction of travel this frame (normalised), for the streak.
@@ -221,14 +308,14 @@ void gw_particle(u32 particle_system, u32 in, u32 out, u32 streak, u32 glow) {
   // The streak runs from the old position (two corners) to the new one (two
   // corners). 'across' is the trail length turned a quarter (x <- y, y <- x),
   // 'along' the width along the motion, as the PowerPC code combines them.
-  const float length = lf(kTrailLength), width = lf(kTrailWidth);
+  const float length = k.length, width = k.width;
   const float across_x = length * dir_y, across_y = length * dir_x;
   const float along_x = width * dir_x, along_y = width * dir_y;
   const float cr = intensity * red, cg = intensity * green, cb = intensity * blue;
   // The quads only for frames that are rendered (gw_frame_drawn).
-  if (!gw_frame_drawn()) return;
-  const float u0 = lf(C + 3208);
-  if (u8* host = gw_vertex_mirror(streak, 128)) {
+  if (!k.drawn) return;
+  const float u0 = k.u0;
+  if (u8* host = streak_host) {
     const float quad[4][8] = {
         {(px - across_x) - along_x, (across_y + py) - along_y, pz, u0, cr, cg, cb, u0},
         {(across_x + px) - along_x, (py - across_y) - along_y, pz, one, cr, cg, cb, u0},
@@ -246,8 +333,8 @@ void gw_particle(u32 particle_system, u32 in, u32 out, u32 streak, u32 glow) {
   if (kWriteGlowQuad) {
     const float mid_x = (px + x) * half, mid_y = (py + y) * half;
     const float gr = cr * glow_k, gg = cg * glow_k, gb = cb * glow_k;
-    const float size = lf(C + 3364);
-    if (u8* host = gw_vertex_mirror(glow, 112)) {
+    const float size = k.size;
+    if (u8* host = glow_host) {
       const float quad[4][7] = {
           {mid_x - size, mid_y - size, zero, zero, gr, gg, gb},
           {mid_x + size, mid_y - size, one, zero, gr, gg, gb},
@@ -261,6 +348,8 @@ void gw_particle(u32 particle_system, u32 in, u32 out, u32 streak, u32 glow) {
     // would commit its memory (it ran out in big explosions at 720p).
   }
 }
+
+}  // namespace
 
 extern "C" void sub_820A1800(PPCContext& ctx, uint8_t* base);  // vertex buffer lock
 extern "C" void sub_820A1850(PPCContext& ctx, uint8_t* base);  // vertex buffer unlock
@@ -314,6 +403,14 @@ extern "C" void sub_82063A38(PPCContext& ctx, uint8_t* base) {
   }
   u32 streak = lock(ctx, base, main_buffer);
   u32 glow = lock(ctx, base, glow_buffer);
+  ParticleConstants constants;
+  particle_constants(system, constants);
+  // The buffers' host mirrors: particle n's quads at n x 128 and n x 112
+  // bytes, the first main_room and glow_room particles in the mirror.
+  u8* const main_host = gw_vertex_mirror(streak, 128);
+  u8* const glow_host = gw_vertex_mirror(glow, 112);
+  const u32 main_room = main_host ? gw_vertex_mirror_room(streak) / 128 : 0;
+  const u32 glow_room = glow_host ? gw_vertex_mirror_room(glow) / 112 : 0;
   u32 live = 0, dest = 0, used = 0;
   for (;;) {
     const u32 next = system + 496;
@@ -329,13 +426,20 @@ extern "C" void sub_82063A38(PPCContext& ctx, uint8_t* base) {
     }
     for (int k = 0; k < (int)lw(bucket + kCount); ++k) {
       const u32 p = bucket + (u32)k * kParticle;
+      // The particles four ahead asked for now (two lines: 44 bytes each):
+      // the Pentium III fetches nothing ahead itself, and each particle was a
+      // wait for memory (a quarter of the update on the console). Prefetching
+      // never faults, past the end included.
+      _mm_prefetch((const char*)gw_host(p + 4 * kParticle), _MM_HINT_T0);
+      _mm_prefetch((const char*)gw_host(p + 4 * kParticle + 32), _MM_HINT_T0);
       if ((int)lw(p + 36) < 0) continue;
       if (used >= kPerBucket) {
         sw(dest + kCount, used);
         dest = bucket;
         used = 0;
       }
-      gw_particle(system, p, dest + used * kParticle, streak, glow);
+      particle_update(constants, p, dest + used * kParticle, streak, live < main_room ? main_host + live * 128 : nullptr,
+                      live < glow_room ? glow_host + live * 112 : nullptr);
       ++used;
       streak += 128;
       glow += 112;

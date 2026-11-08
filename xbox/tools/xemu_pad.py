@@ -143,6 +143,7 @@ class XbdmTarget:
         import xbdm_shot
         self.host = host
         self.xbdm = xbdm_shot.Xbdm(host)
+        xbdm_shot.check_build(self.xbdm)  # the pad's address is from the link map
 
     def word(self, address):
         return int.from_bytes(self.xbdm.getmem(address, 4), 'little')

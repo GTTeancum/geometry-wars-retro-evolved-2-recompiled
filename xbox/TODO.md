@@ -5,6 +5,16 @@ order. Measurements are from XEMU at 64 MB unless noted.
 
 ## 1. 60 fps at 720p
 
+- [x] **Four players at full speed (console, 2026-11-08).** 15-minute
+      four-player soak: median 58.6 updates a second (30 drawn), 50 at the
+      worst 5-second window, no crash, 4.9 MB free. Was 42-47 (21-23 drawn).
+      Particles in place (their mirrors were registered at the buffers'
+      headers, so nothing ever matched), the particle update's constants
+      read once per job, its particles prefetched four ahead, its selects
+      without branches (640 cycles a particle, was about 1,000; four at once
+      in SSE measured slower, 1,150), the stars four at once, square roots
+      as sqrtss (-fno-math-errno). Per update now: grid about 4 ms
+      (memory-bound), particles 3-5, sound 2.5, stars 1.3.
 - [ ] **Pausing freezes the game (found 2026-11-07).** Pressing Start in a
       level stops the picture: the main thread spins in the game's
       BlockOnFence (sub_820A4CE0 / sub_820A1B18), waiting for a GPU fence.
@@ -274,8 +284,8 @@ native engine that plays the game's sound graphs (src/sound_native.cpp).
 
 ## 8. Housekeeping
 
-- [ ] Push `main` when ready (nothing pushed yet; all work is on `main`,
-      no branches).
+- [x] Push `main` (first pushed 2026-11-08; all work is on `main`, no
+      branches).
 
 ## 9. Console integration
 

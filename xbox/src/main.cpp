@@ -24,12 +24,14 @@ bool read_file(const char* path, u32 offset, void* out, u32 size, u32* got) {
 
 }  // namespace
 
+extern "C" volatile const u32 gw_build_stamp[2];  // src/build_stamp.cpp
+
 int main() {
   // Reserve the guest windows before anything else allocates (the virtual
   // heap window starts just above the XBE).
   bool reserved = gw_memory_init();
   gw_status_init();
-  gw_log("boot\n");
+  gw_log("boot (build %08X)\n", gw_build_stamp[1]);
   if (!reserved) gw_fatal("could not reserve the guest memory windows");
   gw_log_memory("after reserving guest windows");
 
