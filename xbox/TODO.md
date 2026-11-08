@@ -87,7 +87,7 @@ starfield 2, the rest (the game's own code) about 17.
       (touch `src/status.cpp` first) asks for 1280x720 and falls back to
       640x480; try it once the memory census shows 6 MB to spare. 720p needs the
       component/HDMI video modes on hardware and about 1.8 MB per 16-bit
-      buffer (three buffers plus depth); budget it against memory (section 4).
+      buffer (three buffers plus depth); budget it against memory (section 2).
 - [ ] Guest memory accesses are no longer volatile, with a compiler barrier
       at every label (`src/gen/pch.h`, `tools/prepare_generated.py`): 27%
       faster recompiled code on the grid in the PC check. Not yet run in
@@ -101,77 +101,7 @@ starfield 2, the rest (the game's own code) about 17.
       (`src/grid_native.cpp`, about 10%); the particle job
       (guest 0x82063448, about 3.5%); vertex copies in `draw_on_gpu`.
 
-## 2. Readable text
-
-- [x] **Unreadable at 720p (fixed 2026-11-07).** The HUD and the vector
-      shapes are glowing lines whose pixel shaders (ED8C5D26, 30398AC8,
-      CABF22DB) fade each stroke as (1 - |u|)^4 across it, the outlines also
-      by alpha^6, with colours far brighter than white. The stroke coordinate
-      u was lost (an exporting instruction's scalar result goes to the vector
-      destination; the decoder used the scalar field) and the strokes were
-      drawn flat: solid bars. Now: u reaches the texture coordinate, a
-      64-texel curve stands in for the power, and the combiners scale the
-      colour (sent at 1/16, constant 64) back up before clamping
-      (use_stroke_combiner). 30398AC8's red-from-alpha is still left out.
-      Font textures are now kept pixel for pixel (padded, not resampled) and
-      without made-up mipmaps, as the game has them.
-- [x] **Menus flickering (2026-11-07).** At a screen change the game draws
-      about a quarter of a second without the menu's foreground; those frames
-      are now not shown (the last frame stays up, at most 12 frames).
-
-- [ ] Fonts and UI art were converted at 512x512 at most, halving the
-      1024x1024 atlas. Now (not yet seen in XEMU): up to 1024, and textures
-      larger than 256 as DXT5 (`src/dxt.cpp`), so full resolution costs less
-      memory than before. Check the text on screen.
-- [ ] Converted textures now carry mipmaps (2x2 averages, DXT5 down to 4x4)
-      with trilinear filtering: the game draws its text smaller than the
-      textures at 640x480, and without mipmaps the glyphs alias. Not yet seen
-      in XEMU. 720p would help further.
-- [ ] Texture format 26 (seen as 18x12) is not converted yet.
-- [x] The debug overlay ("Geometry Wars RE2 - Xbox frame N") covered the
-      score; it is off unless `make OVERLAY=y`. The frame rate is in
-      `gw2log.txt` on hardware.
-- [ ] Grey textures (the fonts: white glyphs coloured by the vertices) are
-      now kept exact as 16-bit alpha + grey instead of DXT5, whose 4x4
-      blocks smear small letters. On hardware the Deadline rules screen and
-      the menus read cleanly at 640x480; 720p is what would sharpen them
-      further.
-
-## 3. Glow
-
-- [ ] Our own glow (`apply_glow` in `src/nv2a.cpp`, on by default, `make
-      GLOW=n` without): the finished picture shrunk 4x, blurred, added back.
-      Stand-in until the game's own chain below. It drew bright blocks in
-      XEMU and nothing on hardware: the weights of the third and fourth
-      samples went to combiner factors nothing reads. Fixed, and the GPU now
-      finishes drawing each buffer before it is read back (needed on
-      hardware). Seen on hardware: halos around the ships, enemies, HUD
-      and menu panels; 19 fps in a level with it on.
-- The game's chain (from the menu capture): the grid and the scene are
-  drawn into float targets, resolved, shrunk and blurred through about 80
-  small passes down to 2x1, summed per pyramid and composited with a tone
-  curve. Its pixel shaders read as weighted texture sums
-  (`xps_sum_of`, checked by `tools\vp_check.cmd` on `_ps_` captures), and
-  `nv2a_sum_ps.ps.cg` sums four textures; what is missing is render targets
-  other than the screen (pbkit only renders to the screen and its extra
-  buffers) and resolves into textures.
-
-- [ ] Render targets and resolves: the 360 draws the glow chain and the
-      composite into EDRAM targets and resolves them to textures. On the NV2A
-      they become surfaces in memory; resolves become no-ops or copies.
-- [ ] Draw the glow-layer draws (vertex shader C5C713E2 for particles,
-      8E1A294A for the in-level grid lines, whose three line buffers
-      src/kernel_memory.cpp took for spark buffers), plus the blur and
-      composite passes, likely at reduced resolution. The frame census now
-      says why each skipped draw was skipped.
-- [ ] Then give the glow-pass particle buffers and the grid-line buffers their
-      own memory again (`src/particle_buffers.cpp`, `src/kernel_memory.cpp`
-      share them while nothing draws them): about 10 MB that section 4 must
-      find first.
-- [ ] Pixel shaders: today only analysed for which interpolator feeds the
-      texture; the glow composite needs real combiner setups.
-
-## 4. Fit in 64 MB
+## 2. Fit in 64 MB
 
 - [x] A level ran out of memory after about 2000 frames. With the undrawn
       particle copies sharing one buffer it ran 6900 frames (two minutes of
@@ -182,7 +112,26 @@ starfield 2, the rest (the game's own code) about 17.
 - [ ] Vertex buffer pool: 32 x 128 KB fully used (4 MB); try 16.
 - [ ] Converted textures: 1 MB each at 512x512 ARGB.
 
-## 5. Picture still missing
+## 3. Picture still missing
+
+- [x] **Menu flicker on idle menus (seen 2026-11-08) — fixed, confirmed on
+      the TV.** Not the 2026-11-07 kind (no frame lost
+      draws): the logo's two ends dimmed for 1-3 frames every few frames.
+      Found with the capture build's flicker detector (make SPAWN_CAPTURE=y:
+      every frame checked in 20x20-pixel cells, logged as "capture: frame
+      ..."). The glow's full-screen add quad lost its upper-right triangle
+      in those frames (the changed pixels all above the screen diagonal; gone
+      with GLOW=n). Its corners now go inline in the command stream instead
+      of the vertex arena (glow_quad): 3+ minutes idle, no flicker. Clearing
+      the vertex cache, an extra wait after a target change and a separate
+      area for the last blur did not help, so the cause in the arena path is
+      not known; other arena draws could have the same fault.
+      Still seen on the TV after that: the whole screen blinking. pbkit
+      hands out its three buffers in turn whatever is on screen, so with two
+      finished frames waiting for vblank the next frame's black fill wiped
+      the buffer the TV was showing (the capture build reads frames as drawn,
+      so it never saw this). begin_frame now waits while the display shows
+      its back buffer: on the idle menu that happened about every 8 s.
 
 - [ ] Background grid: drawn into its own small target and distorted
       (vertex shader 8518CDFB, 46464 vertices); not drawn yet.
@@ -214,7 +163,7 @@ starfield 2, the rest (the game's own code) about 17.
       which the native code no longer writes.
 - [ ] Vertex arena overflows on some menu frames ("vertex arena full").
 
-## 6. Sound
+## 4. Sound
 
 No XMA on the Xbox: the installer converts every sound to IMA ADPCM. None of
 the game's audio engine, its XAudio2 or the XMA unit runs: the game's sound
@@ -273,21 +222,21 @@ native engine that plays the game's sound graphs (src/sound_native.cpp).
       about 8 minutes. One entry (GW3 LeaderChange2) says more samples than
       its data holds; the engine plays what is there.
 
-## 7. Windows installer
+## 5. Windows installer
 
 - [x] `xbox\tools\make_installer.ps1` builds `xbox\build\installer` (and a
       zip): `install.cmd <LIVE package> <new folder>` checks the title,
       extracts the package, writes and checks the game image, and fills the
       folder next to `default.xbe`. Its output matches the staged test disc.
-- [x] Sound conversion (section 6).
+- [x] Sound conversion (section 4).
 - [x] The extractor prints every file; the installer now hides that list.
 
-## 8. Housekeeping
+## 6. Housekeeping
 
 - [x] Push `main` (first pushed 2026-11-08; all work is on `main`, no
       branches).
 
-## 9. Console integration
+## 7. Console integration
 
 - [ ] Saving and loading: confirm on the console that saves and profile
       settings are written and read back after a restart (today they persist

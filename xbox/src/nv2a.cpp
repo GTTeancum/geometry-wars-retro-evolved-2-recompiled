@@ -462,6 +462,25 @@ void begin_frame() {
   while (pb_busy()) {
   }
   gw_wait_end(start, 0, "renderer: GPU finishing the previous frame");
+  // Not drawn into while it is on the screen: pbkit hands out its three
+  // buffers in turn whatever is shown, and with two finished frames waiting
+  // for their vblank the next back buffer is the one the TV is showing, which
+  // this frame's first command (the black fill) wiped: the whole screen
+  // blinked on the idle menus. The display has moved on from it once it shows
+  // either later frame (they are shown in order, and the frame before this
+  // buffer's last one was waited off the screen the same way).
+  {
+    const u32 back = (u32)pb_back_buffer() & 0x03FFFFFF;
+    volatile u32* const shown = (volatile u32*)0xFD600800;  // PCRTC_START
+    if ((*shown & 0x03FFFFFF) == back) {
+      const u64 on_screen = gw_wait_begin();
+      const DWORD since = GetTickCount();
+      while ((*shown & 0x03FFFFFF) == back && GetTickCount() - since < 100) Sleep(1);
+      gw_wait_end(on_screen, 0, "renderer: back buffer still on the screen");
+      static u32 told = 0;
+      if (told++ < 20) gw_log("nv2a: frame %u waited for the screen to leave its buffer (%u so far)\n", g_frames, told);
+    }
+  }
   gw_nv2a_stage = 2;
   blk_flush();
   pb_target_back_buffer();
@@ -1297,31 +1316,34 @@ void use_stroke_combiner(bool glow) {
 
 // One screen-aligned quad from (x0, y0) to (x1, y1); unit k's texture
 // coordinates run from uv[k][0..1] to uv[k][2..3] across it.
+// The corners go in the command stream itself (an inline array), not the
+// vertex arena: drawn from the arena, the full-screen quad that adds the glow
+// lost its upper-right triangle in some frames (the idle menus' logo
+// flickering at both ends, where most of the glow is), however the arena and
+// the vertex cache were handled.
 void glow_quad(float x0, float y0, float x1, float y1, const float uv[4][4]) {
   constexpr u32 kStride = 40;  // x, y, then u, v for each of the four units
-  if (!arena_room(4 * kStride)) return;
-  float* v = (float*)(g_arena + g_arena_used);
+  u32 formats[16] = {}, offsets[16] = {};
+  formats[0] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (2 << 4) | (kStride << 8);
+  for (int k = 0; k < 4; ++k) formats[9 + k] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (2 << 4) | (kStride << 8);
+  set_arrays(formats, offsets);
+  u32* p = blk_begin();
+  p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_QUADS);
+  pb_push(p++, 0x40000000 | NV097_INLINE_ARRAY, 4 * kStride / 4);
   const float corner[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
   for (int c = 0; c < 4; ++c) {
-    float* out = v + c * 10;
+    float out[10];
     out[0] = corner[c][0] ? x1 : x0;
     out[1] = corner[c][1] ? y1 : y0;
     for (int k = 0; k < 4; ++k) {
       out[2 + k * 2] = corner[c][0] ? uv[k][2] : uv[k][0];
       out[3 + k * 2] = corner[c][1] ? uv[k][3] : uv[k][1];
     }
+    memcpy(p, out, sizeof(out));
+    p += 10;
   }
-  u32 formats[16] = {}, offsets[16] = {};
-  const u32 base = ((u32)g_arena & 0x03FFFFFF) + g_arena_used;
-  formats[0] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (2 << 4) | (kStride << 8);
-  offsets[0] = base;
-  for (int k = 0; k < 4; ++k) {
-    formats[9 + k] = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F | (2 << 4) | (kStride << 8);
-    offsets[9 + k] = base + 8 + k * 8;
-  }
-  set_arrays(formats, offsets);
-  g_arena_used += (4 * kStride + 15) & ~15u;
-  draw_arrays(NV097_SET_BEGIN_END_OP_QUADS, 4);
+  p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
+  blk_end(p);
 }
 
 // A pass sampling 'from' (all four units) at four offsets in texels, into
@@ -1784,28 +1806,71 @@ volatile u32 gw_capture_state[4] = {0x43415054, 0, 0, 0};
 u16 gw_capture_frames[kCaptureFrames][kCaptureH][kCaptureW];
 }
 void capture_trigger() {
-  // The level start's spawn draws correctly; the freeze is by white area
+  // The level start's spawn draws correctly; the freeze is by a flicker
   // (capture_frame) instead.
 }
 void capture_frame() {
-  if (gw_capture_state[2]) return;
   while (pb_busy()) {
   }
   const u8* picture = (const u8*)pb_back_buffer();
   const u32 pitch = pb_back_buffer_pitch(), w = pb_back_buffer_width(), h = pb_back_buffer_height();
-  u16(*out)[kCaptureW] = gw_capture_frames[gw_capture_state[1] % kCaptureFrames];
-  u32 white = 0;  // near-white pixels (the stray polygons are large and white)
+  // Once frozen the ring is kept; the check goes on (into a spare copy).
+  static u16 spare[kCaptureH][kCaptureW];
+  u16(*out)[kCaptureW] = gw_capture_state[2] ? spare : gw_capture_frames[gw_capture_state[1] % kCaptureFrames];
+  // Brightness (green) per cell of 64x36 cells (20x20 screen pixels), for
+  // the last 5 frames. A cell that held something and was off by over 30%
+  // (darker or brighter) for 1-3 frames between two frames that agree (the
+  // menu flicker hunt) is logged with where it is, and freezes the ring a few
+  // frames later.
+  constexpr u32 kCx = 64, kCy = 36;
+  static u16 hist[5][kCy][kCx];
+  static u32 seen = 0;
+  u16 (*cells)[kCx] = hist[seen % 5];
+  memset(cells, 0, sizeof(hist[0]));
   for (u32 y = 0; y < kCaptureH; ++y) {
     const u16* row = (const u16*)(picture + (y * h / kCaptureH) * pitch);
     for (u32 x = 0; x < kCaptureW; ++x) {
       const u16 px = row[x * w / kCaptureW];
       out[y][x] = px;
-      white += (px >> 11) >= 28 && ((px >> 5) & 63) >= 56 && (px & 31) >= 28;
+      cells[y / 5][x / 5] += (px >> 5) & 63;
     }
   }
+  ++seen;
+  u32 dipped = 0, length = 0, first_x = 0, first_y = 0, first_was = 0, first_odd = 0;
+  if (seen > 60) {
+    for (u32 cy = 0; cy < kCy; ++cy)
+      for (u32 cx = 0; cx < kCx; ++cx) {
+        const u32 now = cells[cy][cx];
+        for (u32 k = 1; k <= 3; ++k) {
+          const u32 before = hist[(seen - 2 - k) % 5][cy][cx];
+          const u32 ref = now > before ? now : before;
+          if (ref < 300 || before * 10 < now * 9 || now * 10 < before * 9) continue;
+          bool odd = true;
+          u32 odd_value = 0;
+          for (u32 j = 1; j <= k; ++j) {
+            const u32 v = hist[(seen - 1 - j) % 5][cy][cx];
+            odd &= v * 10 < ref * 7 || v * 10 > ref * 13;
+            odd_value = v;
+          }
+          if (odd) {
+            if (!dipped) first_x = cx, first_y = cy, first_was = ref, first_odd = odd_value;
+            ++dipped;
+            if (k > length) length = k;
+            break;
+          }
+        }
+      }
+  }
+  static u32 told = 0;
+  if (dipped) {
+    if (told++ < 300)
+      gw_log("capture: frame %u (drawn %u): %u cells off for %u frame(s) and back; first at %u,%u (screen px) %u -> %u\n",
+             seen, g_frames, dipped, length, first_x * 20, first_y * 20, first_was, first_odd);
+    // (not in the first 30 s: the start-up logos fade in and out)
+    if (seen > 900 && !gw_capture_state[2] && !gw_capture_state[3]) gw_capture_state[3] = 6;
+  }
+  if (gw_capture_state[2]) return;
   gw_capture_state[1] = gw_capture_state[1] + 1;
-  // A quarter of the frame near-white: freeze a few frames later.
-  if (white > kCaptureW * kCaptureH / 4 && !gw_capture_state[3]) gw_capture_state[3] = 6;
   if (gw_capture_state[3] && --gw_capture_state[3] == 0) gw_capture_state[2] = 1;
 }
 #endif
