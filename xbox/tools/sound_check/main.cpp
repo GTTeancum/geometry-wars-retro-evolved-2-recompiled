@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <windows.h>
+#include <xmmintrin.h>
 
 #include "runtime.h"
 
@@ -107,10 +108,49 @@ void render(Wav& w, double seconds, F each) {
 }
 }  // namespace
 
+extern bool gw_sound_test_no_reverb;
+
 int main(int argc, char** argv) {
   const char* out = argc > 1 ? argv[1] : ".";
+  gw_sound_test_no_reverb = getenv("NO_REVERB") != nullptr;
+  // FTZ=1: results too small for a normal float flushed to zero, as the
+  // Xbox's audio thread sets (src/audio.cpp).
+  if (getenv("FTZ")) _mm_setcsr(_mm_getcsr() | 0x8000);
   QueryPerformanceFrequency(&g_freq);
   gw_sound_start();
+  if (getenv("CONSOLE_MENU")) {
+    // The menu as the console's game drives it (logged by an AUDIO_CAPTURE
+    // build): its events and numbered parameters at the same passes.
+    Wav w;
+    char p0[MAX_PATH];
+    snprintf(p0, sizeof(p0), "%s\\menu_console.wav", out);
+    w.open(p0);
+    printf("menu, as on the console:\n");
+    gw_sound_action("Silence");
+    gw_sound_action("Game_start");
+    Sleep(1500);
+    render(w, atof(getenv("CONSOLE_MENU")), [](u32 p) {
+      if (p == 12) {
+        static const struct {
+          const char* name;
+          float value;
+        } kStart[] = {{"Gravity_well_pitch_0", 0}, {"Gravity_well_pitch_1", 0}, {"Gravity_well_pitch_2", 0},
+                      {"Gravity_well_pitch_3", 0}, {"Gravity_well_pitch_4", 0}, {"Paused", 0},
+                      {"SFX_Volume", 1}, {"Mayfly_numbers", 0}, {"DistanceFromHill", 1000},
+                      {"Music_Volume", 1}, {"Thrust", 0}, {"PlayerPosX", 0}, {"PlayerPosY", 0},
+                      {"ProgressionLevelNumber", 0}, {"Multiplier", 0}, {"Score", 0}, {"NoEnemies", 0},
+                      {"Time", 0}, {"LevelTime", 0}, {"BombKillCount", -2147483648.0f}, {"MagnetActive", 0}};
+        for (const auto& k : kStart) gw_sound_set_param(k.name, k.value);
+      }
+      if (p == 1152) gw_sound_action("Bong");
+      if (p == 2180) {
+        gw_sound_action("Start_UI_Music");
+        gw_sound_set_param("SongID", 0);
+      }
+    });
+    w.close();
+    return 0;
+  }
   gw_sound_set_param("SFX_Volume", 1.0f);
   gw_sound_set_param("Music_Volume", 1.0f);
   gw_sound_action("Silence");
@@ -123,8 +163,8 @@ int main(int argc, char** argv) {
     snprintf(path, sizeof(path), "%s\\menu.wav", out);
     w.open(path);
     printf("menu:\n");
-    render(w, 20, [](u32 p) {
-      if (p % 375 == 100) gw_sound_action("Bong");
+    render(w, getenv("MENU_SECONDS") ? atof(getenv("MENU_SECONDS")) : 20, [](u32 p) {
+      if (p % 375 == 100 && !getenv("NO_BONG")) gw_sound_action("Bong");
     });
     w.close();
   }
@@ -162,6 +202,21 @@ int main(int argc, char** argv) {
     render(w, 30, [](u32 p) {
       if (p % 23 == 0) gw_sound_action("Fire_normal");
       if (p % 70 == 30) gw_sound_action("Enemy_explode");
+    });
+    w.close();
+  }
+  {
+    // Sound effects alone (no music), one at a time with silence between,
+    // to look at their starts and ends.
+    Wav w;
+    snprintf(path, sizeof(path), "%s\\sfx.wav", out);
+    w.open(path);
+    printf("sound effects alone:\n");
+    gw_sound_action("Stop_InGame_Music");
+    gw_sound_set_param("Music_Volume", 0.0f);
+    render(w, 12, [](u32 p) {
+      static const char* const kSounds[] = {"Fire_normal", "Enemy_explode", "Grunt_spawn", "Bong", "Player_spawn", "Fire_normal"};
+      if (p % 300 == 50 && p / 300 < 6) gw_sound_action(kSounds[p / 300]);
     });
     w.close();
   }

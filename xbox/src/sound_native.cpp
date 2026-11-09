@@ -70,6 +70,9 @@ inline void prefetch(const void* p, u32 bytes) {
 
 // Time spent, in processor cycles, by part (logged with the audio thread's
 // report on the Xbox, and by the PC check).
+// Passes a voice's stream was not there in time (a gap in that sound),
+// counted for the audio thread's report (src/audio.cpp).
+u32 gw_sound_late;
 unsigned long long g_prof_control, g_prof_audio, g_prof_sound, g_prof_decode, g_prof_effects, g_prof_reverb,
     g_prof_collect, g_prof_mix, g_prof_mark, g_prof_lock, g_prof_out;
 #define PROF_BEGIN(n) const unsigned long long prof_##n = __builtin_ia32_rdtsc()
@@ -795,6 +798,10 @@ void voice_start(Voice& v, u32 at) {
   ring_take(v.r, &v.silent_passes);
   v.gain_prev = 0;
   v.gain_last = 0;
+  // The resampler's carried sample and its filter start from silence: left
+  // from the voice's last sound (a shot cut off by the next one), the new
+  // sound began with a jump from there, a tick behind every effect.
+  for (u32 cc = 0; cc < 2; ++cc) v.carry[cc] = v.fx1[cc] = v.fy1[cc] = 0;
   v.playing = true;
   v.target_step = v.prev_step = 1;
 }
@@ -896,6 +903,7 @@ bool voice_render(Graph& g, Comp& c, Voice& v, float (*out)[kPass], bool needed,
   const u32 got = v.r.render(dst, ch, 1, n, &ended);
   // A stream not there yet: silence, but the wave keeps its place (in time
   // with the music's other layers).
+  if (got < n && !ended) ++gw_sound_late;
   if (got < n && !ended && !v.r.skip(n - got)) ended = true;
   for (u32 i = got; i < n; ++i)
     for (u32 cc = 0; cc < ch; ++cc) in[cc][i + 1] = 0;
@@ -2541,6 +2549,12 @@ DWORD WINAPI reader_thread(LPVOID) {
             EnterCriticalSection(&g_file_lock);
             SetFilePointer(r.bank->file, r.wave->offset + block * r.wave->block, nullptr, FILE_BEGIN);
             ReadFile(r.bank->file, ring->data + slot * kMaxBlock, bytes, &done, nullptr);
+#ifdef GW_SOUND_PROFILE
+            {  // SLOW_DISC=ms: each read takes that long (the console's disc)
+              static const int slow = getenv("SLOW_DISC") ? atoi(getenv("SLOW_DISC")) : 0;
+              if (slow) Sleep(slow);
+            }
+#endif
             LeaveCriticalSection(&g_file_lock);
             EnterCriticalSection(&g_lock);
             if (r.ring == ring && r.ring_next == block && r.ring_written % kStreamBlocks == slot && done == bytes) {
@@ -2721,6 +2735,12 @@ void gw_sound_event(u32 event) {
     if (name) find_targets(t, name, 2);
     else t.found = true;
   }
+#ifdef GW_AUDIO_CAPTURE
+  {
+    const char* name = table_name(0x8218D588, kEvents, event);
+    gw_log("sound event %s (%u) at pass %u, %u targets\n", name ? name : "?", event, g_pass, t.count);
+  }
+#endif
   for (u32 k = 0; k < t.count; ++k) fire(*t.graph[k], bes(t.comp[k]->b + 4));
   LeaveCriticalSection(&g_lock);
 }
@@ -2728,6 +2748,9 @@ void gw_sound_event(u32 event) {
 void gw_sound_action(const char* name) {
   if (!g_ready) return;
   EnterCriticalSection(&g_lock);
+#ifdef GW_AUDIO_CAPTURE
+  gw_log("sound action %s at pass %u\n", name, g_pass);
+#endif
   for (u32 k = 1; k < kGraphs; ++k) {  // the game sends actions to FX, UIMusic and the songs
     Graph& g = g_graphs[k];
     if (!g.live) continue;
@@ -2750,6 +2773,31 @@ void gw_sound_param(u32 param, float value) {
     if (name) find_targets(t, name, 0);
     else t.found = true;
   }
+#ifdef GW_AUDIO_CAPTURE
+  if (param == 0) {  // (Thrust: set every frame) what is playing, every 5 s
+    static DWORD last_debug = GetTickCount();
+    if (GetTickCount() - last_debug > 5000) {
+      last_debug = GetTickCount();
+      LeaveCriticalSection(&g_lock);
+      gw_sound_debug();
+      EnterCriticalSection(&g_lock);
+    }
+  }
+  {
+    static float last[kParams];
+    static bool seen[kParams];
+    if (!seen[param] || last[param] != value) {
+      // (Score, the clock and the ship's position change every frame: only
+      // their first value.)
+      if (!seen[param] || (param != 11 && param != 13 && param != 17 && param != 18)) {
+        const char* name = table_name(0x8218D918, kParams, param);
+        gw_log("sound param %s (%u) = %d/1000 at pass %u\n", name ? name : "?", param, (int)(value * 1000), g_pass);
+      }
+      seen[param] = true;
+      last[param] = value;
+    }
+  }
+#endif
   for (u32 k = 0; k < t.count; ++k) t.comp[k]->s[0] = value;
   LeaveCriticalSection(&g_lock);
 }
@@ -2760,7 +2808,14 @@ void gw_sound_set_param(const char* name, float value) {
   for (Graph& g : g_graphs) {
     if (!g.live) continue;
     for (u32 i = 0; i < g.count; ++i)
-      if (g.c[i].type == 0 && !strcmp(g.c[i].name, name)) g.c[i].s[0] = value;
+      if (g.c[i].type == 0 && !strcmp(g.c[i].name, name)) {
+#ifdef GW_AUDIO_CAPTURE
+        if (g.c[i].s[0] != value)
+          gw_log("sound param %s.%s %d/1000 -> %d/1000 at pass %u\n", g.name, name, (int)(g.c[i].s[0] * 1000),
+                 (int)(value * 1000), g_pass);
+#endif
+        g.c[i].s[0] = value;
+      }
   }
   LeaveCriticalSection(&g_lock);
 }
@@ -2789,19 +2844,23 @@ void gw_sound_debug() {
         for (u32 v = 0; v < c.voice_count; ++v) {
           const Voice& vo = c.voices[v];
           if (!vo.playing) continue;
-          gw_log("  %s #%u %s voice %u gain %.3f pitch %.3f pos %u/%u %s\n", g.name, i, c.name, v, vo.gain_target,
-                 vo.pitch, vo.r.pos, vo.r.wave ? vo.r.wave->samples : 0, vo.r.wave ? vo.r.wave->name : "?");
+          // (thousandths: the Xbox's printf has no %f)
+          gw_log("  %s #%u %s voice %u gain %d/1000 (now %d) pitch %d/1000 pos %u/%u %s\n", g.name, i, c.name, v,
+                 (int)(vo.gain_target * 1000), (int)(vo.gain_last * 1000), (int)(vo.pitch * 1000), vo.r.pos,
+                 vo.r.wave ? vo.r.wave->samples : 0, vo.r.wave ? vo.r.wave->name : "?");
         }
       } else if (c.kind == kAudioMixer && c.active && c.buf) {
         float peak = 0;
         for (u32 o = 0; o < c.out_ch; ++o)
           for (u32 n = 0; n < kPass; ++n) peak = c.buf[o][n] != c.buf[o][n] ? 999.0f : fmaxf(peak, fabsf(c.buf[o][n]));
-        gw_log("  %s #%u %s (mixer %u) peak %.3f\n", g.name, i, c.name, c.type, peak);
+        gw_log("  %s #%u %s (mixer %u) peak %d/1000\n", g.name, i, c.name, c.type, (int)(peak * 1000));
       }
     }
   }
   LeaveCriticalSection(&g_lock);
 }
+
+bool gw_sound_test_no_reverb = false;  // (the PC check: the mix without the reverb)
 
 // One frame (256 samples, 48 kHz stereo) for the AC97 (src/audio.cpp).
 void gw_sound_mix(i16* out, u32 samples) {
@@ -2833,7 +2892,7 @@ void gw_sound_mix(i16* out, u32 samples) {
     dry[0] = g_out[0];
     dry[1] = g_out[1];
     PROF_BEGIN(reverb);
-    have_rev = level_lin > 0 && reverb(g_wet, decay_s, rev);
+    have_rev = level_lin > 0 && !gw_sound_test_no_reverb && reverb(g_wet, decay_s, rev);
     PROF_END(reverb);
   }
   // Output: the stereo fold sums up to three surround channels into each

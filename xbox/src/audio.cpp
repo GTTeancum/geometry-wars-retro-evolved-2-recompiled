@@ -15,6 +15,18 @@
 // The sound engine's time by part (src/sound_native.cpp), in cycles.
 extern unsigned long long g_prof_control, g_prof_audio, g_prof_sound, g_prof_effects, g_prof_reverb,
     g_prof_collect, g_prof_mix, g_prof_mark, g_prof_lock, g_prof_out;
+extern u32 gw_sound_late;  // passes a voice's stream was late (src/sound_native.cpp)
+
+#ifdef GW_AUDIO_CAPTURE
+// Sound out recording (make AUDIO_CAPTURE=y): [0] 'ACAP', [1] frames written
+// (ring position = [1] % kCaptureFrames), [2] frozen (set through xbdm),
+// [3] the ring's size in frames. Host memory of its own (1.5 MiB).
+constexpr unsigned kCaptureFrames = 1500;  // 8 s
+extern "C" {
+volatile u32 gw_audio_capture_state[4] = {0x50414341, 0, 0, kCaptureFrames};
+i16 gw_audio_capture_ring[kCaptureFrames][512];
+}
+#endif
 
 namespace {
 
@@ -132,6 +144,14 @@ DWORD WINAPI audio_thread(LPVOID) {
     for (u32 i = 0; i < kSamples * 2; i += 8) energy += (u64)((i32)frame[i] * frame[i]);
     u8* buffer = g_buffers + (queued % kBuffers) * kFrameBytes;
     memcpy(buffer, frame, kFrameBytes);
+#ifdef GW_AUDIO_CAPTURE
+    // The last kCaptureFrames frames sent out, until xbdm sets the freeze
+    // word (tools/xbdm_audio.py reads them).
+    if (!gw_audio_capture_state[2]) {
+      memcpy(gw_audio_capture_ring[gw_audio_capture_state[1] % kCaptureFrames], frame, kFrameBytes);
+      gw_audio_capture_state[1] = gw_audio_capture_state[1] + 1;
+    }
+#endif
     ac97_queue(buffer, kFrameBytes);
     ++queued;
   };
@@ -143,14 +163,24 @@ DWORD WINAPI audio_thread(LPVOID) {
     // one to fill.
     const u32 playing = kAc97[0x114] & 31;
     const u32 ahead = (queued % kBuffers - playing + kBuffers) % kBuffers;
+    // Ran dry (the AC97 halted at the last frame given): a gap in the
+    // sound, heard as a tick.
+    static u32 dry = 0, low = kAhead;
+    if (kAc97[0x116] & 1) {
+      ++dry;
+      kAc97[0x116] = 0x1C;  // clear the status bits that latch
+    }
+    if (ahead < low) low = ahead;
     static DWORD last = 0;
     if (GetTickCount() - last > 5000) {
       last = GetTickCount();
       // Mix cost per frame (a frame lasts 5333 us) and the output's level
       // (root mean square of the samples, 0..32767).
       const u32 rms = mixes ? (u32)__builtin_sqrtf((float)(energy / ((u64)mixes * kSamples / 4))) : 0;
-      gw_log("audio: %u frames out, %u ahead, mix %u us a frame, level %u (SSE control %04X)\n", queued, ahead,
-             mixes ? (u32)(mix_cycles / mixes / 733) : 0, rms, g_csr_seen);
+      gw_log("audio: %u frames out, %u ahead (fewest %u), ran dry %u times, streams late %u, mix %u us a frame, "
+             "level %u (SSE control %04X)\n",
+             queued, ahead, low, dry, gw_sound_late, mixes ? (u32)(mix_cycles / mixes / 733) : 0, rms, g_csr_seen);
+      low = kAhead;
       if (mixes) {
         gw_log("audio: us a frame: control %u, mixing %u (sounds %u, effects %u), reverb %u\n",
                (u32)(g_prof_control / mixes / 733), (u32)(g_prof_audio / mixes / 733),

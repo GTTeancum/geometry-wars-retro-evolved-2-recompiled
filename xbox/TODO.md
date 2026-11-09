@@ -114,6 +114,29 @@ starfield 2, the rest (the game's own code) about 17.
 
 ## 3. Picture still missing
 
+- [x] **Pausing locked the game up (2026-11-08) — fixed on the console, not
+      yet confirmed by hand.** The pause screen's vertices fill the game's
+      64 KiB command block, and it goes on in the next block without making
+      room (sub_820A5320), after the small sync buffers it put at that
+      block's start. catch_up started from the old chunk and read the
+      vertices as commands (a fence never written, the game waiting on it).
+      Now catch_up checks that its words read as whole packets of the kinds
+      the game writes, and tries the last chunk end, then each recently
+      handed-over buffer's end rounded up to 32 bytes; with none (the ring's
+      wrap back to its start) the words wait for the hand-over. A scratch
+      address other than the game's is refused. Five pause/resume cycles,
+      the pause menu drawn, no lockup.
+- [x] **Sound: a tiny tick behind the effects, the menu music's layers
+      overlapping (2026-11-08) — fixed, confirmed on the TV.**
+      Not the engine: the development console had converted banks from
+      before convert_banks.py handled 16-bit PCM waves (data type 3), each
+      of those 448 samples of garbage: the looping effects (Gravity_well_suck,
+      Mayfly, SFX_ambience, Ship_thrust_loop, a buzz under everything) and
+      every song's silent sync track (the menu's 4 s UIMusic_PCMSync, which
+      the music's section switches follow: all eight layers sounded at once).
+      Found by recording the console's output (make AUDIO_CAPTURE=y,
+      tools/xbdm_audio.py) and fitting it with the layers. The current banks
+      copied to xe:\GW2\Audio (deploying the .xbe alone leaves old ones).
 - [x] **Menu flicker on idle menus (seen 2026-11-08) — fixed, confirmed on
       the TV.** Not the 2026-11-07 kind (no frame lost
       draws): the logo's two ends dimmed for 1-3 frames every few frames.

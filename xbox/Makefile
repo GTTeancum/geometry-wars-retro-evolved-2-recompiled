@@ -75,6 +75,12 @@ ifeq ($(SPAWN_CAPTURE),y)
 src/nv2a.obj: NXDK_CXXFLAGS += -DGW_SPAWN_CAPTURE
 endif
 
+# Record the last 8 s of sound out and log the game's sound actions and
+# parameters (tools/xbdm_audio.py): make AUDIO_CAPTURE=y
+ifeq ($(AUDIO_CAPTURE),y)
+src/audio.obj src/sound_native.obj: NXDK_CXXFLAGS += -DGW_AUDIO_CAPTURE
+endif
+
 # Compare the native grid update with the original now and then: make GRID_CHECK=y
 ifeq ($(GRID_CHECK),y)
 src/grid_native.obj: NXDK_CXXFLAGS += -DGW_GRID_CHECK -DGW_GRID_GUEST_SYNC

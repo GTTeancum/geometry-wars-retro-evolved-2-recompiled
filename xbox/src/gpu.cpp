@@ -134,8 +134,42 @@ void dispatch_interrupt(PPCContext& ctx, u32 source) {
   LeaveCriticalSection(&g_interrupt_lock);
 }
 
+// The last events that move where the game's commands are: 'M' make room
+// (old last word, new), 'I' an indirect buffer run (start, end), 'C' a
+// catch-up (start, end).
+u32 g_events[32][3], g_event_n;
+u32 g_trace_events;  // events still to log as they happen
+void note_event(u32 kind, u32 a, u32 b) {
+  if (g_trace_events) {
+    --g_trace_events;
+    gw_log("  then %c %08X %08X\n", (char)kind, a, b);
+  }
+  u32* e = g_events[g_event_n++ % 32];
+  e[0] = kind;
+  e[1] = a;
+  e[2] = b;
+}
+void report_events() {
+  for (u32 k = g_event_n > 32 ? g_event_n - 32 : 0; k < g_event_n; ++k)
+    gw_log("  event %c %08X %08X\n", (char)g_events[k % 32][0], g_events[k % 32][1], g_events[k % 32][2]);
+}
+
 void write_register(u32 index, u32 value) {
   if (index >= kRegisterCount) return;
+  // The scratch registers' memory is set once by the game; another address
+  // is words that are not commands read as commands: refused, not written.
+  static u32 scratch_addr = 0;
+  if (index == kRegScratchAddr) {
+    if (!scratch_addr) scratch_addr = value;
+    if (value != scratch_addr) {
+      static u32 told = 0;
+      if (told++ < 4) {
+        gw_log("gpu: scratch address %08X refused (the game's is %08X)\n", value, scratch_addr);
+        report_events();
+      }
+      return;
+    }
+  }
   g_regs[index] = value;
   if (index >= kRegScratchReg0 && index <= kRegScratchReg0 + 7) {
     u32 n = index - kRegScratchReg0;
@@ -183,7 +217,8 @@ struct Reader {
 void write_registers(Reader& r, u32 first, u32 count, bool one) {
   const u32 last = one ? first : first + count - 1;
   const bool plain = last < kRegisterCount && !(first <= kRegScratchReg0 + 7 && last >= kRegScratchReg0) &&
-                     !(first <= kRegCoherStatusHost && last >= kRegCoherStatusHost);
+                     !(first <= kRegCoherStatusHost && last >= kRegCoherStatusHost) &&
+                     !(first <= kRegScratchAddr && last >= kRegScratchAddr);
   if (!plain) {
     for (u32 i = 0; i < count; ++i) write_register(one ? first : first + i, r.next());
     return;
@@ -203,16 +238,29 @@ void execute(Reader& r, u32 end, PPCContext& ctx);
 // them. g_buffer_end: the end of the last buffer run, where the game's next
 // commands start unless it moved to a new chunk.
 u32 g_consumed_start, g_consumed_end, g_buffer_end;
+// The ends of the last indirect buffers run (catch_up).
+u32 g_buffer_ends[8], g_buffer_end_n;
+
+// Where the words being run came from, for the audit's report (the pause
+// lockup hunt): 'r' the ring or an indirect buffer, 'c' a native draw's
+// catch-up, with the run's start and end (guest), and the last catch-ups.
+char g_run_kind = 'r';
+u32 g_run_start, g_run_end;
+u32 g_catch_ups[8][3], g_catch_up_n;
 
 // Runs guest command words [start, end) (dwords).
 void run_words(u32 start, u32 end, PPCContext& ctx) {
   if (end <= start) return;
+  g_run_start = start;
+  g_run_end = end;
   Reader r{start, (end - start) / 4, 0, false};
   execute(r, (end - start) / 4, ctx);
 }
 
 void run_indirect(u32 start, u32 length, PPCContext& ctx) {
   const u32 end = start + length * 4;
+  note_event('I', start, end);
+  g_buffer_ends[g_buffer_end_n++ % 8] = end;
   if (g_consumed_end > g_consumed_start && start < g_consumed_end && end > g_consumed_start) {
     run_words(start, g_consumed_start > start ? g_consumed_start : start, ctx);
     if (g_consumed_end < end) run_words(g_consumed_end, end, ctx);
@@ -448,9 +496,14 @@ void execute_type3(Reader& r, u32 packet, PPCContext& ctx) {
 }
 
 void execute(Reader& r, u32 end, PPCContext& ctx) {
+  // The last packets read, for the audit's report.
+  u32 recent[8][2] = {}, recent_n = 0;
   while (r.pos < end) {
     const u32 at = r.base + (r.ring ? (r.pos & (r.size - 1)) : r.pos) * 4;
     u32 packet = r.next();
+    recent[recent_n % 8][0] = at;
+    recent[recent_n % 8][1] = packet;
+    ++recent_n;
     ++gw_stats.gpu_packets;
     if (packet == 0) continue;
     // Audit: a packet running past the words given is not a packet (words
@@ -460,8 +513,18 @@ void execute(Reader& r, u32 end, PPCContext& ctx) {
       const u32 words = t == 0 || t == 3 ? ((packet >> 16) & 0x3FFF) + 1 : t == 1 ? 2 : 0;
       if (r.pos + words > end) {
         static u32 told = 0;
-        if (told++ < 16) gw_log("gpu audit: packet %08X at %08X runs %u words past its buffer\n", packet, at,
-                                r.pos + words - end);
+        if (told++ < 16) {
+          gw_log("gpu audit: packet %08X at %08X runs %u words past its buffer\n", packet, at, r.pos + words - end);
+          gw_log("  in a %s run %08X-%08X (buffer %08X, %u dwords); consumed %08X-%08X, last buffer end %08X\n",
+                 r.ring ? "ring" : g_run_kind == 'c' ? "catch-up" : "indirect", g_run_start, g_run_end, r.base, end,
+                 g_consumed_start, g_consumed_end, g_buffer_end);
+          for (u32 k = recent_n > 8 ? recent_n - 8 : 0; k < recent_n; ++k)
+            gw_log("  packet %08X at %08X\n", recent[k % 8][1], recent[k % 8][0]);
+          for (u32 k = g_catch_up_n > 8 ? g_catch_up_n - 8 : 0; k < g_catch_up_n; ++k)
+            gw_log("  catch-up %08X-%08X%s\n", g_catch_ups[k % 8][0], g_catch_ups[k % 8][1],
+                   g_catch_ups[k % 8][2] ? "" : " (from the last buffer end)");
+          report_events();
+        }
       }
     }
     switch (packet >> 30) {
@@ -567,11 +630,78 @@ u32 gpu_address(u32 a) { return (a & 0x1FFFFFFF) + ((((a >> 20) & 0xFFF) + 0x200
 
 // The command words since the last run, run now and noted as consumed.
 // False when they cannot be found.
+// Whether [start, end) reads as whole packets ending exactly at end (guest
+// addresses), each one of the kinds the game writes: words that are not
+// commands (vertices, the pause screen's) are mostly zeros and floats, which
+// read as empty words, type-1 packets, odd fillers, registers past the end
+// or unknown opcodes, and are refused.
+bool whole_packets(u32 start, u32 end) {
+  if (!start || start > end || end - start >= 0x100000 || (start & 3)) return false;
+  static const u8 kOpcodes[] = {0x10, 0x21, 0x22, 0x27, 0x2B, 0x2D, 0x2F, 0x36, 0x37, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
+                                0x45, 0x46, 0x50, 0x51, 0x54, 0x55, 0x56, 0x58, 0x5A, 0x5B, 0x60, 0x61, 0x62, 0x63, 0x64};
+  u32 at = start;
+  while (at < end) {
+    const u32 packet = gw_load32(at);
+    const u32 t = packet >> 30;
+    if (t == 2) {
+      if (packet != 0x80000000) return false;
+      at += 4;
+      continue;
+    }
+    if (t == 1 || packet == 0) return false;
+    const u32 count = ((packet >> 16) & 0x3FFF) + 1;
+    if (t == 0) {
+      const u32 first = packet & 0x7FFF;
+      if (first >= kRegisterCount || (!((packet >> 15) & 1) && first + count > kRegisterCount)) return false;
+    } else {
+      const u32 opcode = (packet >> 8) & 0x7F;
+      bool known = false;
+      for (u8 o : kOpcodes) known |= o == opcode;
+      if (!known) return false;
+    }
+    at += 4 * (count + 1);
+  }
+  return at == end;
+}
+
 bool catch_up(u32 dev, PPCContext& ctx) {
   const u32 end = gw_gpu_to_guest(gpu_address(gw_load32(dev + 48) + 4));
-  u32 start = g_consumed_end && g_consumed_end <= end && end - g_consumed_end < 0x100000 ? g_consumed_end : g_buffer_end;
-  if (!start || start > end || end - start >= 0x100000) return false;
+  // From where the last run ended, else the start of the chunk the game
+  // moved to last (make room), else the next 32-byte boundary after a
+  // buffer it handed over lately: when its writing reaches the end of a
+  // 64 KiB block (the pause screen, its vertices taking the room) it goes on
+  // in the next block without making room, after the small sync buffers it
+  // put at that block's start and handed over (seen on the console: the
+  // commands at the sync buffer's end rounded up to 32 bytes). The first of
+  // these that reads as whole packets up to the end. With none, the words
+  // run when the game hands them over (run_indirect): reading vertices as
+  // commands locked the game up on the pause screen (a fence never written).
+  u32 start = 0;
+  if (g_consumed_end && g_consumed_end <= end && whole_packets(g_consumed_end, end)) start = g_consumed_end;
+  else if (g_buffer_end && g_buffer_end <= end && whole_packets(g_buffer_end, end)) start = g_buffer_end;
+  for (u32 k = 0; !start && k < 8 && k < g_buffer_end_n; ++k) {
+    const u32 c = (g_buffer_ends[(g_buffer_end_n - 1 - k) % 8] + 31) & ~31u;
+    if (c <= end && whole_packets(c, end)) start = c;
+  }
+  if (!start) {
+    static u32 told = 0;
+    if (told++ < 8)
+      gw_log("gpu: the words before %08X not found (last run end %08X, chunk %08X); left for the hand-over\n", end,
+             g_consumed_end, g_buffer_end);
+    if (told == 1) {
+      report_events();
+      g_trace_events = 60;
+    }
+    return false;
+  }
+  g_catch_ups[g_catch_up_n % 8][0] = start;
+  g_catch_ups[g_catch_up_n % 8][1] = end;
+  g_catch_ups[g_catch_up_n % 8][2] = start == g_consumed_end;
+  ++g_catch_up_n;
+  g_run_kind = 'c';
+  note_event('C', start, end);
   run_words(start, end, ctx);
+  g_run_kind = 'r';
   if (start != g_consumed_end) g_consumed_start = start;
   g_consumed_end = end;
   return true;
@@ -694,9 +824,11 @@ bool native_enabled(u32 dev) { return g_nv2a_started && !(gw_load8(dev + 10940) 
 // start after the word it returns, which catch_up then starts from
 // (the end of the last buffer run would be the old chunk's).
 extern "C" void sub_820A5320(PPCContext& ctx, uint8_t* base) {
+  const u32 before = gw_load32(ctx.r3.u32 + 48);
   __imp__sub_820A5320(ctx, base);
   const u32 result = ctx.r3.u32;
   EnterCriticalSection(&g_command_lock);
+  note_event('M', before, result);
   // r3: the new last-written word (the callers write after it).
   g_buffer_end = gw_gpu_to_guest(gpu_address(result + 4));
   LeaveCriticalSection(&g_command_lock);
