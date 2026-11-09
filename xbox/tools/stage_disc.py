@@ -1,6 +1,9 @@
 """Stage the Xbox disc in xbox/build/staged-disc.
 
-  default.xbe            xbox/build/release/default.xbe
+  default.xbe            xbox/build/release/default.xbe, with the dashboard's
+                         title name and images (tools/xbe_meta.py)
+  TitleImage.xbx, SaveImage.xbx, TitleMeta.xbx
+                         the dashboard's images and name, from the game's icon
   default.xex + data     game/extracted (the package's files; the runtime
                          reads the XEX header and the game opens the rest)
   gw2/default.image.bin  game/analysis/default.image.bin (tools/dump_image)
@@ -80,13 +83,25 @@ def main():
     else:
         staged_loc.replace(loc)
         changed += 1
-    # The sound banks converted for the Xbox (xbox/tools/convert_banks.py
-    # into xbox/build/audio_adpcm), next to the game's banks; the native
-    # sound engine (src/sound_native.cpp) plays these.
-    for src in sorted((ROOT / 'xbox' / 'build' / 'audio_adpcm').glob('*.adpcm')):
+    # The sound banks converted for the Xbox, next to the game's banks; the
+    # native sound engine (src/sound_native.cpp) plays these: Xbox ADPCM
+    # (xbox/tools/xadpcm_banks.cmd into xbox/build/audio_xadpcm, from
+    # xbox/tools/convert_banks.py's IMA ADPCM in xbox/build/audio_adpcm).
+    banks = ROOT / 'xbox' / 'build' / 'audio_xadpcm'
+    if not any(banks.glob('*.adpcm')):
+        sys.exit(f'{banks} has no banks: run xbox/tools/xadpcm_banks.cmd')
+    for src in sorted(banks.glob('*.adpcm')):
         changed += copy(src, STAGE / 'Audio' / src.name)
     changed += copy(image, STAGE / 'gw2' / 'default.image.bin')
-    changed += copy(xbe, STAGE / 'default.xbe')
+    staged_xbe = STAGE / 'default.xbe'
+    if not staged_xbe.exists() or staged_xbe.stat().st_mtime < xbe.stat().st_mtime:
+        shutil.copyfile(xbe, staged_xbe)
+        changed += 1
+    # The dashboard's title name and images, from the game's own icon
+    # (tools/xbe_meta.py): in the staged XBE and next to it.
+    import subprocess
+    subprocess.run([sys.executable, str(ROOT / 'xbox' / 'tools' / 'xbe_meta.py'), 'dashboard', str(staged_xbe),
+                    str(image), str(STAGE)], check=True)
     if devkit_128:
         # Test only: let the staged copy use a 128 MiB development kit's memory.
         clear_limit_64mb(STAGE / 'default.xbe')

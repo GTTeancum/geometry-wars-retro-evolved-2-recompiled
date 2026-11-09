@@ -9,7 +9,8 @@
   2. Writes the game's decrypted image (gw2\default.image.bin) with
      dump_image.exe, and checks that it is the supported version.
   3. Copies the game's files next to default.xbe in the output folder, ready
-     to copy to the Xbox (or to build a disc image from).
+     to copy to the Xbox (or to build a disc image from), and gives the XBE
+     the dashboard's title name and the game's own icon.
   4. Converts the sounds from XMA to IMA ADPCM (audio\<bank>.adpcm), with
      ffmpeg from PATH or ffmpeg.exe next to this script.
 
@@ -28,7 +29,7 @@ $here = $PSScriptRoot
 $titleId = [uint32]'0x584108FF'
 $imageSha256 = '4168A02A62542D32660E63EFDE3244BB423D593C288402F177BF5E6F8C33B901'
 
-foreach ($file in 'default.xbe', 'StfsExtract.cs', 'SoundConvert.cs', 'dump_image.exe', 'rexruntime.dll') {
+foreach ($file in 'default.xbe', 'StfsExtract.cs', 'SoundConvert.cs', 'DashboardIcon.cs', 'dump_image.exe', 'rexruntime.dll') {
     if (-not (Test-Path -LiteralPath (Join-Path $here $file))) { throw "$file is missing from $here; unpack the whole installer first." }
 }
 $pkg = (Resolve-Path -LiteralPath $Package).Path
@@ -65,6 +66,13 @@ try {
     New-Item -ItemType Directory -Force (Join-Path $out 'gw2') | Out-Null
     Copy-Item -LiteralPath $image -Destination (Join-Path $out 'gw2\default.image.bin')
     Copy-Item -LiteralPath (Join-Path $here 'default.xbe') -Destination (Join-Path $out 'default.xbe')
+
+    # The dashboard's title name and the game's own icon, from this copy of
+    # the game: into the XBE and next to it (the download carries none of
+    # the game's art).
+    Write-Host 'Adding the dashboard icon...'
+    Add-Type -Path (Join-Path $here 'DashboardIcon.cs')
+    [DashboardIcon]::Run($image, (Join-Path $out 'default.xbe'), $out)
 
     # The Xbox has no XMA: the sounds become IMA ADPCM, through ffmpeg (on
     # PATH, or ffmpeg.exe next to this script).

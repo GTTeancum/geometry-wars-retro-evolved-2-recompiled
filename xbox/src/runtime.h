@@ -215,6 +215,12 @@ void gw_sound_param(u32 param, float value);
 void gw_sound_action(const char* name);           // an action (event) by name
 void gw_sound_set_param(const char* name, float value);
 void gw_sound_debug();                            // what is playing (the PC check)
+struct GwSoundWave {
+  const u8* data;
+  u32 size, block, channels, samples, rate;
+  bool xa;  // Xbox ADPCM already (a 'GWX1' bank); else IMA ADPCM in Microsoft blocks
+};
+bool gw_sound_find_wave(const char* bank, const char* name, GwSoundWave* out);  // (held in memory)
 float gw_sound_output(u32 output);
 void gw_sound_pause(bool paused);
 // src/audio.cpp: the AC97 output thread.

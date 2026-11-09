@@ -1,5 +1,7 @@
 """Converts the game's sound banks (audio\\*.baf) from XMA to IMA ADPCM for
-the Xbox, which has no XMA. Run by the installer; needs ffmpeg.
+the Xbox, which has no XMA (development; the installer has its own,
+installer/SoundConvert.cs). Needs ffmpeg. tools/xadpcm_banks.cmd then turns
+the result into the Xbox ADPCM banks the game plays.
 
 A bank: 'BANK' header (0x34 bytes; wave count at +12), then one 'WAVE'
 record per sample, each with its own size at +4 (0x5C, or 0x50 without loop

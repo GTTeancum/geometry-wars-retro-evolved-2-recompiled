@@ -8,6 +8,8 @@
 // take the processor from the game.
 #include "runtime.h"
 
+#include "apu.h"
+
 #include <windows.h>
 #include <xboxkrnl/xboxkrnl.h>
 #include <xmmintrin.h>
@@ -109,6 +111,90 @@ void gw_audio_stop() {
 
 namespace {
 
+#ifdef GW_APU_TEST
+// The APU test (make APU_TEST=y AUDIO_CAPTURE=y): one effect of the game,
+// turned into Xbox ADPCM, looping on hardware voice 0; the GP's output is
+// what is played, and only what the GP produced is recorded, in frames of
+// 256 (xemu runs the GP far slower than real time, so the recording holds
+// its output, not real-time sound). tools/xbdm_audio.py reads it.
+// (xemu runs voices 0-63 through the 3D (HRTF) stage, silent without an
+// HRTF entry; voices 64 and up are plain 2D voices there as on a console)
+constexpr u32 kTestVoice = 64;
+
+void apu_test_start() {
+  if (!gw_apu_init()) return;
+  GwSoundWave w;
+  static const char* const kName = "Enemy_explode";
+  if (!gw_sound_find_wave("GW3", kName, &w)) {
+    gw_log("apu test: %s not in memory\n", kName);
+    return;
+  }
+  // (the samples the data holds: one entry says more than it has)
+  u32 samples = w.samples;
+  if (!w.xa) {
+    const u32 per = (w.block - 4 * w.channels) * 2 / w.channels + 1;
+    samples = (w.size / w.block) * per;
+    if (w.size % w.block > 4 * w.channels) samples += (w.size % w.block - 4 * w.channels) * 2 / w.channels + 1;
+    if (samples > w.samples) samples = w.samples;
+  }
+#ifdef GW_APU_TEST_PCM
+  const u32 bits = 16, bytes = samples * 2 * w.channels;
+#else
+  const u32 bits = 4, bytes = gw_xadpcm_blocks(samples) * 36 * w.channels;
+#endif
+  u8* x = (u8*)MmAllocateContiguousMemoryEx(bytes, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
+  if (!x) return;
+  if (bits == 4 && w.xa) memcpy(x, w.data, bytes);
+  else if (bits == 4) gw_xadpcm_reblock(w.data, w.block, w.channels, samples, x);
+  else gw_ima_decode(w.data, w.block, w.channels, samples, (i16*)x);
+  GwApuVoice v = {};
+  v.ba = gw_apu_map(x, bytes);
+  v.channels = w.channels;
+  v.bits = bits;
+  v.loop_end = samples;
+  v.pitch = gw_apu_pitch((float)w.rate / 48000.0f);
+  v.left = v.right = 1.0f;
+  gw_apu_voice_start(kTestVoice, v);
+  gw_apu_voices_go();
+  gw_log("apu test: voice %u plays %s (%u samples, %u channels, %u bytes at %06X)\n", kTestVoice, kName, samples, w.channels, bytes, v.ba);
+}
+
+void apu_test_frame(i16* frame) {
+  static i16 staged[512];
+  static u32 staged_n;
+  static u32 last_log;
+  // Everything the GP has written since the last call (xemu runs it a little
+  // fast, so taking only what the AC97 plays would let the GP's ring lap
+  // the reader); the first 256 frames are played.
+  static i16 chunk[512];
+  u32 total = 0;
+  for (u32 got; (got = gw_apu_read(chunk, 256)) > 0;) {
+    if (total == 0) memcpy(frame, chunk, got * 4);
+    for (u32 i = 0; i < got; ++i) {
+#ifdef GW_AUDIO_CAPTURE
+      staged[staged_n * 2] = chunk[i * 2];
+      staged[staged_n * 2 + 1] = chunk[i * 2 + 1];
+      if (++staged_n == 256) {
+        staged_n = 0;
+        if (!gw_audio_capture_state[2]) {
+          memcpy(gw_audio_capture_ring[gw_audio_capture_state[1] % kCaptureFrames], staged, sizeof(staged));
+          gw_audio_capture_state[1] = gw_audio_capture_state[1] + 1;
+        }
+      }
+#endif
+    }
+    if (total == 0)
+      for (u32 i = got; i < 256; ++i) frame[i * 2] = frame[i * 2 + 1] = 0;
+    total += got;
+  }
+  if (total == 0) memset(frame, 0, 256 * 4);
+  if (GetTickCount() - last_log > 5000) {
+    last_log = GetTickCount();
+    gw_log("apu test: %u GP frames, the voice at sample %u\n", gw_apu_frames(), gw_apu_voice_position(kTestVoice));
+  }
+}
+#endif
+
 DWORD WINAPI audio_thread(LPVOID) {
   gw_log("audio: host thread %u\n", (u32)GetCurrentThreadId());
   // Results too small for a normal float flushed to zero: the sound graphs'
@@ -136,7 +222,11 @@ DWORD WINAPI audio_thread(LPVOID) {
       const u32 csr = _mm_getcsr();
       g_csr_seen = csr;
       _mm_setcsr(csr | 0x8000);
+#ifdef GW_APU_TEST
+      apu_test_frame(frame);
+#else
       gw_sound_mix(frame, kSamples);
+#endif
       _mm_setcsr(csr);
     }
     mix_cycles += __builtin_ia32_rdtsc() - t0;
@@ -144,7 +234,7 @@ DWORD WINAPI audio_thread(LPVOID) {
     for (u32 i = 0; i < kSamples * 2; i += 8) energy += (u64)((i32)frame[i] * frame[i]);
     u8* buffer = g_buffers + (queued % kBuffers) * kFrameBytes;
     memcpy(buffer, frame, kFrameBytes);
-#ifdef GW_AUDIO_CAPTURE
+#if defined(GW_AUDIO_CAPTURE) && !defined(GW_APU_TEST)
     // The last kCaptureFrames frames sent out, until xbdm sets the freeze
     // word (tools/xbdm_audio.py reads them).
     if (!gw_audio_capture_state[2]) {
@@ -155,6 +245,9 @@ DWORD WINAPI audio_thread(LPVOID) {
     ac97_queue(buffer, kFrameBytes);
     ++queued;
   };
+#ifdef GW_APU_TEST
+  apu_test_start();
+#endif
   for (u32 i = 0; i < kAhead; ++i) provide();
   kAc97[0x11B] = 1;  // run, no interrupts
   kAc97[0x17B] = 1;

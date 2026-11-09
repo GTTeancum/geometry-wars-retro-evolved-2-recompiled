@@ -18,9 +18,10 @@ $sources = @{
     'install.cmd'    = Join-Path $xbox 'installer\install.cmd'
     'StfsExtract.cs' = Join-Path $root 'tools\StfsExtract.cs'
     'SoundConvert.cs' = Join-Path $xbox 'installer\SoundConvert.cs'
+    'DashboardIcon.cs' = Join-Path $xbox 'installer\DashboardIcon.cs'
     'dump_image.exe' = Join-Path $root 'build\dump_image\dump_image.exe'
     'rexruntime.dll' = Join-Path $root 'build\dump_image\rexruntime.dll'
-    'default.xbe'    = Join-Path $xbox 'build\release\default.xbe'
+    'default.xbe'    = Join-Path $xbox 'build\release\default.plain.xbe'  # (without the game's icon)
 }
 foreach ($name in $sources.Keys) {
     if (-not (Test-Path -LiteralPath $sources[$name])) { throw "$($sources[$name]) is missing." }

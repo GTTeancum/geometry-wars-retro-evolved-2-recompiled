@@ -118,6 +118,11 @@ int main(int argc, char** argv) {
   if (getenv("FTZ")) _mm_setcsr(_mm_getcsr() | 0x8000);
   QueryPerformanceFrequency(&g_freq);
   gw_sound_start();
+  if (getenv("APU_REPORT")) {
+    extern void gw_sound_apu_report();
+    gw_sound_apu_report();
+    return 0;
+  }
   if (getenv("CONSOLE_MENU")) {
     // The menu as the console's game drives it (logged by an AUDIO_CAPTURE
     // build): its events and numbered parameters at the same passes.

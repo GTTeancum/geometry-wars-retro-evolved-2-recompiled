@@ -33,6 +33,12 @@
 // mixers are combined so each sound is mixed once (see collect).
 #include "runtime.h"
 
+#ifdef GW_SOUND_APU
+#include <xboxkrnl/xboxkrnl.h>
+
+#include "apu.h"
+#endif
+
 #include <math.h>
 #include <new>
 #include <windows.h>
@@ -109,6 +115,14 @@ struct Wave {
   u8* volatile head;
   u32 head_blocks;
   u8* data;  // the whole wave, when held in memory (bank_resident)
+  // The APU's copy (GW_SOUND_APU): each channel as mono Xbox ADPCM at
+  // sample-space offset apu_ba[c], apu_samples long, then a silent tail.
+  u32 apu_ba[2];
+  u32 apu_samples;
+  // Xbox ADPCM (a 'GWX1' bank): 36-byte blocks per channel of 64 samples (a
+  // header sample, then 63 codes; the 64th code is not played), interleaved
+  // per block for stereo; 'block' is a group of them (one stream slot).
+  bool xa;
 };
 struct Bank {
   char name[24];
@@ -225,7 +239,9 @@ bool bank_open(const char* name) {
   u32 head[2];
   DWORD done = 0;
   ReadFile(f, head, 8, &done, nullptr);
-  if (done != 8 || head[0] != 0x44415747) {
+  // 'GWAD': IMA ADPCM in Microsoft blocks; 'GWX1': Xbox ADPCM (xbox/tools/xadpcm_bank).
+  const bool xa = head[0] == 0x31585747;
+  if (done != 8 || (head[0] != 0x44415747 && !xa)) {
     CloseHandle(f);
     return false;
   }
@@ -235,7 +251,11 @@ bool bank_open(const char* name) {
     // A wave's length is what its blocks hold (one entry, LeaderChange2,
     // claims more: its source decoded shorter than its header said).
     Wave& w = waves[i];
-    if (w.channels >= 1 && w.channels <= 2 && w.block > 4 * w.channels) {
+    w.xa = xa;
+    if (xa) {
+      if (w.channels >= 1 && w.channels <= 2 && w.block >= 36 * w.channels && w.samples > w.size / (36 * w.channels) * 64)
+        w.samples = w.size / (36 * w.channels) * 64;
+    } else if (w.channels >= 1 && w.channels <= 2 && w.block > 4 * w.channels) {
       const u32 blocks = (w.size + w.block - 1) / w.block;
       const u32 last = w.size - (blocks ? blocks - 1 : 0) * w.block;
       const u32 per = (w.block - 4 * w.channels) * 2 / w.channels + 1;
@@ -343,10 +363,17 @@ struct Reader {
   Ring* ring = nullptr;
   u32 ring_read = 0, ring_written = 0, ring_first = 0, ring_next = 0;
 
-  u32 per_block() const { return (wave->block - 4 * wave->channels) * 2 / wave->channels + 1; }
+  // (A "block" here is what one read takes: an IMA ADPCM block, or a group
+  // of Xbox ADPCM blocks.)
+  u32 per_block() const {
+    return wave->xa ? wave->block / (36 * wave->channels) * 64 : (wave->block - 4 * wave->channels) * 2 / wave->channels + 1;
+  }
   u32 blocks() const { return (wave->size + wave->block - 1) / wave->block; }
   u32 block_bytes(u32 b) const { return b + 1 == blocks() ? wave->size - b * wave->block : wave->block; }
-  u32 block_samples(u32 b) const { return (block_bytes(b) - 4 * wave->channels) * 2 / wave->channels + 1; }
+  u32 block_samples(u32 b) const {
+    return wave->xa ? block_bytes(b) / (36 * wave->channels) * 64
+                    : (block_bytes(b) - 4 * wave->channels) * 2 / wave->channels + 1;
+  }
   bool streamed() const { return !wave->data; }
 
   u32 head_blocks() const { return wave->head ? wave->head_blocks : 0; }
@@ -373,7 +400,7 @@ struct Reader {
     stream_want(b);
     if (b < head_blocks()) return wave->head + b * wave->block;
     if (!ring || ring_read == ring_written || ring_first != b) return nullptr;
-    return ring->data + (ring_read % kStreamBlocks) * kMaxBlock;
+    return ring->data + (ring_read % kStreamBlocks) * wave->block;
   }
   void start(u32 sample) {
     pos = sample < wave->samples ? sample : 0;
@@ -389,6 +416,32 @@ struct Reader {
     const u32 wch = wave->channels;
     i32 p = pred[c], ix = idx[c] * 16;
     u32 a = at;
+    if (wave->xa) {
+      // Xbox ADPCM: each 64 samples a block of its own (its header resets the
+      // state), the codes after it as in IMA ADPCM.
+      for (; count; --count, ++a) {
+        const u32 k = a & 63;
+        const u8* blk = bytes + (a >> 6) * 36 * wch;
+        if (k == 0) {
+          p = (i16)(blk[c * 4] | blk[c * 4 + 1] << 8);
+          ix = (blk[c * 4 + 2] > 88 ? 88 : blk[c * 4 + 2]) * 16;
+        } else {
+          const u32 code = k - 1;
+          const u8* q = blk + 4 * wch + (code >> 3) * 4 * wch + 4 * c;
+          const int nibble = (q[(code & 7) >> 1] >> ((code & 1) << 2)) & 15;
+          p += g_adpcm_diff[ix + nibble];
+          p = p > 32767 ? 32767 : p < -32768 ? -32768 : p;
+          ix = g_adpcm_next[ix + nibble] * 16;
+        }
+        if (out) {
+          *out = (float)p * (1.0f / 32768.0f);
+          out += stride;
+        }
+      }
+      pred[c] = p;
+      idx[c] = ix / 16;
+      return;
+    }
     if (a == 0 && count) {
       if (out) {
         *out = (float)p * (1.0f / 32768.0f);
@@ -557,6 +610,20 @@ struct Voice {
   float target_step = 1, prev_step = 1;
   float gain_target = 0, gain_prev = 0, gain_last = 0;
   float pitch = 1;
+  // On the APU (GW_SOUND_APU): a hardware voice per wave channel (-1: none,
+  // the voice plays in software), and this pass's mixes into bins.
+  // hw: its hardware voice (-1: software; a stereo wave is one stereo
+  // voice, its left channel on outputs 0 2 4 6, its right on 1 3 5 7);
+  // hw_ring: a streamed wave's ring of Xbox ADPCM blocks the voice loops
+  // over (-1: an in-memory wave), with the samples played since the start
+  // (hw_played; hw_cbo the last play position seen), the blocks written
+  // (hw_out) and the wave's sample it started at (hw_start).
+  i16 hw[2] = {-1, -1};
+  i16 hw_ring = -1;
+  u32 hw_played = 0, hw_cbo = 0, hw_out = 0, hw_start = 0;
+  u8 rt_n[2] = {0, 0};
+  u8 rt_bin[2][4];
+  float rt_gain[2][4];
 };
 
 struct Comp {
@@ -582,6 +649,16 @@ struct Comp {
   bool live = false;     // something under it can sound this pass
   bool inserts = false;  // a mixer with insert effects (its own buffer in the chain)
   bool pulled = false;   // an output port takes it
+  // On the APU (GW_SOUND_APU): a sound whose every way out is plain mixing
+  // up to bin mixers (its voices can play on the APU), and those mixers; a
+  // bin mixer (a graph output's mixer, or one with inserts), its bins while
+  // voices mix into it, and how many voices do.
+  bool apu_ok = false;
+  u8 apu_target_n = 0;
+  Comp* apu_targets[4] = {};
+  bool apu_out = false;
+  i8 apu_bins[4] = {-1, -1, -1, -1};
+  u32 apu_refs = 0;
   u32 collected = 0xFFFFFFFF;  // the period its mixes were combined (g_contribs[contrib_first, contrib_end))
   u32 contrib_first = 0, contrib_end = 0;
   // sound players
@@ -730,7 +807,8 @@ void sound_init(Graph& g, Comp& c) {
   // decoded past the end of its data.
   if (w && (w->channels < 1 || w->channels > 2 || w->block <= 4 * w->channels || w->block > kMaxBlock ||
             !w->samples || w->offset + w->size > GetFileSize(bank->file, nullptr) ||
-            (u64)((w->size + w->block - 1) / w->block) * ((w->block - 4 * w->channels) * 2 / w->channels + 1) <
+            (w->xa ? (u64)(w->size / (36 * w->channels)) * 64
+                   : (u64)((w->size + w->block - 1) / w->block) * ((w->block - 4 * w->channels) * 2 / w->channels + 1)) <
                 w->samples)) {
     gw_log("sound: %s: wave %s has blocks this engine cannot hold\n", g.name, w->name);
     w = nullptr;
@@ -806,9 +884,11 @@ void voice_start(Voice& v, u32 at) {
   v.target_step = v.prev_step = 1;
 }
 
+void hw_voice_stop(Voice& v);
 void voice_stop(Voice& v) {
   v.playing = false;
   ring_give_back(v.r);
+  hw_voice_stop(v);
 }
 
 // A voice reached the end of its wave: its finish action, and the count of
@@ -837,6 +917,7 @@ void playing_changed(Graph& g, Comp& c) {
   else --g.playing_count;
 }
 
+void hw_voice_start(Graph& g, Comp& c, Voice& v);
 void sound_action(Graph& g, Comp& c, u32 action) {
   sound_update(g, c);
   if (action == 0) {
@@ -845,12 +926,14 @@ void sound_action(Graph& g, Comp& c, u32 action) {
       const float start = read_slot(g, c.b + 0x3C);
       c.s[1] = 1;
       voice_start(v, v.r.wave ? (u32)((float)v.r.wave->samples * start) : 0);
+      hw_voice_start(g, c, v);
     } else {
       i32 v = c.last_voice + 1;
       if (v >= (i32)c.voice_count) v = 0;
       c.last_voice = v;
       if (!c.voices[v].playing) c.s[1] += 1;
       voice_start(c.voices[v], 0);
+      hw_voice_start(g, c, c.voices[v]);
     }
   } else if (action == 1) {
     for (u32 v = 0; v < c.voice_count; ++v) voice_stop(c.voices[v]);
@@ -961,7 +1044,8 @@ bool sound_process(Graph& g, Comp& c, bool needed) {
   if (!playing(c)) return false;
   bool any = false, first = true;
   PROF_BEGIN(sound);
-  for (u32 v = 0; v < c.voice_count; ++v) any |= voice_render(g, c, c.voices[v], c.buf, needed, &first);
+  for (u32 v = 0; v < c.voice_count; ++v)
+    if (c.voices[v].hw[0] < 0) any |= voice_render(g, c, c.voices[v], c.buf, needed, &first);
   PROF_END(sound);
   return any;
 }
@@ -1278,6 +1362,10 @@ void collect(Graph& g, Comp& m, const float (*A)[16], u32 dch) {
 }
 
 bool compute(Graph& g, Comp& d);
+#ifdef GW_SOUND_APU
+void hw_route_add(Graph& g, Comp& d, Comp& s, const float* A);
+bool hw_bins_add(Graph& g, Comp& d, bool* fresh);
+#endif
 
 // A contribution's source with its audio ready this pass; false if silent.
 bool source_ready(Graph& g, Comp& s, float gain) {
@@ -1334,6 +1422,9 @@ bool compute(Graph& g, Comp& d) {
     Comp& s = *t.src;
     float peak = 0;
     for (u32 x = 0; x < 16; ++x) peak = fmaxf(peak, fmaxf(fabsf(A0[x]), fabsf(A1[x])));
+#ifdef GW_SOUND_APU
+    if (d.apu_out && s.apu_ok) hw_route_add(g, d, s, A1);
+#endif
     if (!source_ready(g, s, peak)) continue;
     any = true;
     PROF_BEGIN(mix);
@@ -1367,6 +1458,9 @@ bool compute(Graph& g, Comp& d) {
     }
     PROF_END(mix);
   }
+#ifdef GW_SOUND_APU
+  if (d.apu_out && d.apu_refs) any |= hw_bins_add(g, d, fresh);
+#endif
   if (!any) return false;
   for (u32 o = 0; o < d.out_ch; ++o)
     if (fresh[o]) memset(d.buf[o], 0, sizeof(d.buf[o]));
@@ -2296,7 +2390,489 @@ Comp* find_comp(Graph& g, const char* name, u32 type) {
 const float* g_out[2];  // System's output this pass (null: silent)
 const float* g_wet;     // its reverb send
 
+
+// --- sounds on the APU (GW_SOUND_APU) ----------------------------------------------------
+// A sound whose every way out is plain mixing (mixers without inserts) up to
+// "bin mixers" (a graph output's mixer, or any mixer with inserts) plays on
+// the APU's voice processor: a hardware voice per wave channel decodes,
+// pitches and mixes it into the bins of those mixers, with the gains the
+// graph's mixers give it each pass. The GP copies the bins to the ring; each
+// pass reads them back and adds them into their mixers before the mixers'
+// inserts run, so a mixer's effects work on what the APU and software mixed
+// together. Software mixing goes on for everything else. The audio thread
+// waits on the APU's output, so the two parts stay in step. A bin mixer has
+// bins only while voices mix into it; a voice that finds no bins or no free
+// hardware voice plays in software as before.
+#ifdef GW_SOUND_APU
+bool g_apu_on;
+constexpr u32 kHwFirst = 64;             // xemu runs voices 0-63 through its HRTF stage (silent without an entry)
+constexpr u32 kBinsUsed = kBinsCopied - 1;  // the last copied bin is where muted outputs go
+constexpr u8 kBinMuted = kBinsCopied - 1;
+constexpr float kHeadroom = 0.25f;       // the bins are 16-bit: gains go in at a quarter, read back times 4
+constexpr u32 kTailBlocks = 16;          // silent blocks after each wave: a one-shot loops there until it is taken off
+constexpr u32 kHwRings = 32;             // streams on the APU at once
+constexpr u32 kRingBlocks = 256;         // a stream's ring: 256 blocks (16384 samples, 0.34 s)
+u8* g_ring_mem;                          // kHwRings rings of kRingBlocks * 72 bytes
+u32 g_ring_ba;                           // their offset in the sample space
+bool g_ring_used[kHwRings];
+struct HwOwner {
+  Graph* g;
+  Comp* c;
+  Voice* v;
+};
+HwOwner g_hw[kMaxVoices];
+Comp* g_bin_owner[kBinsCopied];
+float g_bins[kBinsCopied][kPass];
+u8 g_bins_wanted[kBinsCopied];
+u32 g_hw_starts, g_hw_full, g_hw_no_bins, g_apu_waves, g_apu_able, g_apu_sounds;
+float g_bin_scale = 4.0f / 32768.0f;  // a bin's 16-bit value to the engine's level (apu_calibrate)
+
+// What the APU's path does to a level, measured: a constant 0.25 (16-bit
+// samples) looping on a voice at full volume into bins 0 and 1, read back
+// from the ring. The bins' scale is set so that a voice at gain g reads back
+// as g (with the headroom); xemu's mix came back at half.
+void apu_calibrate() {
+  i16* dc = (i16*)MmAllocateContiguousMemoryEx(4096, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE);
+  if (!dc) return;
+  for (u32 i = 0; i < 2048; ++i) dc[i] = 8192;
+  GwApuVoice v = {};
+  v.ba = gw_apu_map(dc, 4096);
+  v.channels = 1;
+  v.bits = 16;
+  v.loop_end = 2048;
+  v.left = v.right = 1.0f;
+  gw_apu_voice_start(kMaxVoices - 1, v);
+  gw_apu_voices_go();
+  Sleep(60);
+  gw_apu_skip(gw_apu_available());
+  for (u32 t = 0; t < 100 && gw_apu_available() < kPass; ++t) Sleep(1);
+  static float probe[kBinsCopied][kPass];
+  u8 want[kBinsCopied] = {1, 1};
+  float level = 0;
+  if (gw_apu_available() >= kPass) {
+    gw_apu_read_bins(probe, want, 1.0f / 32768.0f);
+    for (u32 n = 0; n < kPass; ++n) level += probe[0][n];
+    level /= kPass;
+  }
+  gw_apu_voice_stop(kMaxVoices - 1);
+  Sleep(10);
+  gw_apu_skip(gw_apu_available());
+  if (level > 0.01f && level < 1.0f) g_bin_scale = 0.25f / level / kHeadroom / 32768.0f;
+  gw_log("sound: the APU's mix of a 0.25 level reads back as %d/1000: bins scaled by %d/1000 of 4\n",
+         (int)(level * 1000), (int)(g_bin_scale * 32768.0f / 4.0f * 1000));
+}
+
+// The bank's in-memory waves as mono Xbox ADPCM, each channel followed by a
+// silent tail, in one block of contiguous memory mapped into the sample space.
+void apu_prepare(Bank& b) {
+  u32 total = 0;
+  auto have_samples = [](const Wave& w) {
+    if (w.xa) return w.samples;
+    const u32 per = (w.block - 4 * w.channels) * 2 / w.channels + 1;
+    u32 n = (w.size / w.block) * per;
+    if (w.size % w.block > 4 * w.channels) n += (w.size % w.block - 4 * w.channels) * 2 / w.channels + 1;
+    return n < w.samples ? n : w.samples;
+  };
+  for (u32 i = 0; i < b.count; ++i) {
+    const Wave& w = b.waves[i];
+    if (w.data && w.channels >= 1 && w.channels <= 2)
+      total += (gw_xadpcm_blocks(have_samples(w)) + kTailBlocks) * 36 * w.channels;
+  }
+  total += kHwRings * kRingBlocks * 72;  // the streams' rings, after the waves
+  u8* mem = total ? (u8*)MmAllocateContiguousMemoryEx(total, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE)
+                  : nullptr;
+  if (!mem) {
+    gw_log("sound: no memory for the APU's copy of bank %s (%u KiB)\n", b.name, total / 1024);
+    return;
+  }
+  const u32 base = gw_apu_map(mem, total);
+  if (base == 0xFFFFFFFF) {
+    gw_log("sound: no sample space for bank %s\n", b.name);
+    return;
+  }
+  u32 at = 0, n = 0;
+  for (u32 i = 0; i < b.count; ++i) {
+    Wave& w = b.waves[i];
+    if (!w.data || w.channels < 1 || w.channels > 2) continue;
+    const u32 samples = have_samples(w), bytes = (gw_xadpcm_blocks(samples) + kTailBlocks) * 36 * w.channels;
+    memset(mem + at, 0, bytes);
+    if (w.xa) memcpy(mem + at, w.data, gw_xadpcm_blocks(samples) * 36 * w.channels);
+    else gw_xadpcm_reblock(w.data, w.block, w.channels, samples, mem + at);
+    w.apu_ba[0] = base + at;
+    w.apu_samples = samples;
+    at += bytes;
+    ++n;
+    ++g_apu_waves;
+  }
+  memset(mem + at, 0, kHwRings * kRingBlocks * 72);
+  g_ring_mem = mem + at;
+  g_ring_ba = base + at;
+  gw_log("sound: bank %s: %u waves for the APU (%u KiB)\n", b.name, n, total / 1024);
+}
+
+// The bin mixers a sound reaches through plain mixing; false when one of its
+// ways out reaches anything else.
+bool apu_reach(Graph& g, u32 i, u32 depth, Comp& sound) {
+  if (depth > 16 || g.parent_first[i] == g.parent_first[i + 1]) return false;
+  for (u32 k = g.parent_first[i]; k < g.parent_first[i + 1]; ++k) {
+    Comp& m = g.c[g.parents[k]];
+    if (m.kind != kAudioMixer) return false;
+    if (m.apu_out) {
+      if (m.out_ch > 4) return false;
+      u32 t = 0;
+      while (t < sound.apu_target_n && sound.apu_targets[t] != &m) ++t;
+      if (t == sound.apu_target_n) {
+        if (t == 4) return false;
+        sound.apu_targets[sound.apu_target_n++] = &m;
+      }
+    } else if (!apu_reach(g, g.parents[k], depth + 1, sound)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void apu_setup() {
+  for (u32 k = 1; k < kGraphs; ++k) {
+    Graph& g = g_graphs[k];
+    if (!g.live) continue;
+    for (u32 i = 0; i < g.count; ++i)
+      if (g.c[i].kind == kAudioMixer && g.c[i].inserts) g.c[i].apu_out = true;
+    for (u32 o = 0; o < g.output_count; ++o) {
+      Comp& out = g.c[g.outputs[o]];
+      const i32 src = bes(out.b + 4);
+      if (out.dest && src >= 0 && g.c[src].kind == kAudioMixer) g.c[src].apu_out = true;
+    }
+    u32 sounds = 0, able = 0;
+    for (u32 i = 0; i < g.count; ++i) {
+      Comp& c = g.c[i];
+      if (c.kind != kAudioSound) continue;
+      ++sounds;
+      c.apu_ok = apu_reach(g, i, 0, c) && c.apu_target_n;
+      if (!c.apu_ok) c.apu_target_n = 0;
+      able += c.apu_ok;
+    }
+    gw_log("sound: graph %s: %u of %u sounds can play on the APU\n", g.name, able, sounds);
+    g_apu_able += able;
+    g_apu_sounds += sounds;
+  }
+}
+
+// Bins for a voice's bin mixers (each mixer's channels, held while voices
+// mix into it); false (nothing taken) when there are not enough free.
+bool bins_take(Comp& c) {
+  u32 need = 0, free_bins = 0;
+  for (u32 t = 0; t < c.apu_target_n; ++t)
+    if (!c.apu_targets[t]->apu_refs) need += c.apu_targets[t]->out_ch;
+  for (u32 b = 0; b < kBinsUsed; ++b) free_bins += g_bin_owner[b] == nullptr;
+  if (need > free_bins) return false;
+  for (u32 t = 0; t < c.apu_target_n; ++t) {
+    Comp& m = *c.apu_targets[t];
+    if (m.apu_refs++) continue;
+    for (u32 o = 0; o < m.out_ch; ++o)
+      for (u32 b = 0; b < kBinsUsed; ++b)
+        if (!g_bin_owner[b]) {
+          g_bin_owner[b] = &m;
+          m.apu_bins[o] = (i8)b;
+          break;
+        }
+  }
+  return true;
+}
+
+void bins_give_back(Comp& c) {
+  for (u32 t = 0; t < c.apu_target_n; ++t) {
+    Comp& m = *c.apu_targets[t];
+    if (!m.apu_refs || --m.apu_refs) continue;
+    for (u32 o = 0; o < 4; ++o) {
+      if (m.apu_bins[o] >= 0) g_bin_owner[m.apu_bins[o]] = nullptr;
+      m.apu_bins[o] = -1;
+    }
+  }
+}
+
+void hw_voice_stop(Voice& v) {
+  const i16 h = v.hw[0];
+  if (h >= 0) {
+    gw_apu_voice_stop((u32)h);
+    Comp* c = g_hw[h].c;
+    g_hw[h] = {};
+    if (c) bins_give_back(*c);
+  }
+  if (v.hw_ring >= 0) g_ring_used[v.hw_ring] = false;
+  v.hw[0] = v.hw[1] = -1;
+  v.hw_ring = -1;
+  v.rt_n[0] = v.rt_n[1] = 0;
+}
+
+// A streamed voice's ring filled up to two blocks short of its play
+// position, block by block from the stream (the wave's blocks in order,
+// from the start again when it loops; silence past a one-shot's end). A
+// block not read from the disc yet waits, unless the voice is about to play
+// it: then it is silence there, and the wave keeps its place.
+void hw_ring_fill(Voice& v) {
+  const Wave& w = *v.r.wave;
+  const u32 ch = w.channels, bytes = 36 * ch, group = w.block / bytes;
+  const u32 wave_blocks = gw_xadpcm_blocks(w.samples);
+  const u32 played_blocks = (v.hw_start % 64 + v.hw_played) / 64;
+  u8* ring = g_ring_mem + v.hw_ring * kRingBlocks * 72;
+  while (v.hw_out < played_blocks + kRingBlocks - 2) {
+    u8* dst = ring + (v.hw_out % kRingBlocks) * bytes;
+    u32 wb = v.hw_start / 64 + v.hw_out;
+    if (v.r.loop) wb %= wave_blocks;
+    if (wb >= wave_blocks) {
+      memset(dst, 0, bytes);
+    } else {
+      const u8* src = v.r.block_data(wb / group);
+      if (src) {
+        memcpy(dst, src + (wb % group) * bytes, bytes);
+      } else if (v.hw_out < played_blocks + 8) {
+        memset(dst, 0, bytes);  // (the stream is behind: silence, in place)
+        ++gw_sound_late;
+      } else {
+        break;
+      }
+    }
+    ++v.hw_out;
+  }
+}
+
+void hw_voice_start(Graph& g, Comp& c, Voice& v) {
+  if (!g_apu_on || !c.apu_ok || !v.playing) return;
+  const Wave* w = v.r.wave;
+  if (!w) return;
+  const bool stream = !w->data;
+  // In memory: its copy on the APU. Streamed: Xbox ADPCM, and (as the ring
+  // goes block by block) a looping wave a whole number of blocks long.
+  if (stream ? !w->xa || (v.r.loop && w->samples % 64) || !g_ring_mem : !w->apu_samples) return;
+  hw_voice_stop(v);
+  i16 h = -1;
+  for (u32 k = kHwFirst; k < kMaxVoices && h < 0; ++k)
+    if (!g_hw[k].v) h = (i16)k;
+  i16 ring = -1;
+  if (stream)
+    for (u32 k = 0; k < kHwRings && ring < 0; ++k)
+      if (!g_ring_used[k]) ring = (i16)k;
+  if (h < 0 || (stream && ring < 0)) {
+    ++g_hw_full;
+    return;  // (no hardware voice or ring free: software)
+  }
+  if (!bins_take(c)) {
+    ++g_hw_no_bins;
+    return;  // (no bins free: software)
+  }
+  GwApuVoice hv = {};
+  hv.channels = w->channels;
+  hv.bits = 4;
+  if (stream) {
+    g_ring_used[ring] = true;
+    v.hw_ring = ring;
+    v.hw_start = v.r.pos < w->samples ? v.r.pos : 0;
+    v.hw_played = v.hw_cbo = v.hw_out = 0;
+    memset(g_ring_mem + ring * kRingBlocks * 72, 0, kRingBlocks * 72);
+    hw_ring_fill(v);
+    hv.ba = g_ring_ba + ring * kRingBlocks * 72;
+    hv.start = v.hw_start % 64;
+    hv.loop_start = 0;
+    hv.loop_end = kRingBlocks * 64;
+    v.hw_cbo = hv.start;
+  } else {
+    const u32 samples = w->apu_samples;
+    hv.ba = w->apu_ba[0];
+    hv.start = v.r.pos < samples ? v.r.pos : 0;
+    if (v.r.loop) {
+      hv.loop_start = 0;
+      hv.loop_end = samples;
+    } else {  // a one-shot loops over its silent tail until hw_positions takes it off
+      hv.loop_start = samples;
+      hv.loop_end = samples + kTailBlocks * 64;
+    }
+  }
+  gw_apu_voice_start((u32)h, hv);  // (muted: the pass's routes come at its end)
+  g_hw[h] = {&g, &c, &v};
+  v.hw[0] = h;
+  ++g_hw_starts;
+  v.rt_n[0] = v.rt_n[1] = 0;
+}
+
+// The game paused or resumed: the songs' voices (graphs 3 and up, which the
+// original stops) taken off the APU's list and put back, so they stop where
+// they are; nothing of theirs moves meanwhile.
+inline bool hw_paused(const HwOwner& o) { return g_paused && o.g >= &g_graphs[3]; }
+void hw_pause_changed() {
+  static bool was = false;
+  if (g_paused == was) return;
+  was = g_paused;
+  for (u32 h = kHwFirst; h < kMaxVoices; ++h)
+    if (g_hw[h].v && g_hw[h].g >= &g_graphs[3]) gw_apu_voice_pause(h, g_paused);
+}
+
+// Where the hardware voices are: the software voices follow (the songs' sync
+// tracks and progress outputs read them); one-shots past their end end;
+// streams' rings are filled ahead.
+void hw_positions() {
+  if (!g_apu_on) return;
+  for (u32 h = kHwFirst; h < kMaxVoices; ++h) {
+    HwOwner o = g_hw[h];
+    if (!o.v || hw_paused(o)) continue;
+    Voice& v = *o.v;
+    const u32 pos = gw_apu_voice_position(h);
+    if (v.hw_ring >= 0) {
+      const u32 span = kRingBlocks * 64;
+      v.hw_played += (pos % span + span - v.hw_cbo) % span;
+      v.hw_cbo = pos % span;
+      const u32 samples = v.r.wave->samples, at = v.hw_start + v.hw_played;
+      if (!v.r.loop && at >= samples) {
+        v.r.pos = samples;
+        voice_end(*o.g, *o.c, v);
+        continue;
+      }
+      v.r.pos = v.r.loop ? at % samples : at;
+      hw_ring_fill(v);
+    } else {
+      const u32 samples = v.r.wave->apu_samples;
+      if (!v.r.loop && pos >= samples) {
+        v.r.pos = samples;
+        voice_end(*o.g, *o.c, v);
+      } else {
+        v.r.pos = pos < samples ? pos : 0;
+      }
+    }
+  }
+}
+
+// A sound's mix into a bin mixer this pass: per hardware voice and wave
+// channel, the gains A (at the pass's end) to each of d's channels.
+void hw_route_add(Graph& g, Comp& d, Comp& s, const float* A) {
+  (void)g;
+  if (!d.apu_refs) return;
+  for (u32 vi = 0; vi < s.voice_count; ++vi) {
+    Voice& v = s.voices[vi];
+    if (v.hw[0] < 0 || !v.playing) continue;
+    const u32 wch = v.r.wave->channels;
+    const float vg = v.gain_target;
+    for (u32 ch = 0; ch < wch; ++ch) {
+      for (u32 o = 0; o < d.out_ch && o < 4; ++o) {
+        if (d.apu_bins[o] < 0) continue;
+        float gain = 0;
+        for (u32 cc = 0; cc < s.channels && cc < 4; ++cc)
+          if ((cc < wch ? cc : 0) == ch) gain += A[cc * 4 + o];
+        gain *= vg;
+        if (gain <= 0) continue;
+        const u8 bin = (u8)d.apu_bins[o];
+        u32 k = 0;
+        while (k < v.rt_n[ch] && v.rt_bin[ch][k] != bin) ++k;
+        if (k == v.rt_n[ch]) {
+          if (k == (wch == 2 ? 4u : 8u) || k == 4) continue;
+          v.rt_bin[ch][k] = bin;
+          v.rt_gain[ch][k] = 0;
+          ++v.rt_n[ch];
+        }
+        v.rt_gain[ch][k] += gain;
+      }
+    }
+  }
+}
+
+// The pass's routes to the hardware (none: muted), with each voice's pitch:
+// a mono voice's routes on outputs 0-3, a stereo voice's left channel's on
+// 0 2 4 6 and right's on 1 3 5 7.
+void hw_apply() {
+  if (!g_apu_on) return;
+  hw_pause_changed();
+  for (u32 h = kHwFirst; h < kMaxVoices; ++h) {
+    HwOwner o = g_hw[h];
+    if (!o.v || hw_paused(o)) continue;  // (a paused song's voice keeps its routes)
+    Voice& v = *o.v;
+    float step = (float)v.r.wave->rate * 2.08333e-5f * v.pitch;
+    step = step < 1.0f / 256 ? 1.0f / 256 : step > 4 ? 4 : step;
+    u8 bins[8];
+    float gains[8];
+    for (u32 k = 0; k < 8; ++k) {
+      bins[k] = kBinMuted;
+      gains[k] = 0;
+    }
+    if (v.r.wave->channels == 2) {
+      for (u32 ch = 0; ch < 2; ++ch)
+        for (u32 k = 0; k < v.rt_n[ch]; ++k) {
+          bins[2 * k + ch] = v.rt_bin[ch][k];
+          gains[2 * k + ch] = v.rt_gain[ch][k] * kHeadroom;
+        }
+    } else {
+      for (u32 k = 0; k < v.rt_n[0]; ++k) {
+        bins[k] = v.rt_bin[0][k];
+        gains[k] = v.rt_gain[0][k] * kHeadroom;
+      }
+    }
+    gw_apu_voice_mix(h, gw_apu_pitch(step), 8, bins, gains);
+    v.rt_n[0] = v.rt_n[1] = 0;
+  }
+  gw_apu_voices_go();  // (this pass's new voices, with their first routes, together)
+}
+
+// This pass's bins into a bin mixer (before its inserts).
+bool hw_bins_add(Graph& g, Comp& d, bool* fresh) {
+  (void)g;
+  for (u32 o = 0; o < d.out_ch && o < 4; ++o) {
+    if (d.apu_bins[o] < 0) continue;
+    const float* in = g_bins[d.apu_bins[o]];
+    float* out = d.buf[o];
+    if (fresh[o]) {
+      memcpy(out, in, kPass * sizeof(float));
+      fresh[o] = false;
+    } else {
+      for (u32 n = 0; n < kPass; ++n) out[n] += in[n];
+    }
+  }
+  return true;
+}
+
+// The APU's output for this pass (256 frames), waited for: the mix follows
+// the APU's clock. A backlog of more than 2048 frames is skipped (xemu's APU
+// runs a little fast).
+void apu_read_bins() {
+  if (!g_apu_on) return;
+  static bool started = false;
+  if (!started) {
+    started = true;
+    gw_apu_skip(gw_apu_available());
+  }
+  for (u32 b = 0; b < kBinsCopied; ++b) g_bins_wanted[b] = g_bin_owner[b] != nullptr;
+  u32 waited = 0;
+  while (gw_apu_available() < kPass && waited < 40) {
+    Sleep(1);
+    ++waited;
+  }
+  const u32 have = gw_apu_available();
+  if (have < kPass) {
+    static u32 told;
+    if (told++ < 8) gw_log("sound: the APU's output is late (%u frames)\n", have);
+    memset(g_bins, 0, sizeof(g_bins));
+    return;
+  }
+  if (have > 2048) gw_apu_skip((have - 512) / 32 * 32);
+  gw_apu_read_bins(g_bins, g_bins_wanted, g_bin_scale);
+  static DWORD last;
+  if (GetTickCount() - last > 5000) {
+    last = GetTickCount();
+    u32 in_use = 0, bins = 0;
+    for (u32 h = kHwFirst; h < kMaxVoices; ++h) in_use += g_hw[h].v != nullptr;
+    for (u32 b = 0; b < kBinsUsed; ++b) bins += g_bin_owner[b] != nullptr;
+    gw_log("sound: APU voices in use %u, started %u, refused %u (no voice) %u (no bins); bins in use %u; %u frames "
+           "waiting (%u waves, %u of %u sounds can play there)\n",
+           in_use, g_hw_starts, g_hw_full, g_hw_no_bins, bins, gw_apu_available(), g_apu_waves, g_apu_able,
+           g_apu_sounds);
+  }
+}
+#else
+void hw_voice_stop(Voice&) {}
+void hw_voice_start(Graph&, Comp&, Voice&) {}
+void hw_positions() {}
+void hw_apply() {}
+#endif
+
 void graph_pass() {
+  hw_positions();
   // Inputs read last pass's sums (one pass of latency), then collect anew.
   Graph& sys = g_graphs[0];
   if (sys.live) {
@@ -2376,6 +2952,7 @@ void graph_pass() {
     }
   }
   PROF_END(audio);
+  hw_apply();
   gains_pass_done();
   ++g_pass;
 }
@@ -2537,18 +3114,17 @@ DWORD WINAPI reader_thread(LPVOID) {
             if (!count) break;
             Reader& r = *owner;
             if (!count || block >= r.blocks()) break;
-            // Contiguous blocks into contiguous slots (the converted banks'
-            // blocks are kMaxBlock bytes; any other size goes one at a time).
+            // Contiguous blocks into contiguous slots (a ring's slots are
+            // its wave's block size apart).
             if (count > kReadBlocks) count = kReadBlocks;
             if (count > kStreamBlocks - slot) count = kStreamBlocks - slot;
             if (count > r.blocks() - block) count = r.blocks() - block;
-            if (r.wave->block != kMaxBlock) count = 1;
             u32 bytes = 0;
             for (u32 k = 0; k < count; ++k) bytes += r.block_bytes(block + k);
             DWORD done = 0;
             EnterCriticalSection(&g_file_lock);
             SetFilePointer(r.bank->file, r.wave->offset + block * r.wave->block, nullptr, FILE_BEGIN);
-            ReadFile(r.bank->file, ring->data + slot * kMaxBlock, bytes, &done, nullptr);
+            ReadFile(r.bank->file, ring->data + slot * r.wave->block, bytes, &done, nullptr);
 #ifdef GW_SOUND_PROFILE
             {  // SLOW_DISC=ms: each read takes that long (the console's disc)
               static const int slow = getenv("SLOW_DISC") ? atoi(getenv("SLOW_DISC")) : 0;
@@ -2627,6 +3203,12 @@ void gw_sound_start() {
   // The effects in memory (they must start at once); the music streams.
   for (Bank& b : g_banks)
     if (b.count && !_stricmp(b.name, "GW3")) bank_resident(b, kEffectsInMemory);
+#ifdef GW_SOUND_APU
+  g_apu_on = gw_apu_init();
+  if (g_apu_on)
+    for (Bank& b : g_banks)
+      if (b.count && !_stricmp(b.name, "GW3")) apu_prepare(b);
+#endif
 #ifdef GW_SOUND_PROFILE
   if (getenv("SOUND_RESIDENT"))  // the PC check's reference: every bank in memory
     for (Bank& b : g_banks)
@@ -2664,6 +3246,12 @@ void gw_sound_start() {
     snprintf(in, sizeof(in), "Song%uMonoInput", s);
     connect(g_graphs[2 + s], "MonoOutput", in);
   }
+#ifdef GW_SOUND_APU
+  if (g_apu_on) {
+    apu_calibrate();
+    apu_setup();
+  }
+#endif
   u32 comps = 0, voices = 0, buffers = 0;
   for (Graph& g : g_graphs) {
     comps += g.count;
@@ -2860,7 +3448,70 @@ void gw_sound_debug() {
   LeaveCriticalSection(&g_lock);
 }
 
+namespace {
+// What keeps a sound off the APU: a way out that reaches something other than
+// mixers before a bin mixer (a graph output's mixer, or one with inserts).
+const Comp* apu_blocker(Graph& g, u32 i, u32 depth, const bool* bin_mixer, const Comp** target) {
+  if (depth > 16 || g.parent_first[i] == g.parent_first[i + 1]) return &g.c[i];
+  for (u32 k = g.parent_first[i]; k < g.parent_first[i + 1]; ++k) {
+    const u32 p = g.parents[k];
+    const Comp& m = g.c[p];
+    if (m.kind != kAudioMixer) return &m;
+    if (bin_mixer[p]) {
+      *target = &m;
+      continue;
+    }
+    const Comp* b = apu_blocker(g, p, depth + 1, bin_mixer, target);
+    if (b) return b;
+  }
+  return nullptr;
+}
+}  // namespace
+
+// (The PC check, APU_REPORT=1.) Per graph, each sound: whether it could play
+// on the APU (and into which bin mixer) or what keeps it in software; and
+// whether its wave is held in memory.
+void gw_sound_apu_report() {
+  for (u32 k = 1; k < kGraphs; ++k) {
+    Graph& g = g_graphs[k];
+    if (!g.live) continue;
+    bool* bin_mixer = (bool*)calloc(g.count, 1);
+    for (u32 i = 0; i < g.count; ++i) bin_mixer[i] = g.c[i].kind == kAudioMixer && g.c[i].inserts;
+    for (u32 o = 0; o < g.output_count; ++o) {
+      const Comp& out = g.c[g.outputs[o]];
+      const i32 src = bes(out.b + 4);
+      if (out.dest && src >= 0 && g.c[src].kind == kAudioMixer) bin_mixer[src] = true;
+    }
+    for (u32 i = 0; i < g.count; ++i) {
+      const Comp& c = g.c[i];
+      if (c.kind != kAudioSound) continue;
+      const Comp* target = nullptr;
+      const Comp* b = apu_blocker(g, i, 0, bin_mixer, &target);
+      const Wave* w = c.voices ? c.voices[0].r.wave : nullptr;
+      gw_log("  %s %-32s %s %s%s\n", g.name, c.name, w && w->data ? "memory" : "stream",
+             b ? "software: reaches " : "APU into ", b ? b->name : target ? target->name : "?");
+    }
+    free(bin_mixer);
+  }
+}
+
 bool gw_sound_test_no_reverb = false;  // (the PC check: the mix without the reverb)
+
+// A wave held in memory, by bank and name: its converted data (IMA ADPCM in
+// Microsoft blocks) and layout; false if there is none or it streams.
+bool gw_sound_find_wave(const char* bank, const char* name, GwSoundWave* out) {
+  Bank* b = nullptr;
+  const Wave* w = find_wave(bank, name, &b);
+  if (!w || !w->data) return false;
+  out->data = w->data;
+  out->size = w->size;
+  out->block = w->block;
+  out->channels = w->channels;
+  out->samples = w->samples;
+  out->rate = w->rate;
+  out->xa = w->xa;
+  return true;
+}
 
 // One frame (256 samples, 48 kHz stereo) for the AC97 (src/audio.cpp).
 void gw_sound_mix(i16* out, u32 samples) {
@@ -2870,6 +3521,9 @@ void gw_sound_mix(i16* out, u32 samples) {
   bool have_rev = false;
   float level_lin = 0;
   if (g_ready && samples == kPass && g_graphs[0].live) {
+#ifdef GW_SOUND_APU
+    apu_read_bins();
+#endif
     PROF_BEGIN(lock);
     EnterCriticalSection(&g_lock);
     PROF_END(lock);

@@ -19,6 +19,11 @@ surface_scale=2
 [display.window]
 startup_size='1280x720'
 
+[audio]
+# The APU's DSPs emulated: the game's own program on the GP mixes its sound
+# (src/apu.cpp); without it XEMU leaves the GP's mix bins empty.
+use_dsp = true
+
 [sys.files]
 bootrom_path = 'C:/Games/Emulators/Xemu/MCPX/mcpx_1.0.bin'
 flashrom_path = 'C:/Games/Emulators/Xemu/BIOS/xbox-4627_debug.bin'

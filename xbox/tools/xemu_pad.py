@@ -120,6 +120,9 @@ class Gdb:
         self.stop()
         try:
             reply = self.packet(f'M{address:x},{len(data):x}:{data.hex()}')
+            # (a stop reply left over from the interrupt can come first)
+            while reply[:1] in ('T', 'S') and reply != 'OK':
+                reply = self.recv_packet()
             if reply != 'OK':
                 raise SystemExit(f'GDB write failed: {reply}')
         finally:

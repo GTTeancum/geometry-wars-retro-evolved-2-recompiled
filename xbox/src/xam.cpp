@@ -1,7 +1,10 @@
-// XAM: one local signed-in player, an in-memory profile, offline Live,
+// XAM: one local signed-in player, a profile saved on the hard disk, offline Live,
 // controller input, notifications, and the audio/XMA entry points.
 #include "runtime.h"
 
+#include <nxdk/mount.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <windows.h>
 
 
@@ -21,7 +24,8 @@ u32 complete(u32 overlapped, u32 result, u32 length = 0) {
   return X_ERROR_IO_PENDING;
 }
 
-// Title-specific profile settings written by the game, kept for the session.
+// Title-specific profile settings written by the game (saved on the hard
+// disk, below).
 struct StoredSetting {
   u32 id;
   u32 size;
@@ -34,6 +38,158 @@ StoredSetting* find_setting(u32 id) {
     if (s.id == id) return &s;
   }
   return nullptr;
+}
+
+// --- saves on the hard disk ----------------------------------------------------------
+// The settings are the game's whole save (its progress and options). They
+// live in the title's folder on the hard disk, named by the 360 title ID
+// (also the XBE's, tools/xbe_meta.py), in one save the dashboard lists:
+//   E:\UDATA\584108FF\              TitleMeta.xbx, TitleImage.xbx, SaveImage.xbx
+//   E:\UDATA\584108FF\000000000000\ SaveMeta.xbx, SaveImage.xbx, profile.dat
+// profile.dat: 'GWPS', version 1, count, then per setting its id, size and
+// bytes, then an FNV-1a hash of everything before it (little-endian). It is
+// written whole to profile.new and then moved over profile.dat; a missing or
+// damaged profile.dat falls back to profile.new.
+constexpr char kTitleDir[] = "E:\\UDATA\\584108FF";
+constexpr char kSaveDir[] = "E:\\UDATA\\584108FF\\000000000000";
+constexpr char kSaveFile[] = "E:\\UDATA\\584108FF\\000000000000\\profile.dat";
+constexpr char kSaveNew[] = "E:\\UDATA\\584108FF\\000000000000\\profile.new";
+constexpr u32 kSaveMagic = 0x53505747;  // "GWPS"
+bool g_saves_ready;
+
+u32 fnv1a(const u8* p, u32 n) {
+  u32 h = 2166136261u;
+  for (u32 i = 0; i < n; ++i) h = (h ^ p[i]) * 16777619u;
+  return h;
+}
+
+// A UTF-16 (with byte order mark) text file, as the dashboard reads.
+void write_utf16(const char* path, const char* text) {
+  u16 buf[128];
+  u32 n = 0;
+  buf[n++] = 0xFEFF;
+  for (const char* c = text; *c && n < 128; ++c) buf[n++] = (u8)*c;
+  HANDLE f = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return;
+  DWORD done = 0;
+  WriteFile(f, buf, n * 2, &done, nullptr);
+  CloseHandle(f);
+}
+
+// The settings from a save file; false when it is missing or damaged.
+bool load_file(const char* path) {
+  HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return false;
+  static u8 buf[0x8000];
+  DWORD size = 0;
+  const BOOL ok = ReadFile(f, buf, sizeof(buf), &size, nullptr);
+  CloseHandle(f);
+  if (!ok || size < 16 || size == sizeof(buf)) return false;
+  auto word = [&](u32 at) {
+    u32 v;
+    memcpy(&v, buf + at, 4);
+    return v;
+  };
+  if (word(0) != kSaveMagic || word(4) != 1 || word(size - 4) != fnv1a(buf, size - 4)) return false;
+  const u32 count = word(8);
+  // Checked whole before any of it is taken.
+  u32 at = 12;
+  for (u32 i = 0; i < count; ++i) {
+    if (at + 8 > size - 4) return false;
+    const u32 id = word(at), n = word(at + 4);
+    if (i >= 8 || id == 0 || n > ((id >> 16) & 0xFFF) || at + 8 + n > size - 4) return false;
+    at += 8 + n;
+  }
+  if (at != size - 4) return false;
+  at = 12;
+  for (u32 i = 0; i < count; ++i) {
+    const u32 id = word(at), n = word(at + 4);
+    StoredSetting& s = g_settings[i];
+    s.id = id;
+    s.size = n;
+    s.data = (u8*)malloc(n ? n : 1);
+    memcpy(s.data, buf + at + 8, n);
+    at += 8 + n;
+  }
+  return true;
+}
+
+void save_settings() {
+  if (!g_saves_ready) return;
+  static u8 buf[0x8000];
+  u32 at = 12, count = 0;
+  for (const StoredSetting& s : g_settings) {
+    if (!s.id) continue;
+    if (at + 8 + s.size + 4 > sizeof(buf)) break;
+    memcpy(buf + at, &s.id, 4);
+    memcpy(buf + at + 4, &s.size, 4);
+    memcpy(buf + at + 8, s.data, s.size);
+    at += 8 + s.size;
+    ++count;
+  }
+  const u32 head[3] = {kSaveMagic, 1, count};
+  memcpy(buf, head, 12);
+  const u32 hash = fnv1a(buf, at);
+  memcpy(buf + at, &hash, 4);
+  at += 4;
+  HANDLE f = CreateFileA(kSaveNew, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) {
+    gw_log("save: %s could not be written (error %u)\n", kSaveNew, (u32)GetLastError());
+    return;
+  }
+  DWORD done = 0;
+  const BOOL ok = WriteFile(f, buf, at, &done, nullptr) && done == at;
+  CloseHandle(f);
+  if (!ok) {
+    gw_log("save: writing %s failed\n", kSaveNew);
+    return;
+  }
+  DeleteFileA(kSaveFile);
+  if (!MoveFileA(kSaveNew, kSaveFile)) gw_log("save: %s not moved into place\n", kSaveNew);
+  gw_log("save: %u settings written to %s (%u bytes)\n", count, kSaveFile, at);
+}
+
+// (Once, before the first setting is read or written.) The hard disk's
+// title folder made and given the dashboard's files (made from the game's
+// icon when the disc was staged, next to the XBE on D:), and the save read.
+void saves_init() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  const bool mounted = nxIsDriveMounted('E');
+  if (!mounted && !nxMountDrive('E', "\\Device\\Harddisk0\\Partition1\\")) {
+    gw_log("save: the hard disk (E:) could not be mounted; settings kept for this session only\n");
+    return;
+  }
+  static const char* const kDirs[] = {"E:\\UDATA", kTitleDir, kSaveDir};
+  for (const char* dir : kDirs) {
+    if (CreateDirectoryA(dir, nullptr)) gw_log("save: %s made\n", dir);
+    else if (GetLastError() != ERROR_ALREADY_EXISTS)
+      gw_log("save: %s not made (error %u; E: %s)\n", dir, (u32)GetLastError(), mounted ? "was mounted" : "mounted now");
+  }
+  if (GetFileAttributesA(kSaveDir) == INVALID_FILE_ATTRIBUTES) {
+    gw_log("save: %s could not be made (error %u); settings kept for this session only\n", kSaveDir,
+           (u32)GetLastError());
+    return;
+  }
+  static const char* const kFiles[] = {"TitleMeta.xbx", "TitleImage.xbx", "SaveImage.xbx"};
+  for (const char* name : kFiles) {
+    char from[64], to[96];
+    snprintf(from, sizeof(from), "D:\\%s", name);
+    snprintf(to, sizeof(to), "%s\\%s", kTitleDir, name);
+    if (!CopyFileA(from, to, FALSE)) gw_log("save: %s not copied (error %u)\n", from, (u32)GetLastError());
+  }
+  {
+    char to[96];
+    snprintf(to, sizeof(to), "%s\\SaveImage.xbx", kSaveDir);
+    CopyFileA("D:\\SaveImage.xbx", to, FALSE);
+    snprintf(to, sizeof(to), "%s\\SaveMeta.xbx", kSaveDir);
+    write_utf16(to, "[default]\r\nName=Game progress\r\n");
+  }
+  g_saves_ready = true;
+  if (load_file(kSaveFile)) gw_log("save: settings read from %s\n", kSaveFile);
+  else if (load_file(kSaveNew)) gw_log("save: settings read from %s (the last write was not finished)\n", kSaveNew);
+  else gw_log("save: no save in %s yet\n", kSaveDir);
 }
 
 // Notification queue (XNotifyGetNext).
@@ -71,6 +227,7 @@ GW_EXPORT(XamShowSigninUI) { GW_RETURN(X_ERROR_SUCCESS); }
 GW_EXPORT(XamUserReadProfileSettings) {
   u32 user_index = GW_ARG(4), xuids = GW_ARG(6), count = GW_ARG(7), ids = GW_ARG(8);
   u32 size_ptr = GW_ARG(9), buffer = GW_ARG(10), overlapped = GW_STACK_ARG(8);
+  saves_init();
   u32 header_size = 8 + count * 40, data_size = 0;
   for (u32 i = 0; i < count; ++i) {
     u32 id = gw_load32(ids + i * 4);
@@ -115,12 +272,18 @@ GW_EXPORT(XamUserReadProfileSettings) {
 // XamUserWriteProfileSettings(title_id, user_index, count, settings, overlapped)
 GW_EXPORT(XamUserWriteProfileSettings) {
   u32 count = GW_ARG(5), settings = GW_ARG(6), overlapped = GW_ARG(7);
+  saves_init();
+  u32 written = 0;
   for (u32 i = 0; i < count; ++i) {
     u32 s = settings + i * 40;
     u32 id = gw_load32(s + 0x10);
     u32 type = gw_load8(s + 0x18);
     if (type != 6 && type != 4) continue;
     u32 size = gw_load32(s + 0x18 + 8), ptr = gw_load32(s + 0x18 + 12);
+    if (size > ((id >> 16) & 0xFFF)) {  // larger than the setting's id allows
+      gw_log("profile setting %08X: %u bytes refused\n", id, size);
+      continue;
+    }
     StoredSetting* stored = find_setting(id);
     if (!stored) stored = find_setting(0);
     if (!stored) continue;
@@ -129,8 +292,9 @@ GW_EXPORT(XamUserWriteProfileSettings) {
     stored->size = size;
     stored->data = (u8*)malloc(size ? size : 1);
     memcpy(stored->data, gw_host(ptr), size);
-    gw_log("profile setting %08X saved (%u bytes, this session only)\n", id, size);
+    ++written;
   }
+  if (written) save_settings();
   GW_RETURN(complete(overlapped, X_ERROR_SUCCESS));
 }
 

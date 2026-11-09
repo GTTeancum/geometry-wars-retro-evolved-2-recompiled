@@ -81,6 +81,21 @@ ifeq ($(AUDIO_CAPTURE),y)
 src/audio.obj src/sound_native.obj: NXDK_CXXFLAGS += -DGW_AUDIO_CAPTURE
 endif
 
+# The game's sounds on the APU where they can play there (src/sound_native.cpp,
+# src/apu.cpp): make SOUND_APU=y
+ifeq ($(SOUND_APU),y)
+src/sound_native.obj: NXDK_CXXFLAGS += -DGW_SOUND_APU
+endif
+
+# The APU test (src/audio.cpp): one effect on a hardware voice, the GP's
+# output recorded: make APU_TEST=y AUDIO_CAPTURE=y
+ifeq ($(APU_TEST),y)
+src/audio.obj: NXDK_CXXFLAGS += -DGW_APU_TEST
+endif
+ifeq ($(APU_TEST),pcm)
+src/audio.obj: NXDK_CXXFLAGS += -DGW_APU_TEST -DGW_APU_TEST_PCM
+endif
+
 # Compare the native grid update with the original now and then: make GRID_CHECK=y
 ifeq ($(GRID_CHECK),y)
 src/grid_native.obj: NXDK_CXXFLAGS += -DGW_GRID_CHECK -DGW_GRID_GUEST_SYNC
