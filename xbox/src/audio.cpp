@@ -17,7 +17,9 @@
 // The sound engine's time by part (src/sound_native.cpp), in cycles.
 extern unsigned long long g_prof_control, g_prof_audio, g_prof_sound, g_prof_effects, g_prof_reverb,
     g_prof_collect, g_prof_mix, g_prof_mark, g_prof_lock, g_prof_out;
+extern unsigned long long g_prof_hwread, g_prof_hwpos, g_prof_hwapply;
 extern u32 gw_sound_late;  // passes a voice's stream was late (src/sound_native.cpp)
+extern u64 gw_sound_wait_cycles;  // waiting for the APU's output, left out of the mix's cost
 
 #ifdef GW_AUDIO_CAPTURE
 // Sound out recording (make AUDIO_CAPTURE=y): [0] 'ACAP', [1] frames written
@@ -214,9 +216,8 @@ DWORD WINAPI audio_thread(LPVOID) {
   u32 mixes = 0;
   static i16 frame[kSamples * 2];
   auto provide = [&]() {
-    const u64 t0 = __builtin_ia32_rdtsc();
+    const u64 t0 = __builtin_ia32_rdtsc(), wait0 = gw_sound_wait_cycles;
     {
-      GwPartTimer timer(kPartAudio);
       // Flush-to-zero for the mix only (set here each time: the thread's
       // setting does not survive), the caller's setting restored after.
       const u32 csr = _mm_getcsr();
@@ -229,7 +230,10 @@ DWORD WINAPI audio_thread(LPVOID) {
 #endif
       _mm_setcsr(csr);
     }
-    mix_cycles += __builtin_ia32_rdtsc() - t0;
+    // The CPU's cost: the time spent waiting for the APU taken out.
+    const u64 spent = __builtin_ia32_rdtsc() - t0 - (gw_sound_wait_cycles - wait0);
+    __atomic_fetch_add(&gw_part_cycles[kPartAudio], spent, __ATOMIC_RELAXED);
+    mix_cycles += spent;
     ++mixes;
     for (u32 i = 0; i < kSamples * 2; i += 8) energy += (u64)((i32)frame[i] * frame[i]);
     u8* buffer = g_buffers + (queued % kBuffers) * kFrameBytes;
@@ -283,6 +287,11 @@ DWORD WINAPI audio_thread(LPVOID) {
                (u32)(g_prof_collect / mixes / 733), (u32)(g_prof_mix / mixes / 733),
                (u32)(g_prof_mark / mixes / 733), (u32)(g_prof_lock / mixes / 733),
                (u32)(g_prof_out / mixes / 733));
+        if (g_prof_hwread | g_prof_hwpos | g_prof_hwapply)
+          gw_log("audio: us a frame on the APU's side: reading its output %u, positions and rings %u, routes %u\n",
+                 (u32)(g_prof_hwread / mixes / 733), (u32)(g_prof_hwpos / mixes / 733),
+                 (u32)(g_prof_hwapply / mixes / 733));
+        g_prof_hwread = g_prof_hwpos = g_prof_hwapply = 0;
         g_prof_control = g_prof_audio = g_prof_sound = g_prof_effects = g_prof_reverb = 0;
         g_prof_collect = g_prof_mix = g_prof_mark = g_prof_lock = g_prof_out = 0;
       }

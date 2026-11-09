@@ -93,6 +93,12 @@ u32 g_fifo_read;   // bytes read from the ring (mod kFifoBytes)
 bool g_listed[kMaxVoices];
 u16 g_pending[kMaxVoices];  // started, not listed yet (gw_apu_voices_go)
 u32 g_pending_n;
+// A voice taken off the list may still be the one the VP walks to next (it
+// reads a voice's link before mixing it), so its record (state, link) stays
+// as it was until two APU frames have passed: the VP never meets an idle
+// voice or a stale link (XEMU stops on an idle voice in a list).
+bool g_settling[kMaxVoices];
+u32 g_unlinked_at[kMaxVoices];  // the GP's frame count when it came off
 
 inline void wr(u32 off, u32 v) { *(volatile u32*)(kBar0 + off) = v; }
 inline u32 rd(u32 off) { return *(volatile u32*)(kBar0 + off); }
@@ -131,9 +137,13 @@ void link(u32 h) {
   g_listed[h] = true;
 }
 
+u32 frame_count();
+
 void unlink(u32 h) {
   if (!g_listed[h]) return;
   g_listed[h] = false;
+  g_settling[h] = true;
+  g_unlinked_at[h] = frame_count();
   const u32 next = *voice(h, kV_PITCH_LINK) & 0xFFFF;
   u32 cur = rd(kTVL2D) & 0xFFFF;
   if (cur == h) {
@@ -148,6 +158,16 @@ void unlink(u32 h) {
     }
     cur = n;
   }
+}
+
+u32 frame_count();
+
+// Off the list for two whole APU frames (or never listed).
+bool settled(u32 h) {
+  if (!g_settling[h]) return true;
+  if (((frame_count() - g_unlinked_at[h]) & 0xFFFFFF) < 2) return false;
+  g_settling[h] = false;
+  return true;
 }
 
 }  // namespace
@@ -225,6 +245,11 @@ bool gw_apu_init() {
 bool gw_apu_ready() { return g_ready; }
 
 u32 gw_apu_frames() { return g_voices ? rd(kGP_XMEM + 4 * kFrameCounterX) & 0xFFFFFF : 0; }
+namespace {
+u32 frame_count() { return gw_apu_frames(); }
+}  // namespace
+
+bool gw_apu_voice_free(u32 h) { return g_ready && h < kMaxVoices && !g_listed[h] && settled(h); }
 
 u32 gw_apu_map(const void* data, u32 bytes) {
   const u32 phys = MmGetPhysicalAddress((void*)data);
@@ -241,11 +266,10 @@ u32 gw_apu_map(const void* data, u32 bytes) {
   return base * 4096 + (phys & 0xFFF);
 }
 
-void gw_apu_voice_start(u32 h, const GwApuVoice& v) {
-  if (!g_ready || h >= kMaxVoices) return;
+bool gw_apu_voice_start(u32 h, const GwApuVoice& v) {
+  if (!gw_apu_voice_free(h)) return false;  // (still listed, or the VP may still reach it)
   for (u32 i = 0; i < g_pending_n; ++i)
     if (g_pending[i] == h) g_pending[i--] = g_pending[--g_pending_n];
-  unlink(h);
   *voice(h, kV_STATE) = 0;
   for (u32 i = 0; i < kVoiceSize; i += 4) *voice(h, i) = 0;
   u32 a, b, c;
@@ -272,6 +296,7 @@ void gw_apu_voice_start(u32 h, const GwApuVoice& v) {
   // Listed at the next gw_apu_voices_go, with the others started till then,
   // so they all begin in the same APU frame.
   if (g_pending_n < kMaxVoices) g_pending[g_pending_n++] = (u16)h;
+  return true;
 }
 
 void gw_apu_voice_pause(u32 h, bool paused) {
@@ -291,15 +316,22 @@ void gw_apu_voices_go() {
   if (!g_ready || !g_pending_n) return;
   // Chained among themselves in front of the list, then the head written
   // once: the VP takes them all in one frame.
-  u32 head = rd(kTVL2D) & 0xFFFF;
+  // (A voice the VP may still reach, paused and resumed within two frames,
+  // waits for the next call: its link is not rewritten under the VP.)
+  u32 head = rd(kTVL2D) & 0xFFFF, kept = 0;
+  const u32 first = head;
   for (u32 i = g_pending_n; i-- > 0;) {
     const u32 h = g_pending[i];
+    if (!settled(h)) {
+      g_pending[kept++] = (u16)h;
+      continue;
+    }
     *(volatile u16*)(g_voices + h * kVoiceSize + kV_PITCH_LINK) = (u16)head;
     g_listed[h] = true;
     head = h;
   }
-  wr(kTVL2D, head);
-  g_pending_n = 0;
+  if (head != first) wr(kTVL2D, head);
+  g_pending_n = kept;
 }
 
 void gw_apu_voice_mix(u32 h, i16 pitch, u32 n, const u8* bins, const float* gains) {
@@ -346,8 +378,7 @@ void gw_apu_voice_stop(u32 h) {
   if (!g_ready || h >= kMaxVoices) return;
   for (u32 i = 0; i < g_pending_n; ++i)
     if (g_pending[i] == h) g_pending[i--] = g_pending[--g_pending_n];
-  unlink(h);
-  *voice(h, kV_STATE) = 0;
+  unlink(h);  // (its record left alone: see g_settling)
 }
 
 u32 gw_apu_voice_position(u32 h) { return g_ready && h < kMaxVoices ? *voice(h, kV_CBO) & 0xFFFFFF : 0; }

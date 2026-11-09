@@ -79,8 +79,13 @@ inline void prefetch(const void* p, u32 bytes) {
 // Passes a voice's stream was not there in time (a gap in that sound),
 // counted for the audio thread's report (src/audio.cpp).
 u32 gw_sound_late;
+u64 gw_sound_wait_cycles;  // the audio thread idle, waiting for the APU's output (not mixing cost)
 unsigned long long g_prof_control, g_prof_audio, g_prof_sound, g_prof_decode, g_prof_effects, g_prof_reverb,
     g_prof_collect, g_prof_mix, g_prof_mark, g_prof_lock, g_prof_out;
+// The APU's own parts (zero in the software build): reading its output back
+// (the wait for it left out), following its voices' positions and filling
+// stream rings, writing its voices' routes.
+unsigned long long g_prof_hwread, g_prof_hwpos, g_prof_hwapply;
 #define PROF_BEGIN(n) const unsigned long long prof_##n = __builtin_ia32_rdtsc()
 #define PROF_END(n) g_prof_##n += __builtin_ia32_rdtsc() - prof_##n
 
@@ -2424,6 +2429,12 @@ HwOwner g_hw[kMaxVoices];
 Comp* g_bin_owner[kBinsCopied];
 float g_bins[kBinsCopied][kPass];
 u8 g_bins_wanted[kBinsCopied];
+// A bin with sound in it this pass. A mixer whose bins are all silent is as
+// a software mixer nothing reached: its inserts (and what it feeds, such as
+// the reverb) are not run. Voices hold bins on every mixer they may reach,
+// muted or not, and one-shots play a silent tail, so most bins are often
+// silent.
+bool g_bin_live[kBinsCopied];
 u32 g_hw_starts, g_hw_full, g_hw_no_bins, g_apu_waves, g_apu_able, g_apu_sounds;
 float g_bin_scale = 4.0f / 32768.0f;  // a bin's 16-bit value to the engine's level (apu_calibrate)
 
@@ -2648,7 +2659,7 @@ void hw_voice_start(Graph& g, Comp& c, Voice& v) {
   hw_voice_stop(v);
   i16 h = -1;
   for (u32 k = kHwFirst; k < kMaxVoices && h < 0; ++k)
-    if (!g_hw[k].v) h = (i16)k;
+    if (!g_hw[k].v && gw_apu_voice_free(k)) h = (i16)k;
   i16 ring = -1;
   if (stream)
     for (u32 k = 0; k < kHwRings && ring < 0; ++k)
@@ -2688,7 +2699,15 @@ void hw_voice_start(Graph& g, Comp& c, Voice& v) {
       hv.loop_end = samples + kTailBlocks * 64;
     }
   }
-  gw_apu_voice_start((u32)h, hv);  // (muted: the pass's routes come at its end)
+  if (!gw_apu_voice_start((u32)h, hv)) {  // (muted: the pass's routes come at its end)
+    if (stream) {
+      g_ring_used[ring] = false;
+      v.hw_ring = -1;
+    }
+    bins_give_back(c);
+    ++g_hw_full;
+    return;
+  }
   g_hw[h] = {&g, &c, &v};
   v.hw[0] = h;
   ++g_hw_starts;
@@ -2810,11 +2829,14 @@ void hw_apply() {
   gw_apu_voices_go();  // (this pass's new voices, with their first routes, together)
 }
 
-// This pass's bins into a bin mixer (before its inserts).
+// This pass's bins into a bin mixer (before its inserts); false when all
+// of them were silent.
 bool hw_bins_add(Graph& g, Comp& d, bool* fresh) {
   (void)g;
+  bool any = false;
   for (u32 o = 0; o < d.out_ch && o < 4; ++o) {
-    if (d.apu_bins[o] < 0) continue;
+    if (d.apu_bins[o] < 0 || !g_bin_live[d.apu_bins[o]]) continue;
+    any = true;
     const float* in = g_bins[d.apu_bins[o]];
     float* out = d.buf[o];
     if (fresh[o]) {
@@ -2824,7 +2846,7 @@ bool hw_bins_add(Graph& g, Comp& d, bool* fresh) {
       for (u32 n = 0; n < kPass; ++n) out[n] += in[n];
     }
   }
-  return true;
+  return any;
 }
 
 // The APU's output for this pass (256 frames), waited for: the mix follows
@@ -2839,19 +2861,28 @@ void apu_read_bins() {
   }
   for (u32 b = 0; b < kBinsCopied; ++b) g_bins_wanted[b] = g_bin_owner[b] != nullptr;
   u32 waited = 0;
+  const u64 wait_from = __builtin_ia32_rdtsc();
   while (gw_apu_available() < kPass && waited < 40) {
     Sleep(1);
     ++waited;
   }
+  gw_sound_wait_cycles += __builtin_ia32_rdtsc() - wait_from;
   const u32 have = gw_apu_available();
   if (have < kPass) {
     static u32 told;
     if (told++ < 8) gw_log("sound: the APU's output is late (%u frames)\n", have);
     memset(g_bins, 0, sizeof(g_bins));
+    memset(g_bin_live, 0, sizeof(g_bin_live));
     return;
   }
   if (have > 2048) gw_apu_skip((have - 512) / 32 * 32);
   gw_apu_read_bins(g_bins, g_bins_wanted, g_bin_scale);
+  for (u32 b = 0; b < kBinsCopied; ++b) {
+    bool live = false;
+    if (g_bins_wanted[b])
+      for (u32 n = 0; n < kPass && !live; ++n) live = g_bins[b][n] != 0.0f;
+    g_bin_live[b] = live;
+  }
   static DWORD last;
   if (GetTickCount() - last > 5000) {
     last = GetTickCount();
@@ -2872,7 +2903,9 @@ void hw_apply() {}
 #endif
 
 void graph_pass() {
+  PROF_BEGIN(hwpos);
   hw_positions();
+  PROF_END(hwpos);
   // Inputs read last pass's sums (one pass of latency), then collect anew.
   Graph& sys = g_graphs[0];
   if (sys.live) {
@@ -2952,7 +2985,9 @@ void graph_pass() {
     }
   }
   PROF_END(audio);
+  PROF_BEGIN(hwapply);
   hw_apply();
+  PROF_END(hwapply);
   gains_pass_done();
   ++g_pass;
 }
@@ -3522,7 +3557,11 @@ void gw_sound_mix(i16* out, u32 samples) {
   float level_lin = 0;
   if (g_ready && samples == kPass && g_graphs[0].live) {
 #ifdef GW_SOUND_APU
+    const u64 wait0 = gw_sound_wait_cycles;
+    PROF_BEGIN(hwread);
     apu_read_bins();
+    PROF_END(hwread);
+    g_prof_hwread -= gw_sound_wait_cycles - wait0;
 #endif
     PROF_BEGIN(lock);
     EnterCriticalSection(&g_lock);

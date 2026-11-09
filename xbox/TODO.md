@@ -16,7 +16,9 @@ stars 1.2, sound 2.0, commands 0.1.
 
 ## 2. Fit in 64 MB
 
-About 4.9 MB is free in a four-player level.
+About 4.9 MB is free in a four-player level (console). In XEMU (2026-11-09,
+12 minutes of four players): 5.7 MB free at the lowest; with `SOUND_APU=y`
+3.7 MB (its copies of the effects, the stream rings and tables).
 
 - [ ] Main-picture particle buffers: two sets of six jobs' buffers for the
       frames in flight (`src/particle_buffers.cpp`); one set may do now
@@ -62,7 +64,23 @@ APU's own format), and a native engine plays the game's sound graphs
       - Seen in XEMU: menu music on the APU as in the software engine (the
         layers within a sample of each other, 0.23 unexplained by the layers,
         as the PC check); a game: 718 hardware voices started, none refused,
-        12 bins; pause silent and resumed.
+        12 bins; pause silent and resumed. Twelve minutes of four players:
+        38,000 voices started, none refused. (Before, XEMU stopped after a few
+        minutes: a voice taken off the list was cleared at once, and the VP,
+        which reads a voice's link before mixing it, could still reach it;
+        now a voice off the list is left alone for two APU frames.)
+      - Memory: 2 MB less free than the software engine in a four-player
+        level. To win back: play the effects from the banks' own memory
+        (contiguous) instead of a copy, a smaller GP ring, smaller rings.
+      - CPU (XEMU, four players, us per 5.3 ms frame, the wait for the APU
+        left out): software 700-850, APU 650-770 in the busiest stretches
+        and 300-450 in lighter ones. The voices' own mixing goes (280 -> 30);
+        the inserts, control and combining stay (the same in both), and the
+        APU's side costs about 110 (reading its output 45, positions and
+        rings 30, routes 33). Bins all silent count as nothing reaching the
+        mixer (before, every bin mixer ran its inserts and the reverb ran
+        all the time). To trim: write a voice's routes only when they
+        change (each costs 8 log10f), skip reading silent bins' owners.
       - Next, on the console: hear it; measure the CPU time saved; the
         console's ADPCM rounding, its mix level and whether stereo voices
         put the right channel on the odd outputs. Then make it the default.

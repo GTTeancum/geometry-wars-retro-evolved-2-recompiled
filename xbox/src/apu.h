@@ -29,7 +29,10 @@ u32 gw_apu_frames();  // APU frames the GP has run (32 samples each)
 // good); its offset there, or 0xFFFFFFFF when the space is full.
 u32 gw_apu_map(const void* data, u32 bytes);
 
-void gw_apu_voice_start(u32 h, const GwApuVoice& v);  // (plays from the next gw_apu_voices_go)
+// Voice h free to start: not listed, and off the list long enough that the
+// VP can no longer reach it (two APU frames).
+bool gw_apu_voice_free(u32 h);
+bool gw_apu_voice_start(u32 h, const GwApuVoice& v);  // false: not free; plays from the next gw_apu_voices_go
 void gw_apu_voices_go();  // the voices started since the last call, listed together
 void gw_apu_voice_pause(u32 h, bool paused);  // off the list (its place kept) / back at the next go
 void gw_apu_voice_set(u32 h, i16 pitch, float left, float right);
