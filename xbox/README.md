@@ -32,6 +32,11 @@ Later milestones:
 3. **Playable with sound**: controller input through nxdk, music and effects
    (the game's XMA audio decoded or converted for the Xbox).
 4. **Full speed on hardware**, within 64 MB.
+   Reached (console, 2026-11-08): the game updates at full speed, 58.6
+   updates a second median with four players, and draws every second update
+   (`GW_DRAW_EVERY` in `src/render_native.cpp`), 30 pictures a second at 720p.
+   Per update in a level: grid about 2.2 ms, particles 0-4, stars 1.2, sound
+   2.0, commands 0.1.
 
 ## Status (2026-11-05)
 

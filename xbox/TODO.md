@@ -3,18 +3,7 @@
 Status and history live in `README.md`; this is what is left, roughly in
 order. Measurements are from the console (a debug kit at 64 MB) unless noted.
 
-## 1. Speed
-
-The game updates at full speed (58.6 updates a second median with four
-players) and draws every second update (`GW_DRAW_EVERY` in
-`src/render_native.cpp`), so 30 pictures a second at 720p. Per update in a
-level (the log's `cpu ms/frame` line): grid about 2.2 ms, particles 0-4,
-stars 1.2, sound 2.0, commands 0.1.
-
-- [ ] Draw every update (60 pictures a second): the drawing that the
-      skipped frames save has to fit in the frame.
-
-## 2. Fit in 64 MB
+## 1. Fit in 64 MB
 
 About 4.9 MB is free in a four-player level (console). In XEMU (2026-11-09,
 12 minutes of four players): 5.7 MB free at the lowest; with `SOUND_APU=y`
@@ -26,7 +15,7 @@ About 4.9 MB is free in a four-player level (console). In XEMU (2026-11-09,
 - [ ] Vertex buffer pool: the game's 256 buffers of 128 KB share 32 real
       ones (4 MB, `src/crt_hooks.cpp`); try 16.
 
-## 3. Sound
+## 2. Sound
 
 No XMA on the Xbox: the installer converts every sound to Xbox ADPCM (the
 APU's own format), and a native engine plays the game's sound graphs
