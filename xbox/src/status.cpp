@@ -128,7 +128,11 @@ DWORD WINAPI status_thread(LPVOID) {
     if (swaps != last_swaps) stalled_seconds = 0;
     last_swaps = swaps;
     last_tick = now;
-    if (seconds % 300 == 299) gw_log_memory("every 5 minutes");  // (a soak's memory over time)
+#ifdef GW_PARTICLE_STRESS
+    if (seconds % 5 == 4) gw_log_memory("every 5 s (particle stress)");
+#else
+    if (seconds % 300 == 299) gw_log_memory("every 5 minutes");
+#endif  // (a soak's memory over time)
     if (++seconds % 5 == 0) {
       // ms of CPU per frame for each timed part, at 733 MHz.
       static u64 last_cycles[kPartCount];

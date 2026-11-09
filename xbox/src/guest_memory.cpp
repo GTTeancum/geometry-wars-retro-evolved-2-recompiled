@@ -428,7 +428,14 @@ extern "C" float roundevenf(float x) {
   return f;
 }
 
+#ifdef GW_PARTICLE_STRESS
+extern u32 gw_particles_most;
+#endif
+
 void gw_log_memory(const char* when) {
+#ifdef GW_PARTICLE_STRESS
+  gw_log("particles: most %u live\n", gw_particles_most);
+#endif
   MM_STATISTICS stats;
   stats.Length = sizeof(stats);
   MmQueryStatistics(&stats);

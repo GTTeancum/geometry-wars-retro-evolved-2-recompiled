@@ -291,7 +291,12 @@ void particle_update(const ParticleConstants& k, u32 in, u32 out, u32 streak, u8
   t = sel(t - one, hi, t);
   const float glow_k = k.glow_k;
   const float intensity = limit * (t * t * t * glow_k + one) * (trail_clamped * trail_clamped);
-  const float alpha = sel(intensity - k.alpha_min, hi, bounce) * brightness - k.brightness_bias;
+  float alpha = sel(intensity - k.alpha_min, hi, bounce) * brightness - k.brightness_bias;
+#ifdef GW_PARTICLE_STRESS
+  // Test only: no particle fades out, so the game's pool fills (the worst
+  // case for the vertex buffers, which follow the busiest frame).
+  if (!(alpha > 0.25f)) alpha = 0.25f;
+#endif
   sf(out + 36, alpha);
 
   // Direction of travel this frame (normalised), for the streak.
@@ -366,6 +371,9 @@ constexpr u32 kGlowBuffers = 0x821B3E7C, kMainBuffers = 0x821B3E80, kFrame = 0x8
 // particles of 44 bytes, then the count at +5632), +8 the bucket index
 // array, +12 the last index, +496 the next index (shared by the jobs).
 constexpr u32 kBucket = 5636, kParticle = 44, kPerBucket = 128, kCount = 5632;
+// The most live particles kept (a job; the first takes them all): about
+// 2.4 MB stays free in XEMU at the cap with four players.
+constexpr u32 kMaxLive = 16000;
 
 u32 lock(PPCContext& ctx, uint8_t* base, u32 buffer) {
   ctx.r3.u64 = buffer;
@@ -387,6 +395,10 @@ u32 lock(PPCContext& ctx, uint8_t* base, u32 buffer) {
 // recompiled code made the most expensive part of the particles; the same
 // stores in the same order otherwise. The jobs run one after another on
 // the main thread (sub_82063F08 below), so the index needs no atomics.
+#ifdef GW_PARTICLE_STRESS
+u32 gw_particles_most;  // the most live particles in one job (reported at an allocation failure)
+#endif
+
 extern "C" void sub_82063A38(PPCContext& ctx, uint8_t* base) {
   GwPartTimer timer(kPartParticles);
   const u32 system = ctx.r3.u32, job = lw(ctx.r4.u32 + 4);
@@ -433,6 +445,11 @@ extern "C" void sub_82063A38(PPCContext& ctx, uint8_t* base) {
       _mm_prefetch((const char*)gw_host(p + 4 * kParticle), _MM_HINT_T0);
       _mm_prefetch((const char*)gw_host(p + 4 * kParticle + 32), _MM_HINT_T0);
       if ((int)lw(p + 36) < 0) continue;
+      // Past kMaxLive the particle is dropped as a dead one is (not moved on
+      // into the compacted buckets): the vertex buffers follow the busiest
+      // frame, and 64 MB ran out at about 25,400 (four players, the stress
+      // build); the busiest real play seen had about 5,200.
+      if (live >= kMaxLive) continue;
       if (used >= kPerBucket) {
         sw(dest + kCount, used);
         dest = bucket;
@@ -452,6 +469,16 @@ extern "C" void sub_82063A38(PPCContext& ctx, uint8_t* base) {
   }
   if (dest) sw(dest + kCount, used);
   sw(kLive + job * 4, live);
+#ifdef GW_PARTICLE_STRESS
+  {
+    static u32 calls;
+    u32& most = gw_particles_most;
+    if (live > most) most = live;
+    if (job == 0 && ++calls % 300 == 0) {  // (about every 5 s)
+      gw_log("particles: %u live (most %u); buckets in use %u\n", live, most, lw(system + 12) + 1);
+    }
+  }
+#endif
   ctx.r3.u64 = glow_buffer;
   sub_820A1850(ctx, base);
   ctx.r3.u64 = main_buffer;

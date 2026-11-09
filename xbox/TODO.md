@@ -9,6 +9,13 @@ About 4.9 MB is free in a four-player level (console). In XEMU (2026-11-09,
 12 minutes of four players): 5.7 MB free at the lowest; with `SOUND_APU=y`
 3.7 MB (its copies of the effects, the stream rings and tables).
 
+Particles (2026-11-09): with none fading out (`make PARTICLE_STRESS=y`, a
+test build) four players in XEMU ran out of memory at about 25,400 live
+particles, and the game froze; the busiest real play seen had about 5,200.
+They are now capped at 16,000 (`kMaxLive` in `src/particle_native.cpp`;
+past it a particle is dropped as a dead one is). The stress build at the
+cap: 6 minutes, 4.1 MB free at the lowest, no fault.
+
 - [ ] Main-picture particle buffers: two sets of six jobs' buffers for the
       frames in flight (`src/particle_buffers.cpp`); one set may do now
       that the jobs run inline.

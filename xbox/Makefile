@@ -75,6 +75,12 @@ ifeq ($(SPAWN_CAPTURE),y)
 src/nv2a.obj: NXDK_CXXFLAGS += -DGW_SPAWN_CAPTURE
 endif
 
+# Test only: particles never fade out, so the game's particle pool fills (the
+# worst case for memory); free memory logged every 15 s: make PARTICLE_STRESS=y
+ifeq ($(PARTICLE_STRESS),y)
+src/particle_native.obj src/status.obj src/guest_memory.obj: NXDK_CXXFLAGS += -DGW_PARTICLE_STRESS
+endif
+
 # Record the last 8 s of sound out and log the game's sound actions and
 # parameters (tools/xbdm_audio.py): make AUDIO_CAPTURE=y
 ifeq ($(AUDIO_CAPTURE),y)
