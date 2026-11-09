@@ -175,8 +175,8 @@ GW_EXPORT(XamGetExecutionId) {
 }
 
 GW_EXPORT(XamGetSystemVersion) { GW_RETURN(0x20000000); }
-GW_EXPORT(XamLoaderLaunchTitle) { gw_fatal("XamLoaderLaunchTitle"); }
-GW_EXPORT(XamLoaderTerminateTitle) { gw_fatal("game exited (XamLoaderTerminateTitle)"); }
+GW_EXPORT(XamLoaderLaunchTitle) { gw_return_to_dash("the game launched another title (XamLoaderLaunchTitle)"); }
+GW_EXPORT(XamLoaderTerminateTitle) { gw_return_to_dash("the game exited (XamLoaderTerminateTitle)"); }
 
 // --- UI ------------------------------------------------------------------------------------
 

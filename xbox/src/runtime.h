@@ -125,6 +125,12 @@ bool gw_census_due();                         // committed memory passed another
 
 void gw_log(const char* fmt, ...);
 [[noreturn]] void gw_fatal(const char* fmt, ...);
+// Back to the dashboard (the in-game reset): the controller combo
+// (LT+RT+Back+Black, src/input.cpp), the main menu's Return to dash and the
+// game's own exits. Sound is stopped first; the console then quick-reboots
+// into the dashboard (src/kernel_misc.cpp).
+[[noreturn]] void gw_return_to_dash(const char* why);
+void gw_audio_stop();
 void gw_status_init();
 void gw_status_frame();  // called on each guest swap
 void gw_log_backtrace(PPCContext& ctx);

@@ -20,6 +20,25 @@ constexpr int kPads = 4;
 SDL_GameController* g_controllers[kPads];
 bool g_sdl_ok;
 
+// The in-game reset, as Perfect Dark X: LT+RT+Back+Black held together on
+// any controller returns to the dashboard (gw_return_to_dash). Read from the
+// controller's fixed physical layout (nxdk's joystick: axes 2 and 5 the
+// triggers, buttons 6 Back and 5 Black), not through any button mapping.
+void check_reset_combo() {
+  for (int i = 0; i < kPads; ++i) {
+    if (!g_controllers[i]) continue;
+    SDL_Joystick* joy = SDL_GameControllerGetJoystick(g_controllers[i]);
+    if (!joy) continue;
+    if (SDL_JoystickGetAxis(joy, 2) > 16384 && SDL_JoystickGetAxis(joy, 5) > 16384 && SDL_JoystickGetButton(joy, 6) &&
+        SDL_JoystickGetButton(joy, 5)) {
+      for (auto& c : g_controllers)
+        if (c) SDL_GameControllerRumble(c, 0, 0, 0);
+      gw_log("reset: player %d held LT+RT+Back+Black\n", i + 1);
+      gw_return_to_dash("controller combo");
+    }
+  }
+}
+
 void update_controllers() {
   // The game reads the pad several times a frame; SDL's update also polls
   // the USB hubs, so it runs at most every 8 ms (reads in between see the
@@ -47,6 +66,7 @@ void update_controllers() {
     }
   }
   SDL_GameControllerUpdate();
+  check_reset_combo();
 }
 
 int16_t axis(SDL_GameController* c, SDL_GameControllerAxis a, bool flip) {

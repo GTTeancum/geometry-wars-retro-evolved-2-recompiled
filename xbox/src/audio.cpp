@@ -80,6 +80,23 @@ void ac97_queue(u8* buffer, u32 bytes) {
   g_next = (g_next + 1) % kBuffers;
 }
 
+}  // namespace
+
+// The AC97's two bus masters stopped and reset, so nothing is still playing
+// out of this program's buffers when the console reboots to the dashboard.
+void gw_audio_stop() {
+  kAc97[0x11B] = 0;
+  kAc97[0x17B] = 0;
+  kAc97[0x11B] = 2;
+  kAc97[0x17B] = 2;
+  for (int t = 0; (kAc97[0x11B] & 2) && t < 100000; ++t) {
+  }
+  for (int t = 0; (kAc97[0x17B] & 2) && t < 100000; ++t) {
+  }
+}
+
+namespace {
+
 DWORD WINAPI audio_thread(LPVOID) {
   gw_log("audio: host thread %u\n", (u32)GetCurrentThreadId());
   // Results too small for a normal float flushed to zero: the sound graphs'

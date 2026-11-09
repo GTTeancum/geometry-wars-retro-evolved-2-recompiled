@@ -334,7 +334,7 @@ GW_EXPORT(KeBugCheckEx) { gw_fatal("KeBugCheckEx(%08X, %08X, %08X)", GW_ARG(3), 
 GW_EXPORT(RtlRaiseException) { gw_fatal("RtlRaiseException(code %08X)", gw_load32(GW_ARG(3))); }
 GW_EXPORT(RtlUnwind) { gw_fatal("RtlUnwind"); }
 GW_EXPORT(__C_specific_handler) { gw_fatal("__C_specific_handler"); }
-GW_EXPORT(HalReturnToFirmware) { gw_fatal("game asked to return to the dashboard (%u)", GW_ARG(3)); }
+GW_EXPORT(HalReturnToFirmware) { gw_return_to_dash("the game asked for the dashboard (HalReturnToFirmware)"); }
 GW_EXPORT(ExRegisterTitleTerminateNotification) {}
 
 // --- networking (offline) ------------------------------------------------------------------
@@ -349,3 +349,27 @@ GW_EXPORT(NetDll_WSAStartup) {
 }
 
 GW_EXPORT(NetDll_XNetStartup) { GW_RETURN(0); }
+
+// --- in-game reset ---------------------------------------------------------------
+
+// As Perfect Dark X: a launch data page asking for the dashboard, written
+// back to RAM (the firmware reads it after the quick reboot), then a quick
+// reboot. The page is the kernel's own LaunchDataPage, allocated here when
+// no title set one; a failed allocation falls back to a full reboot.
+void gw_return_to_dash(const char* why) {
+  gw_log("reset: back to the dashboard: %s\n", why);
+  gw_audio_stop();
+  const u32 kPageSize = 0x1000;
+  if (!LaunchDataPage) LaunchDataPage = (PLAUNCH_DATA_PAGE)MmAllocateContiguousMemory(kPageSize);
+  if (!LaunchDataPage) HalReturnToFirmware(HalRebootRoutine);
+  MmPersistContiguousMemory(LaunchDataPage, kPageSize, TRUE);
+  memset((void*)LaunchDataPage, 0, kPageSize);
+  LaunchDataPage->Header.dwLaunchDataType = LDT_LAUNCH_DASHBOARD;
+  LaunchDataPage->Header.dwTitleId = CURRENT_XBE_HEADER->CertificateHeader->TitleID;
+  LaunchDataPage->Header.dwFlags = 0;
+  __asm__ __volatile__("sfence" ::: "memory");
+  __asm__ __volatile__("wbinvd" ::: "memory");
+  HalReturnToFirmware(HalQuickRebootRoutine);
+  for (;;) {
+  }
+}

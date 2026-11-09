@@ -33,6 +33,23 @@ def clear_limit_64mb(xbe_path):
     xbe_path.write_bytes(data)
 
 
+def patch_menu_text(loc_path):
+    # The main menu's Return to arcade (an Xbox 360 Arcade item) is the
+    # in-game reset here (src/menu_native.cpp): Return to dash, written over
+    # the same string (UTF-16 big-endian), the rest of its room left as
+    # terminators, so no offset in the file moves.
+    data = bytearray(loc_path.read_bytes())
+    old = 'Return to arcade'.encode('utf-16-be')
+    new = 'Return to dash'.encode('utf-16-be')
+    at = data.find(old)
+    if at < 0:
+        if data.find(new + b'\0\0') >= 0:
+            return
+        sys.exit(f'{loc_path}: Return to arcade not found')
+    data[at:at + len(old)] = new + b'\0' * (len(old) - len(new))
+    loc_path.write_bytes(bytes(data))
+
+
 def main():
     devkit_128 = '--devkit-128mb' in sys.argv[1:]
     extracted = ROOT / 'game' / 'extracted'
@@ -47,9 +64,22 @@ def main():
     if hashlib.sha256(image.read_bytes()).hexdigest() != IMAGE_SHA256:
         sys.exit(f'{image} is not the supported image')
     changed = 0
+    loc = STAGE / 'Text-en.loc'
     for src in extracted.rglob('*'):
         if src.is_file():
-            changed += copy(src, STAGE / src.relative_to(extracted))
+            dst = STAGE / src.relative_to(extracted)
+            if dst == loc:
+                continue
+            changed += copy(src, dst)
+    # The English text, with the main menu's Return to dash.
+    staged_loc = STAGE / 'Text-en.loc.new'
+    shutil.copyfile(extracted / 'Text-en.loc', staged_loc)
+    patch_menu_text(staged_loc)
+    if loc.exists() and filecmp.cmp(staged_loc, loc, shallow=False):
+        staged_loc.unlink()
+    else:
+        staged_loc.replace(loc)
+        changed += 1
     # The sound banks converted for the Xbox (xbox/tools/convert_banks.py
     # into xbox/build/audio_adpcm), next to the game's banks; the native
     # sound engine (src/sound_native.cpp) plays these.
