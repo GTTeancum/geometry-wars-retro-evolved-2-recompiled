@@ -36,20 +36,42 @@ def clear_limit_64mb(xbe_path):
     xbe_path.write_bytes(data)
 
 
-def patch_menu_text(loc_path):
-    # The main menu's Return to arcade (an Xbox 360 Arcade item) is the
-    # in-game reset here (src/menu_native.cpp): Return to dash, written over
-    # the same string (UTF-16 big-endian), the rest of its room left as
-    # terminators, so no offset in the file moves.
+# The game's text changed for the Xbox, in every language (installer/
+# install.ps1 makes the same changes); each new string fits in the old one's
+# room:
+#   - the main menu's Return to arcade (ID_MENU_RETURN_TO_ARCADE, an Xbox 360
+#     Arcade item) is the in-game reset here (src/menu_native.cpp): Return
+#     to dash;
+#   - the prompt for a missing controller (ID_X_CONNECT_CONTROLLER) names
+#     the Xbox's.
+TEXT_CHANGES = {
+    'en': [('Return to arcade', 'Return to dash'),
+           ('Connect Xbox 360 Controller', 'Connect Xbox Controller')],
+    'de': [('Zur\u00fcck zu Arcade', 'Zur\u00fcck zum Dash'),
+           ('Xbox 360 Controller anschlie\u00dfen', 'Xbox Controller anschlie\u00dfen')],
+    'es': [('Volver a Arcade', 'Volver al Dash'),
+           ('Conecta un Mando Xbox 360', 'Conecta un Mando Xbox')],
+    'fr': [('Retour vers Arcade', 'Retour au Dash'),
+           ('Veuillez connecter la manette Xbox 360', 'Veuillez connecter la manette Xbox')],
+    'it': [('Torna a Xbox LIVE Arcade', 'Torna alla Dash'),
+           ('Collega il Controller Xbox 360', 'Collega il Controller Xbox')],
+}
+
+
+def patch_text(loc_path, changes):
+    # Each new string is written over the whole old one (UTF-16 big-endian,
+    # matched between terminators), the rest of its room left as zeros, so
+    # no offset in the file moves.
     data = bytearray(loc_path.read_bytes())
-    old = 'Return to arcade'.encode('utf-16-be')
-    new = 'Return to dash'.encode('utf-16-be')
-    at = data.find(old)
-    if at < 0:
-        if data.find(new + b'\0\0') >= 0:
-            return
-        sys.exit(f'{loc_path}: Return to arcade not found')
-    data[at:at + len(old)] = new + b'\0' * (len(old) - len(new))
+    for old_text, new_text in changes:
+        old = old_text.encode('utf-16-be')
+        new = new_text.encode('utf-16-be')
+        assert len(new) <= len(old), new_text
+        at = data.find(b'\0\0' + old + b'\0\0')
+        if at < 0:
+            sys.exit(f'{loc_path}: {old_text} not found')
+        at += 2
+        data[at:at + len(old)] = new + b'\0' * (len(old) - len(new))
     loc_path.write_bytes(bytes(data))
 
 
@@ -67,22 +89,23 @@ def main():
     if hashlib.sha256(image.read_bytes()).hexdigest() != IMAGE_SHA256:
         sys.exit(f'{image} is not the supported image')
     changed = 0
-    loc = STAGE / 'Text-en.loc'
+    texts = {STAGE / f'Text-{lang}.loc': lang for lang in TEXT_CHANGES}
     for src in extracted.rglob('*'):
         if src.is_file():
             dst = STAGE / src.relative_to(extracted)
-            if dst == loc:
+            if dst in texts:
                 continue
             changed += copy(src, dst)
-    # The English text, with the main menu's Return to dash.
-    staged_loc = STAGE / 'Text-en.loc.new'
-    shutil.copyfile(extracted / 'Text-en.loc', staged_loc)
-    patch_menu_text(staged_loc)
-    if loc.exists() and filecmp.cmp(staged_loc, loc, shallow=False):
-        staged_loc.unlink()
-    else:
-        staged_loc.replace(loc)
-        changed += 1
+    # The game's text in each language, with the Xbox's changes (TEXT_CHANGES).
+    for loc, lang in texts.items():
+        staged_loc = loc.with_name(loc.name + '.new')
+        shutil.copyfile(extracted / loc.name, staged_loc)
+        patch_text(staged_loc, TEXT_CHANGES[lang])
+        if loc.exists() and filecmp.cmp(staged_loc, loc, shallow=False):
+            staged_loc.unlink()
+        else:
+            staged_loc.replace(loc)
+            changed += 1
     # The sound banks converted for the Xbox, next to the game's banks; the
     # native sound engine (src/sound_native.cpp) plays these: Xbox ADPCM
     # (xbox/tools/xadpcm_banks.cmd into xbox/build/audio_xadpcm, from

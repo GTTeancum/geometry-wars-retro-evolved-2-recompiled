@@ -5,22 +5,26 @@ order. Measurements are from the console (a debug kit at 64 MB) unless noted.
 
 ## 1. Fit in 64 MB
 
-About 4.9 MB is free in a four-player level (console). In XEMU (2026-11-09,
-12 minutes of four players): 5.7 MB free at the lowest; with `SOUND_APU=y`
-3.7 MB (its copies of the effects, the stream rings and tables).
+Done for the public test. Four players on the console (2026-11-09, 12
+minutes, the particle cap in): 4.7 MB free, flat through the run. In XEMU
+5.7 MB (XEMU shows about 1 MB more free than the console); with
+`SOUND_APU=y` 2 MB less (shelved, see Sound).
 
-Particles (2026-11-09): with none fading out (`make PARTICLE_STRESS=y`, a
-test build) four players in XEMU ran out of memory at about 25,400 live
-particles, and the game froze; the busiest real play seen had about 5,200.
-They are now capped at 16,000 (`kMaxLive` in `src/particle_native.cpp`;
-past it a particle is dropped as a dead one is). The stress build at the
-cap: 6 minutes, 4.1 MB free at the lowest, no fault.
+Particles: with none fading out (`make PARTICLE_STRESS=y`, a test build)
+four players in XEMU ran out of memory at about 25,400 live particles, and
+the game froze; the busiest real play seen had about 5,200. They are now
+capped at 16,000 (`kMaxLive` in `src/particle_native.cpp`; past it a
+particle is dropped as a dead one is). The stress build at the cap: 6
+minutes, 4.1 MB free at the lowest in XEMU, no fault (on the console about
+3 MB, by the difference above; not run there).
 
-- [ ] Main-picture particle buffers: two sets of six jobs' buffers for the
-      frames in flight (`src/particle_buffers.cpp`); one set may do now
-      that the jobs run inline.
-- [ ] Vertex buffer pool: the game's 256 buffers of 128 KB share 32 real
-      ones (4 MB, `src/crt_hooks.cpp`); try 16.
+Spare memory, if it is ever needed:
+
+- Main-picture particle buffers: two sets of six jobs' buffers for the
+  frames in flight (`src/particle_buffers.cpp`); one set may do now that
+  the jobs run inline.
+- Vertex buffer pool: the game's 256 buffers of 128 KB share 32 real ones
+  (4 MB, `src/crt_hooks.cpp`); 16 would give back 2 MB.
 
 ## 2. Sound
 

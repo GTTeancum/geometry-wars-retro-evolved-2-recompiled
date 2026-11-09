@@ -67,6 +67,42 @@ try {
     Copy-Item -LiteralPath $image -Destination (Join-Path $out 'gw2\default.image.bin')
     Copy-Item -LiteralPath (Join-Path $here 'default.xbe') -Destination (Join-Path $out 'default.xbe')
 
+    # The game's text changed for the Xbox in every language, as
+    # tools/stage_disc.py does (its TEXT_CHANGES): Return to arcade becomes
+    # Return to dash, and the controller prompt loses "360". Each new string
+    # is written over the whole old one (UTF-16 big-endian, matched between
+    # terminators), the rest of its room zeros, so no offset in the file
+    # moves. (Accented letters as [char] codes: this file is read as ANSI.)
+    $ue = [char]0x00FC; $sz = [char]0x00DF
+    $textChanges = @{
+        'en' = @(@('Return to arcade', 'Return to dash'),
+                 @('Connect Xbox 360 Controller', 'Connect Xbox Controller'))
+        'de' = @(@("Zur${ue}ck zu Arcade", "Zur${ue}ck zum Dash"),
+                 @("Xbox 360 Controller anschlie${sz}en", "Xbox Controller anschlie${sz}en"))
+        'es' = @(@('Volver a Arcade', 'Volver al Dash'),
+                 @('Conecta un Mando Xbox 360', 'Conecta un Mando Xbox'))
+        'fr' = @(@('Retour vers Arcade', 'Retour au Dash'),
+                 @('Veuillez connecter la manette Xbox 360', 'Veuillez connecter la manette Xbox'))
+        'it' = @(@('Torna a Xbox LIVE Arcade', 'Torna alla Dash'),
+                 @('Collega il Controller Xbox 360', 'Collega il Controller Xbox'))
+    }
+    $utf16 = [System.Text.Encoding]::BigEndianUnicode
+    foreach ($lang in $textChanges.Keys) {
+        $loc = Join-Path $out "Text-$lang.loc"
+        $text = [System.IO.File]::ReadAllBytes($loc)
+        $hex = [System.BitConverter]::ToString($text)
+        foreach ($change in $textChanges[$lang]) {
+            $old = $utf16.GetBytes($change[0])
+            $new = $utf16.GetBytes($change[1])
+            $at = $hex.IndexOf('00-00-' + [System.BitConverter]::ToString($old) + '-00-00')
+            if ($at -lt 0 -or $at % 3 -ne 0) { throw "Text-$lang.loc: '$($change[0])' not found." }
+            $at = $at / 3 + 2
+            for ($i = 0; $i -lt $old.Length; $i++) { $text[$at + $i] = if ($i -lt $new.Length) { $new[$i] } else { 0 } }
+            $hex = [System.BitConverter]::ToString($text)
+        }
+        [System.IO.File]::WriteAllBytes($loc, $text)
+    }
+
     # The dashboard's title name and the game's own icon, from this copy of
     # the game: into the XBE and next to it (the download carries none of
     # the game's art).
@@ -74,7 +110,7 @@ try {
     Add-Type -Path (Join-Path $here 'DashboardIcon.cs')
     [DashboardIcon]::Run($image, (Join-Path $out 'default.xbe'), $out)
 
-    # The Xbox has no XMA: the sounds become IMA ADPCM, through ffmpeg (on
+    # The Xbox has no XMA: the sounds become Xbox ADPCM, through ffmpeg (on
     # PATH, or ffmpeg.exe next to this script).
     $ffmpeg = Join-Path $here 'ffmpeg.exe'
     if (-not (Test-Path -LiteralPath $ffmpeg)) { $ffmpeg = (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source }
