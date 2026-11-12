@@ -16,6 +16,7 @@ $out = Join-Path $xbox 'build\installer'
 $sources = @{
     'install.ps1'    = Join-Path $xbox 'installer\install.ps1'
     'install.cmd'    = Join-Path $xbox 'installer\install.cmd'
+    'README.txt'     = Join-Path $xbox 'installer\README.txt'
     'StfsExtract.cs' = Join-Path $root 'tools\StfsExtract.cs'
     'SoundConvert.cs' = Join-Path $xbox 'installer\SoundConvert.cs'
     'DashboardIcon.cs' = Join-Path $xbox 'installer\DashboardIcon.cs'

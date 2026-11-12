@@ -11,7 +11,7 @@
   3. Copies the game's files next to default.xbe in the output folder, ready
      to copy to the Xbox (or to build a disc image from), and gives the XBE
      the dashboard's title name and the game's own icon.
-  4. Converts the sounds from XMA to IMA ADPCM (audio\<bank>.adpcm), with
+  4. Converts the sounds from XMA to Xbox ADPCM (audio\<bank>.adpcm), with
      ffmpeg from PATH or ffmpeg.exe next to this script.
 
   The output folder must be new or empty. Nothing is written anywhere else
