@@ -359,6 +359,7 @@ GW_EXPORT(NetDll_XNetStartup) { GW_RETURN(0); }
 void gw_return_to_dash(const char* why) {
   gw_log("reset: back to the dashboard: %s\n", why);
   gw_audio_stop();
+  gw_flush_saves();
   const u32 kPageSize = 0x1000;
   if (!LaunchDataPage) LaunchDataPage = (PLAUNCH_DATA_PAGE)MmAllocateContiguousMemory(kPageSize);
   if (!LaunchDataPage) HalReturnToFirmware(HalRebootRoutine);

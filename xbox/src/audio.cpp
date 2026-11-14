@@ -19,6 +19,10 @@ extern unsigned long long g_prof_control, g_prof_audio, g_prof_sound, g_prof_eff
     g_prof_collect, g_prof_mix, g_prof_mark, g_prof_lock, g_prof_out;
 extern unsigned long long g_prof_hwread, g_prof_hwpos, g_prof_hwapply;
 extern u32 gw_sound_late;  // passes a voice's stream was late (src/sound_native.cpp)
+extern u32 gw_sound_late_why[3];
+extern u32 gw_sound_voices;
+extern unsigned long long g_prof_decode;
+extern const char* gw_sound_late_wave;
 extern u64 gw_sound_wait_cycles;  // waiting for the APU's output, left out of the mix's cost
 
 #ifdef GW_AUDIO_CAPTURE
@@ -278,11 +282,19 @@ DWORD WINAPI audio_thread(LPVOID) {
              "level %u (SSE control %04X)\n",
              queued, ahead, low, dry, gw_sound_late, mixes ? (u32)(mix_cycles / mixes / 733) : 0, rms, g_csr_seen);
       low = kAhead;
+      if (gw_sound_late_why[0] | gw_sound_late_why[1] | gw_sound_late_why[2]) {
+        gw_log("audio: streams late: no ring %u, ring behind %u, ring elsewhere %u; last %s\n", gw_sound_late_why[0],
+               gw_sound_late_why[1], gw_sound_late_why[2], gw_sound_late_wave);
+        gw_sound_late_why[0] = gw_sound_late_why[1] = gw_sound_late_why[2] = 0;
+      }
       if (mixes) {
-        gw_log("audio: us a frame: control %u, mixing %u (sounds %u, effects %u), reverb %u\n",
+        gw_log("audio: us a frame: control %u, mixing %u (sounds %u: %u voices a frame, decoding %u; effects %u), "
+               "reverb %u\n",
                (u32)(g_prof_control / mixes / 733), (u32)(g_prof_audio / mixes / 733),
-               (u32)(g_prof_sound / mixes / 733), (u32)(g_prof_effects / mixes / 733),
-               (u32)(g_prof_reverb / mixes / 733));
+               (u32)(g_prof_sound / mixes / 733), gw_sound_voices / mixes, (u32)(g_prof_decode / mixes / 733),
+               (u32)(g_prof_effects / mixes / 733), (u32)(g_prof_reverb / mixes / 733));
+        gw_sound_voices = 0;
+        g_prof_decode = 0;
         gw_log("audio: us a frame: combining %u, mixing loops %u, marking %u, lock %u, output %u\n",
                (u32)(g_prof_collect / mixes / 733), (u32)(g_prof_mix / mixes / 733),
                (u32)(g_prof_mark / mixes / 733), (u32)(g_prof_lock / mixes / 733),

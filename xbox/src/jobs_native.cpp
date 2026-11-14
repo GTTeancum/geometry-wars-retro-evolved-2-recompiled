@@ -53,6 +53,21 @@ extern "C" void sub_82063F08(PPCContext& ctx, uint8_t* base) {
   }
   const u32 object = ctx.r3.u32;
   ctx.r1.u64 = ctx.r1.u32 - 144;  // the original's frame, below which the calls put theirs
+  // At 30 ticks a second (make TICK30=y) the systems run here step a fixed
+  // amount per call, not by the game's time step (the particles' motion and
+  // damping, the grid's springs, the stars): run twice per tick, so they
+  // move as at 60.
+  for (u32 step = 0; step < 60 / kGwTicks; ++step) {
+  gw_jobs_inner_step = step + 1 < 60 / kGwTicks;  // only the last step's vertices are drawn
+  if (step > 0) {
+    // The grid's frame start for the step after the first (as guest
+    // 0x8205C8F8 does once a tick, without its line buffer change): its row
+    // counter back to 0, its position slots flipped (read the last written).
+    const u32 write = gw_load32(0x821A0000 + 5908);
+    gw_store32(0x821A0000 + 5892, 0);
+    gw_store32(0x82180000 + 9660, write);
+    gw_store32(0x821A0000 + 5908, 1 - write);
+  }
 
   // Before the barrier, as the original.
   ctx.r3.u64 = gw_load32(0x821A0000 - 11632);
@@ -99,5 +114,7 @@ extern "C" void sub_82063F08(PPCContext& ctx, uint8_t* base) {
   ctx.r3.u64 = object;
   sub_82062F28(ctx, base);
   gw_store32(object + 12, ctx.r3.u32);
+  }
+  gw_jobs_inner_step = false;
   ctx.r1.u64 = ctx.r1.u32 + 144;
 }

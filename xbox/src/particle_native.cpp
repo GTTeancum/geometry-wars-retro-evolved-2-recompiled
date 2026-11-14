@@ -48,6 +48,13 @@ inline void sf(u32 a, float f) {
   memcpy(gw_host(a), &v, 4);
 }
 
+// The particle store's own values: host order (see sub_82063100 below).
+inline float hf(u32 a) {
+  float f;
+  memcpy(&f, gw_host(a), 4);
+  return f;
+}
+
 inline float ld(u32 a) {  // a double constant, as float
   u64 v = gw_load64(a);
   double d;
@@ -354,7 +361,312 @@ void particle_update(const ParticleConstants& k, u32 in, u32 out, u32 streak, u8
   }
 }
 
+// Four particles at once: particle_update's operations, each on four
+// particles in the four lanes of an SSE register (the same single-precision
+// operations, so each lane's results are those of particle_update). The
+// particles are in the store's host order (sub_82063100 below), turned into
+// lanes with transposes, the results written back per particle. All four are read before any is written: the job's compaction
+// moves a particle only to its own slot or an earlier one, so no particle's
+// new slot is another's old one in the same batch.
+struct Lane {
+  u32 in, out, streak;
+  u8* streak_host;
+  u8* glow_host;
+};
+typedef __m128 V;
+inline V s1(float f) { return _mm_set1_ps(f); }
+inline V add(V a, V b) { return _mm_add_ps(a, b); }
+inline V sub(V a, V b) { return _mm_sub_ps(a, b); }
+inline V mul(V a, V b) { return _mm_mul_ps(a, b); }
+inline V div(V a, V b) { return _mm_div_ps(a, b); }
+inline V neg(V a) { return _mm_xor_ps(a, _mm_set1_ps(-0.0f)); }
+inline V sel(V a, V b, V c) {  // a >= 0 ? b : c (NaN: c), lane by lane
+  const V m = _mm_cmple_ps(_mm_setzero_ps(), a);
+  return _mm_or_ps(_mm_and_ps(m, b), _mm_andnot_ps(m, c));
+}
+inline V rsq(V x) {
+#ifdef GW_GRID_EXACT_RSQ
+  alignas(16) float f[4];
+  _mm_store_ps(f, x);
+  for (float& v : f) v = rsq(v);
+  return _mm_load_ps(f);
+#else
+  return _mm_rsqrt_ps(x);  // frsqrte, as rsq: the same estimate in every lane
+#endif
+}
+
+void particle_update4(const ParticleConstants& k, const Lane* lane, u32 n) {
+  // Lanes past n repeat the first particle; their results are dropped. Each
+  // particle is three 16-byte loads (the twelfth float is the next
+  // particle's, or the bucket's count: inside the bucket either way, unused).
+  V r0[4], r1[4], r2[4];
+  for (u32 l = 0; l < 4; ++l) {
+    const float* in = (const float*)gw_host(lane[l < n ? l : 0].in);
+    r0[l] = _mm_loadu_ps(in);
+    r1[l] = _mm_loadu_ps(in + 4);
+    r2[l] = _mm_loadu_ps(in + 8);
+  }
+  _MM_TRANSPOSE4_PS(r0[0], r0[1], r0[2], r0[3]);
+  _MM_TRANSPOSE4_PS(r1[0], r1[1], r1[2], r1[3]);
+  _MM_TRANSPOSE4_PS(r2[0], r2[1], r2[2], r2[3]);
+  const V px = r0[0], py = r0[1], pz = r0[2], vx = r0[3];
+  const V vy = r1[0], vz = r1[1], red = r1[2], green = r1[3];
+  const V blue = r2[0], brightness = r2[1], speed_smoothed = r2[2];
+  const V one = s1(k.one), zero = s1(k.zero), half = s1(k.half), bounce = s1(k.bounce), reverse = s1(k.reverse);
+  const V unit = s1(1.0f);  // recip's 1
+
+  // 1. Move, and reflect off the walls.
+  const V max_x = s1(k.max_x), max_y = s1(k.max_y), dt = s1(k.dt);
+  const V dx = mul(vx, dt), dy = mul(vy, dt);
+  V dz = mul(vz, dt);
+  const V nx = add(px, dx), ny = add(py, dy), z = add(pz, dz);
+  const V left = add(max_x, nx), right = sub(max_x, nx);
+  const V bottom = add(max_y, ny), top = sub(max_y, ny);
+  const V factor_x = sel(left, sel(right, bounce, reverse), reverse);
+  const V factor_y = sel(bottom, sel(top, bounce, reverse), reverse);
+  V x = sel(left, nx, sub(neg(max_x), left));
+  x = sel(right, x, add(max_x, right));
+  V y = sel(bottom, ny, sub(neg(max_y), bottom));
+  y = sel(top, y, add(max_y, top));
+  const V nearest_x = sel(left, right, left), nearest_y = sel(bottom, top, bottom);
+  const V inside = sel(nearest_x, nearest_y, nearest_x);
+  V mx = sel(inside, dx, mul(factor_x, dx));
+  V my = sel(inside, dy, mul(factor_y, dy));
+
+  // 2. Gravity wells.
+  if (k.wells > 0) {
+    const V bias = s1(k.bias), pull = s1(k.pull);
+    for (int w = 0; w < k.wells; ++w) {
+      V tz = sub(s1(well_at(k, w, 2)), z), tx = sub(s1(well_at(k, w, 0)), x), ty = sub(s1(well_at(k, w, 1)), y);
+      const V d2 = add(add(mul(tx, tx), mul(tz, tz)), mul(ty, ty));
+      const V reach = sub(d2, one);
+      V s = mul(div(unit, d2), pull);
+      s = sel(sub(half, s), s, half);
+      const V swirl_x = mul(sub(ty, tx), s), swirl_y = mul(sub(neg(tx), ty), s), swirl_z = mul(zero, s);
+      ty = add(swirl_y, ty);
+      tz = add(swirl_z, tz);
+      tx = add(swirl_x, tx);
+      const V r = rsq(add(add(add(mul(tz, tz), mul(ty, ty)), mul(tx, tx)), bias));
+      const V ax = mul(mul(tx, r), s), ay = mul(mul(ty, r), s), az = mul(mul(tz, r), s);
+      mx = sel(reach, add(ax, mx), mx);
+      my = sel(reach, add(ay, my), my);
+      dz = sel(reach, add(az, dz), dz);
+    }
+  }
+
+  // 3. Black holes.
+  if (k.holes > 0) {
+    const V push = s1(k.push);
+    for (int h = 0; h < k.holes; ++h) {
+      const V ty = sub(s1(hole_at(k, h, 1)), y), tz = sub(s1(hole_at(k, h, 2)), z), tx = sub(s1(hole_at(k, h, 0)), x);
+      const V strength = s1(strength_at(k, h));
+      const V dist = _mm_sqrt_ps(add(add(mul(ty, ty), mul(tz, tz)), mul(tx, tx)));
+      const V inv = div(one, dist);
+      const V outside = sub(dist, one);
+      V s = mul(div(unit, dist), push);
+      s = sel(sub(half, s), s, half);
+      const V new_z = sub(dz, mul(mul(inv, tz), s));
+      const V ax = mul(mul(mul(inv, tx), s), strength), ay = mul(mul(mul(ty, inv), s), strength);
+      dz = sel(outside, new_z, dz);
+      mx = sel(outside, sub(mx, ax), mx);
+      my = sel(outside, sub(my, ay), my);
+    }
+  }
+
+  // 4. New state.
+  const V speed = _mm_sqrt_ps(add(mul(mx, mx), add(mul(dz, dz), mul(my, my))));
+  const V smoothing = s1(k.smoothing);
+  const V smoothed = add(mul(sub(speed, speed_smoothed), smoothing), speed_smoothed);
+  const V faded = mul(brightness, s1(k.fade));
+  const V limit = sel(sub(s1(k.cap), faded), faded, s1(k.cap));
+  const V trail = mul(smoothed, smoothing);
+  const V trail_clamped = sel(sub(one, trail), trail, one);
+  V t = mul(sub(trail, s1(k.trail_offset)), half);
+  t = sel(neg(t), s1(k.lo), t);
+  t = sel(sub(t, one), s1(k.hi), t);
+  const V glow_k = s1(k.glow_k);
+  const V intensity = mul(mul(limit, add(mul(mul(mul(t, t), t), glow_k), one)), mul(trail_clamped, trail_clamped));
+  V alpha = sub(mul(sel(sub(intensity, s1(k.alpha_min)), s1(k.hi), bounce), brightness), s1(k.brightness_bias));
+#ifdef GW_PARTICLE_STRESS
+  {
+    const V m = _mm_cmpgt_ps(alpha, s1(0.25f));
+    alpha = _mm_or_ps(_mm_and_ps(m, alpha), _mm_andnot_ps(m, s1(0.25f)));
+  }
+#endif
+  {
+    // Back to particles: two 16-byte stores and three floats each (a
+    // twelfth would overwrite the next particle).
+    V s0 = x, s1 = y, s2 = z, s3 = mx, s4 = my, s5 = dz, s6 = red, s7 = green;
+    V s8 = blue, s9 = alpha, s10 = smoothed, s11 = _mm_setzero_ps();
+    _MM_TRANSPOSE4_PS(s0, s1, s2, s3);
+    _MM_TRANSPOSE4_PS(s4, s5, s6, s7);
+    _MM_TRANSPOSE4_PS(s8, s9, s10, s11);
+    const V w0[4] = {s0, s1, s2, s3}, w1[4] = {s4, s5, s6, s7}, w2[4] = {s8, s9, s10, s11};
+    for (u32 l = 0; l < n; ++l) {
+      float* out = (float*)gw_host(lane[l].out);
+      _mm_storeu_ps(out, w0[l]);
+      _mm_storeu_ps(out + 4, w1[l]);
+      alignas(16) float t[4];
+      _mm_store_ps(t, w2[l]);
+      out[8] = t[0];
+      out[9] = t[1];
+      out[10] = t[2];
+    }
+  }
+
+  // The streak's direction (none for a particle that did not move).
+  const V sx = sub(x, px), sy = sub(y, py);
+  const V r = rsq(add(mul(sy, sy), mul(sx, sx)));
+  V dir_x = mul(sx, r), dir_y = mul(sy, r);
+  const V bad = _mm_or_ps(_mm_cmpneq_ps(sub(dir_x, dir_x), _mm_setzero_ps()),
+                          _mm_cmpneq_ps(sub(dir_y, dir_y), _mm_setzero_ps()));
+  dir_x = _mm_andnot_ps(bad, dir_x);
+  dir_y = _mm_andnot_ps(bad, dir_y);
+  const V length = s1(k.length), width = s1(k.width);
+  const V across_x = mul(length, dir_y), across_y = mul(length, dir_x);
+  const V along_x = mul(width, dir_x), along_y = mul(width, dir_y);
+  const V cr = mul(intensity, red), cg = mul(intensity, green), cb = mul(intensity, blue);
+  if (!k.drawn) return;
+  const V u0 = s1(k.u0);
+
+  // The streak: four vertices (x, y, z, u, r, g, b, v), turned from lanes
+  // into each particle's.
+  {
+    V corner[4][8] = {
+        {sub(sub(px, across_x), along_x), sub(add(across_y, py), along_y), pz, u0, cr, cg, cb, u0},
+        {sub(add(across_x, px), along_x), sub(sub(py, across_y), along_y), pz, one, cr, cg, cb, u0},
+        {add(add(along_x, across_x), x), add(sub(y, across_y), along_y), z, one, cr, cg, cb, one},
+        {add(sub(x, across_x), along_x), add(add(along_y, across_y), y), z, u0, cr, cg, cb, one},
+    };
+    for (u32 v = 0; v < 4; ++v) {
+      _MM_TRANSPOSE4_PS(corner[v][0], corner[v][1], corner[v][2], corner[v][3]);
+      _MM_TRANSPOSE4_PS(corner[v][4], corner[v][5], corner[v][6], corner[v][7]);
+    }
+    for (u32 l = 0; l < n; ++l) {
+      if (u8* host = lane[l].streak_host) {
+        for (u32 v = 0; v < 4; ++v) {
+          _mm_storeu_ps((float*)(host + v * 32), corner[v][l]);
+          _mm_storeu_ps((float*)(host + v * 32 + 16), corner[v][4 + l]);
+        }
+      } else {
+        for (u32 v = 0; v < 4; ++v) {
+          alignas(16) float f[8];
+          _mm_store_ps(f, corner[v][l]);
+          _mm_store_ps(f + 4, corner[v][4 + l]);
+          streak_vertex(lane[l].streak + v * 32, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+        }
+      }
+    }
+  }
+
+  if (kWriteGlowQuad) {
+    const V mid_x = mul(add(px, x), half), mid_y = mul(add(py, y), half);
+    const V gr = mul(cr, glow_k), gg = mul(cg, glow_k), gb = mul(cb, glow_k);
+    const V size = s1(k.size);
+    V corner[4][8] = {
+        {sub(mid_x, size), sub(mid_y, size), zero, zero, gr, gg, gb, zero},
+        {add(mid_x, size), sub(mid_y, size), one, zero, gr, gg, gb, zero},
+        {add(mid_x, size), add(mid_y, size), one, one, gr, gg, gb, zero},
+        {sub(mid_x, size), add(mid_y, size), zero, one, gr, gg, gb, zero},
+    };
+    for (u32 v = 0; v < 4; ++v) {
+      _MM_TRANSPOSE4_PS(corner[v][0], corner[v][1], corner[v][2], corner[v][3]);
+      _MM_TRANSPOSE4_PS(corner[v][4], corner[v][5], corner[v][6], corner[v][7]);
+    }
+    for (u32 l = 0; l < n; ++l) {
+      u8* host = lane[l].glow_host;
+      if (!host) continue;  // past the mirror: left out, as particle_update
+      for (u32 v = 0; v < 4; ++v) {
+        alignas(16) float f[8];
+        _mm_store_ps(f, corner[v][l]);
+        _mm_store_ps(f + 4, corner[v][4 + l]);
+        memcpy(host + v * 28, f, 28);
+      }
+    }
+  }
+}
+
 }  // namespace
+
+// The particle store, kept in host order in the game's own buckets.
+//
+// The particles' 44 bytes were big-endian like all guest data, and the job
+// byte-swapped every value in and out of every particle every frame (with a
+// crowd and explosions, up to 16,000 particles: most of the update's time on
+// the Pentium III, which has no SSE byte shuffle). Only five functions touch
+// a particle's values: the add (0x82063100), the bucket clear (0x82063018),
+// the constructor at the system's creation (0x82062E10: the zero constant
+// into the first six values, the same bytes either way: checked at the
+// first add), the job (0x82063A38) and the update (0x82063448, called only by
+// the job). The first three and the job are native here and keep the values
+// in host order, in place, so no extra memory. The bucket counts (+5632)
+// and index stay big-endian (recompiled code reads them: 0x82062EE0,
+// 0x82062FC8). sub_82063448 keeps the guest's order for anything else that
+// calls it (nothing does now).
+namespace {
+constexpr u32 kStoreBucket = 5636, kStoreCount = 5632, kStoreParticle = 44;
+inline void hs(u32 a, float f) { memcpy(gw_host(a), &f, 4); }
+}  // namespace
+
+// Adds a particle (guest 0x82063100): r3 the particle system, r4 its position,
+// r5 its velocity, r6 its colour (3 floats each, guest order). Into the
+// current bucket (index entry +12) while it has room, else the next one from
+// the index (biased by +0, as the original), else nowhere.
+extern "C" void sub_82063100(PPCContext& ctx, uint8_t* base) {
+  (void)base;
+  const u32 system = ctx.r3.u32;
+  const u32 last = gw_load32(system + 12), index = gw_load32(system + 8);
+  u32 bucket = gw_load32(system + 4) + gw_load32(index + last * 4) * kStoreBucket;
+  if ((int)gw_load32(bucket + kStoreCount) >= 128) {
+    const u32 bias = gw_load32(system + 0), next = last + 1;
+    if ((int)next >= (int)bias) return;
+    const u32 entry = gw_load32(index + next * 4);
+    gw_store32(system + 12, next);
+    const u32 number = entry - bias;
+    gw_store32(index + next * 4, number);
+    bucket = gw_load32(system + 4) + number * kStoreBucket;
+  }
+  static bool checked;
+  if (!checked) {
+    checked = true;
+    if (gw_load32(C + 1740) != 0) gw_log("particles: the constructor's zero is not 0.0 (%08X)\n", gw_load32(C + 1740));
+  }
+  const u32 count = gw_load32(bucket + kStoreCount);
+  const u32 p = bucket + count * kStoreParticle;
+  gw_store32(bucket + kStoreCount, count + 1);
+  const u32 from[3] = {ctx.r4.u32, ctx.r5.u32, ctx.r6.u32};
+  for (u32 v = 0; v < 3; ++v)
+    for (u32 c = 0; c < 3; ++c) hs(p + v * 12 + c * 4, lf(from[v] + c * 4));
+  hs(p + 36, lf(C + 1780));
+  // Its speed: fmuls, fmadds, fmadds, fsqrts.
+  const double vx = hf(p + 12), vy = hf(p + 16), vz = hf(p + 20);
+  const float vy2 = (float)(vy * vy);
+  const float s1 = (float)(vx * vx + vy2);
+  const float s2 = (float)(vz * vz + s1);
+  hs(p + 40, __builtin_sqrtf(s2));
+}
+
+// Clears a bucket (guest 0x82063018): r3 the bucket; the first six values of
+// its 128 particles set to the zero constant, its count to 0.
+extern "C" void sub_82063018(PPCContext& ctx, uint8_t* base) {
+  (void)base;
+  const u32 bucket = ctx.r3.u32;
+  const float zero = lf(C + 1740);
+  for (u32 k = 0; k < 128; ++k)
+    for (u32 v = 0; v < 6; ++v) hs(bucket + k * kStoreParticle + v * 4, zero);
+  gw_store32(bucket + kStoreCount, 0);
+}
+
+// Test hook (tools/native_check): every particle value of buckets buckets
+// (count of them) byte-swapped, between the guest's order and the store's.
+void gw_particle_store_swap(u32 buckets, u32 count) {
+  for (u32 b = 0; b < count; ++b)
+    for (u32 k = 0; k < 128; ++k)
+      for (u32 v = 0; v < 11; ++v) {
+        const u32 a = buckets + b * kStoreBucket + k * kStoreParticle + v * 4;
+        gw_store32(a, __builtin_bswap32(gw_load32(a)));
+      }
+}
 
 extern "C" void sub_820A1800(PPCContext& ctx, uint8_t* base);  // vertex buffer lock
 extern "C" void sub_820A1850(PPCContext& ctx, uint8_t* base);  // vertex buffer unlock
@@ -424,6 +736,9 @@ extern "C" void sub_82063A38(PPCContext& ctx, uint8_t* base) {
   const u32 main_room = main_host ? gw_vertex_mirror_room(streak) / 128 : 0;
   const u32 glow_room = glow_host ? gw_vertex_mirror_room(glow) / 112 : 0;
   u32 live = 0, dest = 0, used = 0;
+  // Particles are updated four at a time (particle_update4).
+  Lane batch[4];
+  u32 batched = 0;
   for (;;) {
     const u32 next = system + 496;
     const int index = (int)lw(next);
@@ -444,7 +759,9 @@ extern "C" void sub_82063A38(PPCContext& ctx, uint8_t* base) {
       // never faults, past the end included.
       _mm_prefetch((const char*)gw_host(p + 4 * kParticle), _MM_HINT_T0);
       _mm_prefetch((const char*)gw_host(p + 4 * kParticle + 32), _MM_HINT_T0);
-      if ((int)lw(p + 36) < 0) continue;
+      u32 bright;
+      memcpy(&bright, gw_host(p + 36), 4);  // (the store's host order)
+      if ((int)bright < 0) continue;
       // Past kMaxLive the particle is dropped as a dead one is (not moved on
       // into the compacted buckets): the vertex buffers follow the busiest
       // frame, and 64 MB ran out at about 25,400 (four players, the stress
@@ -455,8 +772,12 @@ extern "C" void sub_82063A38(PPCContext& ctx, uint8_t* base) {
         dest = bucket;
         used = 0;
       }
-      particle_update(constants, p, dest + used * kParticle, streak, live < main_room ? main_host + live * 128 : nullptr,
-                      live < glow_room ? glow_host + live * 112 : nullptr);
+      batch[batched++] = {p, dest + used * kParticle, streak, live < main_room ? main_host + live * 128 : nullptr,
+                          live < glow_room ? glow_host + live * 112 : nullptr};
+      if (batched == 4) {
+        particle_update4(constants, batch, 4);
+        batched = 0;
+      }
       ++used;
       streak += 128;
       glow += 112;
@@ -467,6 +788,7 @@ extern "C" void sub_82063A38(PPCContext& ctx, uint8_t* base) {
       sw(entry, lw(system + 0) + number);
     }
   }
+  if (batched) particle_update4(constants, batch, batched);
   if (dest) sw(dest + kCount, used);
   sw(kLive + job * 4, live);
 #ifdef GW_PARTICLE_STRESS

@@ -33,6 +33,9 @@
 // mixers are combined so each sound is mixed once (see collect).
 #include "runtime.h"
 
+#ifndef GW_SOUND_PROFILE
+#include <xboxkrnl/xboxkrnl.h>  // MmQueryStatistics (pcm_cache)
+#endif
 #ifdef GW_SOUND_APU
 #include <xboxkrnl/xboxkrnl.h>
 
@@ -79,6 +82,11 @@ inline void prefetch(const void* p, u32 bytes) {
 // Passes a voice's stream was not there in time (a gap in that sound),
 // counted for the audio thread's report (src/audio.cpp).
 u32 gw_sound_late;
+u32 gw_sound_voices;  // voices decoded (a pass each), for the audio report
+// Why streams were late since the last report (no ring, the ring behind, the
+// ring at another place) and the last late wave's name (src/audio.cpp logs them).
+u32 gw_sound_late_why[3];
+const char* gw_sound_late_wave = "";
 u64 gw_sound_wait_cycles;  // the audio thread idle, waiting for the APU's output (not mixing cost)
 unsigned long long g_prof_control, g_prof_audio, g_prof_sound, g_prof_decode, g_prof_effects, g_prof_reverb,
     g_prof_collect, g_prof_mix, g_prof_mark, g_prof_lock, g_prof_out;
@@ -120,6 +128,10 @@ struct Wave {
   u8* volatile head;
   u32 head_blocks;
   u8* data;  // the whole wave, when held in memory (bank_resident)
+  // Decoded (pcm_cache): the samples as the decoder makes them, channels
+  // interleaved, and the pass it was last played in.
+  mutable i16* pcm;
+  mutable u32 pcm_used;
   // The APU's copy (GW_SOUND_APU): each channel as mono Xbox ADPCM at
   // sample-space offset apu_ba[c], apu_samples long, then a silent tail.
   u32 apu_ba[2];
@@ -474,6 +486,64 @@ struct Reader {
     pred[c] = p;
     idx[c] = ix / 16;
   }
+  // Both channels of a stereo wave, count samples from 'at', into o0 and o1:
+  // the same arithmetic as decode, the two channels' chains interleaved (each
+  // sample's step waits on the one before; the Pentium III overlaps two
+  // independent chains).
+  void decode2(u32 count, float* o0, float* o1) {
+    constexpr float kScale = 1.0f / 32768.0f;
+    i32 p0 = pred[0], p1 = pred[1], x0 = idx[0] * 16, x1 = idx[1] * 16;
+    u32 a = at;
+    auto step = [](i32& p, i32& x, int nibble) {
+      p += g_adpcm_diff[x + nibble];
+      p = p > 32767 ? 32767 : p < -32768 ? -32768 : p;
+      x = g_adpcm_next[x + nibble] * 16;
+    };
+    if (wave->xa) {
+      for (; count; --count, ++a) {
+        const u32 k = a & 63;
+        const u8* blk = bytes + (a >> 6) * 72;
+        if (k == 0) {
+          p0 = (i16)(blk[0] | blk[1] << 8);
+          x0 = (blk[2] > 88 ? 88 : blk[2]) * 16;
+          p1 = (i16)(blk[4] | blk[5] << 8);
+          x1 = (blk[6] > 88 ? 88 : blk[6]) * 16;
+        } else {
+          const u32 code = k - 1;
+          const u8* q = blk + 8 + (code >> 3) * 8 + ((code & 7) >> 1);
+          const u32 sh = (code & 1) << 2;
+          step(p0, x0, (q[0] >> sh) & 15);
+          step(p1, x1, (q[4] >> sh) & 15);
+        }
+        *o0++ = (float)p0 * kScale;
+        *o1++ = (float)p1 * kScale;
+      }
+    } else {
+      if (a == 0 && count) {
+        *o0++ = (float)p0 * kScale;
+        *o1++ = (float)p1 * kScale;
+        ++a;
+        --count;
+      }
+      const u8* q = bytes + 8 + ((a - 1) >> 3) * 8;
+      u32 k = (a - 1) & 7;
+      for (; count; --count) {
+        const u32 sh = (k & 1) << 2;
+        step(p0, x0, (q[k >> 1] >> sh) & 15);
+        step(p1, x1, (q[4 + (k >> 1)] >> sh) & 15);
+        *o0++ = (float)p0 * kScale;
+        *o1++ = (float)p1 * kScale;
+        if (++k == 8) {
+          k = 0;
+          q += 8;
+        }
+      }
+    }
+    pred[0] = p0;
+    pred[1] = p1;
+    idx[0] = x0 / 16;
+    idx[1] = x1 / 16;
+  }
   // The decoder at 'pos'; false while a stream is behind.
   bool sync() {
     const u32 pb = per_block(), b = pos / pb, s = pos - b * pb;
@@ -499,6 +569,34 @@ struct Reader {
   // many; *ended at the end of a wave that does not loop.
   u32 render(float* const* out, u32 ch, u32 first, u32 n, bool* ended) {
     u32 got = 0;
+    if (!streamed() && wave->pcm) {
+      // Decoded already (pcm_cache): the same samples, converted. The
+      // decoder starts again from its block if the cache gives this wave up.
+      block = -1;
+      bytes = nullptr;
+      const u32 wch = wave->channels, both = ch < wch ? ch : wch;
+      while (got < n) {
+        u32 run = n - got;
+        if (run > wave->samples - pos) run = wave->samples - pos;
+        if (!run) break;
+        const i16* src = wave->pcm + pos * wch;
+        for (u32 c = 0; c < both; ++c) {
+          float* o = out[c] + first + got;
+          for (u32 i = 0; i < run; ++i) o[i] = (float)src[i * wch + c] * (1.0f / 32768.0f);
+        }
+        for (u32 d = wch; d < ch; ++d) memcpy(out[d] + first + got, out[wch - 1] + first + got, run * 4);
+        got += run;
+        pos += run;
+        if (pos >= wave->samples) {
+          if (!loop) {
+            *ended = true;
+            break;
+          }
+          pos = 0;
+        }
+      }
+      return got;
+    }
     while (got < n) {
       if (!sync()) break;
       u32 run = block_samples((u32)block) - at;
@@ -507,6 +605,21 @@ struct Reader {
       if (!run) break;
       const u32 wch = wave->channels;
       const u32 at0 = at;
+      if (wch == 2 && ch == 2) {
+        decode2(run, out[0] + first + got, out[1] + first + got);
+        at = at0 + run;
+        got += run;
+        pos += run;
+        if (pos >= wave->samples) {
+          if (!loop) {
+            *ended = true;
+            break;
+          }
+          pos = 0;
+          if (streamed()) stream_want(0);
+        }
+        continue;
+      }
       for (u32 c = 0; c < ch; ++c) {
         if (c < wch) {
           at = at0;
@@ -548,6 +661,77 @@ struct Reader {
     return true;
   }
 };
+
+// Decoded sounds: the effects held in memory are decoded once, as they are
+// first played, and kept (up to kPcmBudget, the waves played longest ago
+// given up first): decoding was about two thirds of the voices' time, and a
+// block decodes the same wherever it is started (each block's header sets
+// the decoder's state), so the cached samples are the decoder's own. At most
+// one wave is decoded a pass (a short wave's decoding is about a millisecond).
+constexpr u32 kPcmBudget = 1 << 20;     // bytes
+constexpr u32 kPcmWaveMost = 128 * 1024;  // bytes: longer waves are not cached
+constexpr u32 kPcmKeepFree = 6 << 20;    // memory left to the game
+const Wave* g_pcm_waves[256];
+u32 g_pcm_count, g_pcm_bytes, g_pcm_pass = ~0u;
+
+void pcm_cache(const Wave& w) {
+  if (w.pcm || !w.data || !w.samples || g_pcm_pass == g_pass) return;
+  const u32 bytes = w.samples * w.channels * 2;
+  if (bytes > kPcmWaveMost) return;
+  g_pcm_pass = g_pass;
+  // Room: the waves played longest ago (not this pass) given up.
+  while (g_pcm_bytes + bytes > kPcmBudget || g_pcm_count == 256) {
+    u32 oldest = ~0u, at = 0;
+    for (u32 i = 0; i < g_pcm_count; ++i)
+      if (g_pcm_waves[i]->pcm_used < oldest) oldest = g_pcm_waves[i]->pcm_used, at = i;
+    if (oldest == ~0u || oldest == g_pass) return;
+    const Wave& gone = *g_pcm_waves[at];
+    free(gone.pcm);
+    gone.pcm = nullptr;
+    g_pcm_bytes -= gone.samples * gone.channels * 2;
+    g_pcm_waves[at] = g_pcm_waves[--g_pcm_count];
+  }
+#ifndef GW_SOUND_PROFILE
+  MM_STATISTICS stats;
+  stats.Length = sizeof(stats);
+  MmQueryStatistics(&stats);
+  if (stats.AvailablePages * 4096 < kPcmKeepFree + bytes) return;
+#endif
+  i16* out = (i16*)malloc(bytes);
+  if (!out) return;
+  // The decoder, block by block (as Reader::sync and render do).
+  Reader r;
+  r.wave = &w;
+  static float tmp[2][4096];
+  const u32 wch = w.channels, blocks = r.blocks();
+  u32 pos = 0;
+  for (u32 b = 0; b < blocks && pos < w.samples; ++b) {
+    r.bytes = w.data + b * w.block;
+    u32 count = r.block_samples(b);
+    if (count > w.samples - pos) count = w.samples - pos;
+    if (count > 4096) {  // (no block is this long; refused rather than decoded past tmp)
+      free(out);
+      return;
+    }
+    for (u32 c = 0; c < wch; ++c) {
+      r.pred[c] = (i16)(r.bytes[c * 4] | r.bytes[c * 4 + 1] << 8);
+      r.idx[c] = r.bytes[c * 4 + 2] > 88 ? 88 : r.bytes[c * 4 + 2];
+    }
+    r.at = 0;
+    for (u32 c = 0; c < wch; ++c) r.decode(c, count, tmp[c], 1);
+    for (u32 i = 0; i < count; ++i)
+      for (u32 c = 0; c < wch; ++c) out[(pos + i) * wch + c] = (i16)(tmp[c][i] * 32768.0f);
+    pos += count;
+  }
+  if (pos < w.samples) {
+    free(out);
+    return;
+  }
+  w.pcm = out;
+  w.pcm_used = g_pass;
+  g_pcm_waves[g_pcm_count++] = &w;
+  g_pcm_bytes += bytes;
+}
 
 // (g_lock held.) A ring for a playing streamed wave, filled from where it
 // is. With none free, the one whose wave has been silent longest is taken
@@ -988,10 +1172,21 @@ bool voice_render(Graph& g, Comp& c, Voice& v, float (*out)[kPass], bool needed,
   v.silent_passes = 0;
   if (v.r.streamed() && !v.r.ring) ring_take(v.r, &v.silent_passes);
   float* const dst[2] = {in[0], in[1]};
+  PROF_BEGIN(decode);
+  if (!v.r.streamed()) {
+    pcm_cache(*v.r.wave);
+    v.r.wave->pcm_used = g_pass;
+  }
   const u32 got = v.r.render(dst, ch, 1, n, &ended);
+  PROF_END(decode);
+  ++gw_sound_voices;
   // A stream not there yet: silence, but the wave keeps its place (in time
   // with the music's other layers).
-  if (got < n && !ended) ++gw_sound_late;
+  if (got < n && !ended) {
+    ++gw_sound_late;
+    ++gw_sound_late_why[!v.r.ring ? 0 : v.r.ring_read == v.r.ring_written ? 1 : 2];
+    gw_sound_late_wave = v.r.wave->name;
+  }
   if (got < n && !ended && !v.r.skip(n - got)) ended = true;
   for (u32 i = got; i < n; ++i)
     for (u32 cc = 0; cc < ch; ++cc) in[cc][i + 1] = 0;
@@ -1341,24 +1536,36 @@ void collect(Graph& g, Comp& m, const float (*A)[16], u32 dch) {
     // (A way at zero gain is still taken: what is under it must keep its
     // place, e.g. the songs' silent sync tracks, whose progress the music
     // follows.)
-    float C[3][16] = {};
-    for (u32 x = 0; x < m.in_ch; ++x) {
-      const u32 sc = x < s.channels ? x : 0;
-      for (u32 o = 0; o < m.out_ch; ++o) {
-        const float t = gain_at(m.target, m, i, x, o), cur = gain_at(m.current, m, i, x, o);
-        if (t == 0 && cur == 0) continue;
-        const float gs[3] = {cur, (t + cur) * 0.5f, t};
-        for (u32 p = 0; p < 3; ++p)
-          for (u32 d = 0; d < dch; ++d) C[p][sc * 4 + d] += gs[p] * A[p][o * 4 + d];
+    // The products into the contribution itself when s is mixed here (no
+    // copy), on the stack when the chain goes on through s.
+    const bool through = s.kind == kAudioMixer && !s.inserts;
+    float local[3][16];
+    float (*C)[16];
+    if (through) {
+      C = local;
+    } else if (g_contrib_top < kMaxContribs) {
+      C = g_contribs[g_contrib_top].a;
+    } else {
+      C = nullptr;
+    }
+    if (C) {
+      memset(C, 0, sizeof(local));
+      for (u32 x = 0; x < m.in_ch; ++x) {
+        const u32 sc = x < s.channels ? x : 0;
+        for (u32 o = 0; o < m.out_ch; ++o) {
+          const float t = gain_at(m.target, m, i, x, o), cur = gain_at(m.current, m, i, x, o);
+          if (t == 0 && cur == 0) continue;
+          const float gs[3] = {cur, (t + cur) * 0.5f, t};
+          for (u32 p = 0; p < 3; ++p)
+            for (u32 d = 0; d < dch; ++d) C[p][sc * 4 + d] += gs[p] * A[p][o * 4 + d];
+        }
       }
     }
-    if (s.kind == kAudioMixer && !s.inserts) {
+    if (through) {
       gains_ready(g, s);
       collect(g, s, C, dch);
-    } else if (g_contrib_top < kMaxContribs) {
-      Contrib& t = g_contribs[g_contrib_top++];
-      t.src = &s;
-      memcpy(t.a, C, sizeof(C));
+    } else if (C) {
+      g_contribs[g_contrib_top++].src = &s;
     } else if (!g_contrib_full_logged) {
       g_contrib_full_logged = true;
       gw_log("sound: more than %u mixes in one period; the rest left out\n", kMaxContribs);
@@ -1626,13 +1833,36 @@ void effect_process(Graph& g, Comp& c, float (*buf)[kPass], u32 ch) {
         d[9] = -((t - 1) / (t + 1));
         d[8] = (1 - d[9]) * 0.5f;
       }
-      for (u32 cc = 0; cc < ch && cc < 6; ++cc) {
+      // (Coefficients and state in registers, two channels a loop: the
+      // same operations in the same order as one channel at a time.)
+      const float a = d[8], b = d[9], gain = d[2];
+      u32 cc = 0;
+      for (; cc + 1 < ch && cc + 1 < 6; cc += 2) {
+        float* X0 = buf[cc];
+        float* X1 = buf[cc + 1];
+        float p0 = d[10 + cc], q0 = d[16 + cc], p1 = d[11 + cc], q1 = d[17 + cc];
+        for (u32 n = 0; n < kPass; ++n) {
+          const float x0 = X0[n], x1 = X1[n];
+          q0 = (x0 + p0) * a + b * q0;
+          q1 = (x1 + p1) * a + b * q1;
+          p0 = x0;
+          p1 = x1;
+          X0[n] = gain * q0;
+          X1[n] = gain * q1;
+        }
+        d[10 + cc] = p0;
+        d[16 + cc] = q0;
+        d[11 + cc] = p1;
+        d[17 + cc] = q1;
+      }
+      for (; cc < ch && cc < 6; ++cc) {
+        float* X = buf[cc];
         float x1 = d[10 + cc], y1 = d[16 + cc];
         for (u32 n = 0; n < kPass; ++n) {
-          const float x = buf[cc][n];
-          y1 = (x + x1) * d[8] + d[9] * y1;
+          const float x = X[n];
+          y1 = (x + x1) * a + b * y1;
           x1 = x;
-          buf[cc][n] = d[2] * y1;
+          X[n] = gain * y1;
         }
         d[10 + cc] = x1;
         d[16 + cc] = y1;
@@ -1647,16 +1877,35 @@ void effect_process(Graph& g, Comp& c, float (*buf)[kPass], u32 ch) {
         d[4] = -((t - 1) / (t + 1));
         d[3] = (d[4] + 1) * 0.5f;
       }
-      for (u32 cc = 0; cc < ch && cc < 2; ++cc) {
-        float x1 = d[8 + cc], y1 = d[12 + cc];
+      const float a = d[4], b = d[3], gain = d[1];
+      if (ch >= 2) {
+        float* X0 = buf[0];
+        float* X1 = buf[1];
+        float p0 = d[8], q0 = d[12], p1 = d[9], q1 = d[13];
         for (u32 n = 0; n < kPass; ++n) {
-          const float x = buf[cc][n];
-          y1 = d[4] * y1 + d[3] * (x1 - x);
-          x1 = x;
-          buf[cc][n] = y1 * d[1];
+          const float x0 = X0[n], x1 = X1[n];
+          q0 = a * q0 + b * (p0 - x0);
+          q1 = a * q1 + b * (p1 - x1);
+          p0 = x0;
+          p1 = x1;
+          X0[n] = q0 * gain;
+          X1[n] = q1 * gain;
         }
-        d[8 + cc] = x1;
-        d[12 + cc] = y1;
+        d[8] = p0;
+        d[12] = q0;
+        d[9] = p1;
+        d[13] = q1;
+      } else if (ch == 1) {
+        float* X = buf[0];
+        float x1 = d[8], y1 = d[12];
+        for (u32 n = 0; n < kPass; ++n) {
+          const float x = X[n];
+          y1 = a * y1 + b * (x1 - x);
+          x1 = x;
+          X[n] = y1 * gain;
+        }
+        d[8] = x1;
+        d[12] = y1;
       }
       break;
     }
@@ -1679,19 +1928,35 @@ void effect_process(Graph& g, Comp& c, float (*buf)[kPass], u32 ch) {
         d[10] = (float)((1.0 - cs) * inv) * d[3];
         d[9] = d[10] * 0.5f;
       }
-      for (u32 cc = 0; cc < ch && cc < 2; ++cc) {
-        float* st = d + 12 + cc * 4;  // x1 x2 y1 y2
+      const float b0 = d[9], b1 = d[10], na1 = -d[7], na2 = -d[8], gain = d[3];
+      auto step = [&](float x, float* st) {  // st: x1 x2 y1 y2 (registers in the loops below)
+        const float fir = b0 * x + b1 * st[0] + b0 * st[1];
+        float y = st[2] * na1 + fir;
+        y = st[3] * na2 + y;
+        st[1] = st[0];
+        st[0] = x;
+        st[3] = st[2];
+        st[2] = y;
+        return y * gain;
+      };
+      if (ch >= 2) {
+        float* X0 = buf[0];
+        float* X1 = buf[1];
+        float s0[4] = {d[12], d[13], d[14], d[15]}, s1[4] = {d[16], d[17], d[18], d[19]};
         for (u32 n = 0; n < kPass; ++n) {
-          const float x = buf[cc][n];
-          const float fir = d[9] * x + d[10] * st[0] + d[9] * st[1];
-          float y = st[2] * -d[7] + fir;
-          y = st[3] * -d[8] + y;
-          st[1] = st[0];
-          st[0] = x;
-          st[3] = st[2];
-          st[2] = y;
-          buf[cc][n] = y * d[3];
+          const float y0 = step(X0[n], s0), y1 = step(X1[n], s1);
+          X0[n] = y0;
+          X1[n] = y1;
         }
+        for (u32 k = 0; k < 4; ++k) {
+          d[12 + k] = s0[k];
+          d[16 + k] = s1[k];
+        }
+      } else if (ch == 1) {
+        float* X = buf[0];
+        float s0[4] = {d[12], d[13], d[14], d[15]};
+        for (u32 n = 0; n < kPass; ++n) X[n] = step(X[n], s0);
+        for (u32 k = 0; k < 4; ++k) d[12 + k] = s0[k];
       }
       break;
     }
@@ -1708,22 +1973,38 @@ void effect_process(Graph& g, Comp& c, float (*buf)[kPass], u32 ch) {
         d[9] = (Aa + 1) * inv;
         d[10] = (1 - Aa) * inv;
       }
-      for (u32 cc = 0; cc < ch && cc < 2; ++cc) {
-        float* st = d + 12 + cc * 4;  // x1 x2 y1 y2
+      const float c7 = d[7], c9 = d[9], c10 = d[10], n7 = -d[7], n8 = -d[8], hi = d[3], lo = -d[3];
+      auto step = [&](float x, float* st) {  // st: x1 x2 y1 y2 (registers in the loops below)
+        float t = c7 * st[0];
+        t = c9 * x + t;
+        t = c10 * st[1] + t;
+        t = n7 * st[2] + t;
+        float y = n8 * st[3] + t;
+        y = clampf(y, lo, hi);
+        st[1] = st[0];
+        st[0] = x;
+        st[3] = st[2];
+        st[2] = y;
+        return y;
+      };
+      if (ch >= 2) {
+        float* X0 = buf[0];
+        float* X1 = buf[1];
+        float s0[4] = {d[12], d[13], d[14], d[15]}, s1[4] = {d[16], d[17], d[18], d[19]};
         for (u32 n = 0; n < kPass; ++n) {
-          const float x = buf[cc][n];
-          float t = d[7] * st[0];
-          t = d[9] * x + t;
-          t = d[10] * st[1] + t;
-          t = -d[7] * st[2] + t;
-          float y = -d[8] * st[3] + t;
-          y = clampf(y, -d[3], d[3]);
-          st[1] = st[0];
-          st[0] = x;
-          st[3] = st[2];
-          st[2] = y;
-          buf[cc][n] = y;
+          const float y0 = step(X0[n], s0), y1 = step(X1[n], s1);
+          X0[n] = y0;
+          X1[n] = y1;
         }
+        for (u32 k = 0; k < 4; ++k) {
+          d[12 + k] = s0[k];
+          d[16 + k] = s1[k];
+        }
+      } else if (ch == 1) {
+        float* X = buf[0];
+        float s0[4] = {d[12], d[13], d[14], d[15]};
+        for (u32 n = 0; n < kPass; ++n) X[n] = step(X[n], s0);
+        for (u32 k = 0; k < 4; ++k) d[12 + k] = s0[k];
       }
       break;
     }
@@ -1741,21 +2022,37 @@ void effect_process(Graph& g, Comp& c, float (*buf)[kPass], u32 ch) {
         d[7] = (float)(-2 * (am + ap * cs) * inv);
         d[8] = (float)((ap + am * cs - beta) * inv);
       }
-      for (u32 cc = 0; cc < ch && cc < 2; ++cc) {
-        float* st = d + 12 + cc * 4;
+      const float c9 = d[9], c10 = d[10], c11 = d[11], n7 = -d[7], n8 = -d[8];
+      auto step = [&](float x, float* st) {  // st: x1 x2 y1 y2 (registers in the loops below)
+        float t = c10 * st[0];
+        t = c9 * x + t;
+        t = c11 * st[1] + t;
+        t = n7 * st[2] + t;
+        const float y = n8 * st[3] + t;
+        st[1] = st[0];
+        st[0] = x;
+        st[3] = st[2];
+        st[2] = y;
+        return y;
+      };
+      if (ch >= 2) {
+        float* X0 = buf[0];
+        float* X1 = buf[1];
+        float s0[4] = {d[12], d[13], d[14], d[15]}, s1[4] = {d[16], d[17], d[18], d[19]};
         for (u32 n = 0; n < kPass; ++n) {
-          const float x = buf[cc][n];
-          float t = d[10] * st[0];
-          t = d[9] * x + t;
-          t = d[11] * st[1] + t;
-          t = -d[7] * st[2] + t;
-          const float y = -d[8] * st[3] + t;
-          st[1] = st[0];
-          st[0] = x;
-          st[3] = st[2];
-          st[2] = y;
-          buf[cc][n] = y;
+          const float y0 = step(X0[n], s0), y1 = step(X1[n], s1);
+          X0[n] = y0;
+          X1[n] = y1;
         }
+        for (u32 k = 0; k < 4; ++k) {
+          d[12 + k] = s0[k];
+          d[16 + k] = s1[k];
+        }
+      } else if (ch == 1) {
+        float* X = buf[0];
+        float s0[4] = {d[12], d[13], d[14], d[15]};
+        for (u32 n = 0; n < kPass; ++n) X[n] = step(X[n], s0);
+        for (u32 k = 0; k < 4; ++k) d[12 + k] = s0[k];
       }
       break;
     }
@@ -3251,7 +3548,11 @@ void gw_sound_start() {
 #endif
   for (Ring& ring : g_rings) ring.data = (u8*)arena(kStreamBlocks * kMaxBlock);
   g_reader_wake = CreateEventA(nullptr, FALSE, FALSE, nullptr);
-  CreateThread(nullptr, 64 * 1024, reader_thread, nullptr, 0, nullptr);
+  // Above the game's threads: it needs little processor time, but a busy
+  // main thread (a crowd on screen, the frame over budget) left it waiting to
+  // run, and the music's streams fell behind (heard as gaps).
+  if (HANDLE t = CreateThread(nullptr, 64 * 1024, reader_thread, nullptr, 0, nullptr))
+    SetThreadPriority(t, THREAD_PRIORITY_HIGHEST);
   // The graphs, in the game's creation order.
   static const char* const kFiles[kGraphs][2] = {
       {"System.dat", "System"}, {"GW3_FX.dat", "FX"},       {"UIMusic.dat", "UIMusic"},

@@ -10,7 +10,7 @@
 
 namespace {
 
-constexpr u64 kXuid = 0xB13EBABEBABEBABEull;
+constexpr u64 kXuid = kGwLocalXuid;
 constexpr u32 kTitleId = 0x584108FF;
 
 // XAM_OVERLAPPED: result +0, length +4, context +8, event +0xC,
@@ -114,6 +114,57 @@ bool load_file(const char* path) {
   return true;
 }
 
+// The hard disk's cache holds written data and directory changes for a
+// while; a save made just before the console is switched off or reset
+// (a high score, then straight to the dashboard) was lost with it. Each save
+// is flushed (the file, then the whole volume for the rename), as is the
+// volume before a reset (gw_flush_saves, src/kernel_misc.cpp).
+void flush_handle(HANDLE f, const char* what) {
+  IO_STATUS_BLOCK io;
+  const NTSTATUS status = NtFlushBuffersFile(f, &io);
+  if (!NT_SUCCESS(status)) gw_log("save: flushing %s failed (%08X)\n", what, (u32)status);
+}
+
+void flush_volume() {
+  ANSI_STRING name;
+  RtlInitAnsiString(&name, "\\Device\\Harddisk0\\Partition1");
+  OBJECT_ATTRIBUTES attributes;
+  InitializeObjectAttributes(&attributes, &name, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+  IO_STATUS_BLOCK io;
+  HANDLE volume;
+  const NTSTATUS status = NtOpenFile(&volume, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, &attributes, &io,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_SYNCHRONOUS_IO_ALERT);
+  if (!NT_SUCCESS(status)) {
+    gw_log("save: the hard disk could not be opened to flush it (%08X)\n", (u32)status);
+    return;
+  }
+  flush_handle(volume, "the hard disk");
+  NtClose(volume);
+}
+
+// A save file written whole to 'temp', flushed, moved over 'path', and the
+// hard disk flushed for the move; a reader falls back to 'temp' when 'path'
+// is missing or damaged.
+bool write_save_file(const char* path, const char* temp, const void* data, u32 size) {
+  HANDLE f = CreateFileA(temp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+  if (f == INVALID_HANDLE_VALUE) {
+    gw_log("save: %s could not be written (error %u)\n", temp, (u32)GetLastError());
+    return false;
+  }
+  DWORD done = 0;
+  const BOOL ok = WriteFile(f, data, size, &done, nullptr) && done == size;
+  if (ok) flush_handle(f, temp);
+  CloseHandle(f);
+  if (!ok) {
+    gw_log("save: writing %s failed\n", temp);
+    return false;
+  }
+  DeleteFileA(path);
+  if (!MoveFileA(temp, path)) gw_log("save: %s not moved into place\n", temp);
+  flush_volume();
+  return true;
+}
+
 void save_settings() {
   if (!g_saves_ready) return;
   static u8 buf[0x8000];
@@ -132,21 +183,8 @@ void save_settings() {
   const u32 hash = fnv1a(buf, at);
   memcpy(buf + at, &hash, 4);
   at += 4;
-  HANDLE f = CreateFileA(kSaveNew, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
-  if (f == INVALID_HANDLE_VALUE) {
-    gw_log("save: %s could not be written (error %u)\n", kSaveNew, (u32)GetLastError());
-    return;
-  }
-  DWORD done = 0;
-  const BOOL ok = WriteFile(f, buf, at, &done, nullptr) && done == at;
-  CloseHandle(f);
-  if (!ok) {
-    gw_log("save: writing %s failed\n", kSaveNew);
-    return;
-  }
-  DeleteFileA(kSaveFile);
-  if (!MoveFileA(kSaveNew, kSaveFile)) gw_log("save: %s not moved into place\n", kSaveNew);
-  gw_log("save: %u settings written to %s (%u bytes)\n", count, kSaveFile, at);
+  if (!write_save_file(kSaveFile, kSaveNew, buf, at)) return;
+  gw_log("save: %u settings written to %s (%u bytes) at frame %u\n", count, kSaveFile, at, gw_stats.swaps);
 }
 
 // (Once, before the first setting is read or written.) The hard disk's
@@ -201,6 +239,20 @@ Notification g_notifications[16];
 volatile LONG g_notification_count;
 
 }  // namespace
+
+// Before a reset: whatever the hard disk still holds written out (above).
+void gw_flush_saves() {
+  if (g_saves_ready) flush_volume();
+}
+
+bool gw_saves_ready() {
+  saves_init();
+  return g_saves_ready;
+}
+
+bool gw_write_save_file(const char* path, const char* temp, const void* data, u32 size) {
+  return gw_saves_ready() && write_save_file(path, temp, data, size);
+}
 
 // --- users -------------------------------------------------------------------------
 
@@ -286,7 +338,10 @@ GW_EXPORT(XamUserWriteProfileSettings) {
     }
     StoredSetting* stored = find_setting(id);
     if (!stored) stored = find_setting(0);
-    if (!stored) continue;
+    if (!stored) {
+      gw_log("profile setting %08X: no room to keep it (%u kept)\n", id, (u32)(sizeof(g_settings) / sizeof(g_settings[0])));
+      continue;
+    }
     free(stored->data);
     stored->id = id;
     stored->size = size;
@@ -381,6 +436,27 @@ GW_EXPORT(XMsgInProcessCall) {
     Sleep(10);
     GW_RETURN(X_ERROR_SUCCESS);
   }
+  if (app == 0xFC) {
+    // XLiveBase, answered as ReXGlue 0.10.0 does (xlivebase_app.cpp): with the
+    // player reported signed in to Live (src/live_scores.cpp) the game asks
+    // for its friends, and a bare success there (no list) ended in the game's
+    // own exception. Failing it leaves the friends board empty.
+    const u32 length = GW_ARG(6);
+    switch (message) {
+      case 0x00058004:  // logon id: one 32-bit value
+      case 0x00058006:  // NAT type: open
+        if (buffer && (length == 0 || length >= 4)) gw_store32(buffer, 1);
+        GW_RETURN(X_ERROR_SUCCESS);
+      case 0x00058007:  // XOnlineGetServiceInfo
+        GW_RETURN(0x80151802);  // connection invalid
+      case 0x00058037:  // XPresenceInitialize
+      case 0x00058046:
+        GW_RETURN(X_ERROR_SUCCESS);
+      default:  // friends (0x58020), game invites (0x58023), the rest
+        gw_log("XMsgInProcessCall(app FC, message %08X) failed, as offline\n", message);
+        GW_RETURN(0x80004005);  // E_FAIL
+    }
+  }
   static u32 logged[16];
   bool seen = false;
   for (u32 m : logged) seen |= m == message;
@@ -467,6 +543,7 @@ GW_EXPORT(XamInputGetState) {
   static u32 packet = 0;
   memset(gw_host(state), 0, 16);
   if (!gw_input_read(user, state + 4) && user != 0) GW_RETURN(X_ERROR_DEVICE_NOT_CONNECTED);
+  gw_scores_input(user, state + 4);
   gw_store32(state, ++packet);
   GW_RETURN(X_ERROR_SUCCESS);
 }

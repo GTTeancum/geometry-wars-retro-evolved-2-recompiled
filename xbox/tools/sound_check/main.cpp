@@ -83,6 +83,7 @@ void render(Wav& w, double seconds, F each) {
     if (w.second_frames >= 48000) {
       printf("  %5.1f s  level %.4f  peak %.3f  cost %.0f us/pass\n", w.frames / 48000.0,
              sqrt(w.sum / (w.second_frames * 2)), w.peak, w.cost / (w.second_frames / 256) * 1e6);
+      printf("        Mcycles: decode %.1f\n", g_prof_decode / 1e6);
       printf("        Mcycles: control %.1f audio %.1f (sounds %.1f, effects %.1f)\n", g_prof_control / 1e6, g_prof_audio / 1e6,
              g_prof_sound / 1e6, g_prof_effects / 1e6);
       g_prof_control = g_prof_audio = g_prof_sound = g_prof_decode = g_prof_effects = 0;

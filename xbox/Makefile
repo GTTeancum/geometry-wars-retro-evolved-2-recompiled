@@ -10,7 +10,11 @@ REXGLUE_INCLUDE = ../tools/rexglue/win-amd64/include
 
 RUNTIME_SRCS = $(wildcard src/*.cpp)
 GEN_SRCS = $(wildcard build/gen/*_recomp.*.cpp) $(wildcard build/gen/*_init.cpp)
-SRCS = $(RUNTIME_SRCS) $(GEN_SRCS)
+SRCS = $(RUNTIME_SRCS) $(GEN_SRCS) third_party/pbkit/pbkit.c
+
+# pbkit's core with the frame and depth pitches set to the tile pitches (480p:
+# third_party/pbkit/pbkit.c); its own headers stay nxdk's.
+third_party/pbkit/pbkit.obj: NXDK_CFLAGS += -I$(NXDK_DIR)/lib/pbkit
 
 PROJECT_OBJS = $(addsuffix .obj,$(basename $(SRCS)))
 GEN_OBJS = $(addsuffix .obj,$(basename $(GEN_SRCS)))
@@ -49,6 +53,62 @@ src/build_stamp.obj: NXDK_CXXFLAGS += -DGW_BUILD_STAMP=$(BUILD_STAMP)u
 # Our own glow over each frame (see src/nv2a.cpp); make GLOW=n leaves it out.
 ifneq ($(GLOW),n)
 src/nv2a.obj: NXDK_CXXFLAGS += -DGW_GLOW
+endif
+
+# A picture every DRAW_EVERY frames always, not fewer under load
+# (src/render_native.cpp): make ADAPTIVE=n
+ifeq ($(ADAPTIVE),n)
+src/render_native.obj: NXDK_CXXFLAGS += -DGW_DRAW_FIXED
+endif
+
+# Lines every 8 pixels in from each edge, to see where the frame lands on a
+# TV: make TEST_PATTERN=y
+ifeq ($(TEST_PATTERN),y)
+src/nv2a.obj: NXDK_CXXFLAGS += -DGW_TEST_PATTERN
+endif
+
+# Test cheats (src/test_cheats.cpp): invincible, every mode shown, the save
+# unchanged: make TEST_CHEATS=y
+ifeq ($(TEST_CHEATS),y)
+src/test_cheats.obj: NXDK_CXXFLAGS += -DGW_TEST_CHEATS
+endif
+
+# The world update (0x820366A0) and score display (0x8207CA48) as the
+# generated code with registers in locals (src/enemy_native.cpp): no faster
+# on the PC and part of them untested, so off: make BIG_NATIVE=y
+ifeq ($(BIG_NATIVE),y)
+src/enemy_native.obj: NXDK_CXXFLAGS += -DGW_BIG_NATIVE
+endif
+
+# Draws left out by shader, chosen from the PC while the game runs
+# (src/nv2a.cpp, tools/xbdm_poke.py): make DRAW_SKIP=y
+ifeq ($(DRAW_SKIP),y)
+src/nv2a.obj: NXDK_CXXFLAGS += -DGW_DRAW_SKIP
+endif
+
+# Outline segments far outside the arena logged with who drew them
+# (src/shapes_native.cpp): make OUTLINE_CHECK=y
+ifeq ($(OUTLINE_CHECK),y)
+src/shapes_native.obj: NXDK_CXXFLAGS += -DGW_OUTLINE_CHECK
+endif
+
+# The game at 30 ticks a second, a picture each (src/render_native.cpp,
+# src/jobs_native.cpp); make TICK30=n for 60 ticks with a picture every
+# second one. Every source sees the tick rate (runtime.h): rebuild them all
+# when changing it.
+ifneq ($(TICK30),n)
+NXDK_CXXFLAGS += -DGW_TICK30
+endif
+
+# Vertices with positions out of all reason counted per kind of draw
+# (src/nv2a.cpp, in the census): make GEOMETRY_CHECK=y
+ifeq ($(GEOMETRY_CHECK),y)
+src/nv2a.obj: NXDK_CXXFLAGS += -DGW_GEOMETRY_CHECK
+endif
+
+# Which game code draws text, and what (src/text_trace.cpp): make TEXT_TRACE=y
+ifeq ($(TEXT_TRACE),y)
+src/text_trace.obj: NXDK_CXXFLAGS += -DGW_TEXT_TRACE
 endif
 
 # The frame counter over the top of the screen (it covers the game's score):

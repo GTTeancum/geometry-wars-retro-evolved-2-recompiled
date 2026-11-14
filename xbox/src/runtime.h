@@ -48,6 +48,8 @@ constexpr u32 kGuestPhysicalBase = 0xC0000000;
 constexpr u32 kGuestPhysicalSize = 0x1D000000;
 
 constexpr u32 kEntryPoint = 0x82095FD8;
+// The local player's XUID (src/xam.cpp, src/live_scores.cpp).
+constexpr u64 kGwLocalXuid = 0xB13EBABEBABEBABEull;
 constexpr u32 kDefaultStackSize = 0x40000;
 
 // --- guest memory -----------------------------------------------------------
@@ -109,6 +111,10 @@ extern GwGridLines gw_grid_lines;
 u8* gw_vertex_mirror_add(u32 guest, u32 size);
 u8* gw_vertex_mirror(u32 guest, u32 bytes);
 u32 gw_vertex_mirror_room(u32 guest);  // bytes from guest to its mirror's end (0: in none)
+// Deferred outlines (src/shapes_native.cpp): vertices [first, first + count)
+// of the outline chunk at guest built into out (host order, 32 bytes each);
+// returns how many were deferred from first on (0: not a deferred chunk).
+u32 gw_outline_vertices(u32 guest, u32 first, u32 count, u8* out);
 void gw_physical_free(u32 guest);
 u32 gw_system_alloc(u32 size, u32 align = 16);
 u32 gw_stack_alloc(u32 size);                // returns the low end
@@ -130,6 +136,12 @@ void gw_log(const char* fmt, ...);
 // game's own exits. Sound is stopped first; the console then quick-reboots
 // into the dashboard (src/kernel_misc.cpp).
 [[noreturn]] void gw_return_to_dash(const char* why);
+// Saves still in the hard disk's cache written out (src/xam.cpp).
+void gw_flush_saves();
+// The save folder on the hard disk made and read (src/xam.cpp), and a file
+// written there safely: whole to temp, flushed, then moved over path.
+bool gw_saves_ready();
+bool gw_write_save_file(const char* path, const char* temp, const void* data, u32 size);
 void gw_audio_stop();
 void gw_status_init();
 void gw_status_frame();  // called on each guest swap
@@ -187,6 +199,9 @@ void gw_fault_report();  // commit-on-touch faults by allocation (src/guest_memo
 // Controllers (src/input.cpp).
 void gw_input_init();
 bool gw_input_read(u32 user, u32 gamepad);
+// While initials are entered for a high score: drives the entry from the
+// controller and leaves the game a neutral one (src/live_scores.cpp).
+void gw_scores_input(u32 user, u32 gamepad);
 
 // --- threads ----------------------------------------------------------------
 
@@ -241,6 +256,15 @@ u32 gw_particle_set_buffer(u32 set, u32 job, bool glow);
 // src/render_native.cpp: the number of the next frame drawn (counts drawn
 // frames).
 u32 gw_drawn_index();
+// The game's ticks a second (src/render_native.cpp): 60, or 30 with make
+// TICK30=y (each tick twice as long; the per-tick visual systems stepped
+// twice, src/jobs_native.cpp).
+extern bool gw_jobs_inner_step;  // the jobs' first of two steps (no vertices; src/render_native.cpp)
+#ifdef GW_TICK30
+constexpr u32 kGwTicks = 30;
+#else
+constexpr u32 kGwTicks = 60;
+#endif
 // src/nv2a.cpp: sets the display's scan-out line length (CRTC offset) to the
 // frame's pitch, logging the values it found when they were wrong.
 void gw_crtc_pitch();

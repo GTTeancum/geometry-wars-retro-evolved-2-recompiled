@@ -25,6 +25,9 @@ Steps:
   shot NAME                 screenshot to xbox/test-artifacts/pad/NAME.png
   off                       disable the remote pad
   player N                  the steps after drive player N's pad (1-4; default 1)
+
+--file FILE adds steps from a file, one a line (a long run). Each step's line
+starts with the wall-clock time, so the frame counts give the game's speed.
 """
 import argparse
 import pathlib
@@ -261,13 +264,16 @@ def main():
     p.add_argument('--port', type=int, default=9257)
     p.add_argument('--gdb-port', type=int, default=9258)
     p.add_argument('--xbdm', help='a development Xbox address (its debug monitor) instead of XEMU')
-    p.add_argument('steps', nargs='+')
+    p.add_argument('--file', help='more steps, one a line, after those given')
+    p.add_argument('steps', nargs='*')
     args = p.parse_args()
+    if args.file:
+        args.steps += [line.strip() for line in open(args.file) if line.strip()]
     session = Session(args)
     try:
         for step in args.steps:
             result = session.step(step)
-            print(f'{step}: frame {session.frame()}' + (f' -> {result}' if result else ''), flush=True)
+            print(f'{time.time():.2f} {step}: frame {session.frame()}' + (f' -> {result}' if result else ''), flush=True)
     finally:
         session.gdb.close()
 

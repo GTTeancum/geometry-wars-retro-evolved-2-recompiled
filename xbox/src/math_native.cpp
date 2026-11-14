@@ -66,6 +66,37 @@ extern "C" void sub_821308B8(PPCContext& ctx, uint8_t* base) {
   ctx.f1.f64 = (double)exponential((float)x);
 }
 
+// cos(f1) -> f1 (guest 0x8212EA80): the original reduces |x| by (k - 1/2) pi
+// with k the nearest whole number to (|x| + pi/2) / pi, then the sine's
+// polynomial, negated for odd k. The same here in single precision (the
+// constant split so (k - 1/2) times its first part is exact below 2048);
+// larger arguments, infinities and NaN go to the original. Every enemy's
+// rotation matrix asks for one each frame (guest 0x82041600).
+extern "C" void __imp__sub_8212EA80(PPCContext& ctx, uint8_t* base);
+float gw_cosine(float x) {
+  const float ax = __builtin_fabsf(x);
+  const float k = (float)(int)((ax + 1.57079633f) * 0.318309886f + 0.5f);
+  const float h = k - 0.5f;
+  float r = ax - h * 3.140625f;
+  r -= h * 9.67653589793e-4f;
+  const float r2 = r * r;
+  float p = -2.50521084e-8f;
+  p = p * r2 + 2.75573192e-6f;
+  p = p * r2 - 1.98412698e-4f;
+  p = p * r2 + 8.33333333e-3f;
+  p = p * r2 - 1.66666667e-1f;
+  const float s = r + r * r2 * p;
+  return ((int)k & 1) ? -s : s;
+}
+extern "C" void sub_8212EA80(PPCContext& ctx, uint8_t* base) {
+  const double x = ctx.f1.f64;
+  if (!(__builtin_fabs(x) < 2048.0)) {
+    __imp__sub_8212EA80(ctx, base);
+    return;
+  }
+  ctx.f1.f64 = (double)gw_cosine((float)x);
+}
+
 // sin(f1) -> f1 (guest 0x8212E9B0).
 extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base) {
   const double x = ctx.f1.f64;
@@ -109,6 +140,41 @@ extern "C" void sub_82030338(PPCContext& ctx, uint8_t* base) {
   float out[4];
   vector_times_matrix(out, ctx.r4.u32, ctx.r5.u32);
   for (u32 c = 0; c < 4; ++c) store_float(ctx.r3.u32 + c * 4, out[c]);
+}
+
+// Rotation about an axis (guest 0x82041600): r3 the 4x4 out, r4 the axis
+// (x, y, z), f1 the angle. Identity first, then with c = cos, s = sin and
+// t = 1 - c the nine entries, each multiply rounded to single and each
+// multiply-add done in double then rounded (as the recompiled fmadds), the
+// axis read afresh for each entry in the original's order (so even an axis
+// inside the matrix gives the same result). Every enemy's drawing builds
+// one each frame. Returns r3.
+extern "C" void sub_8212E9B0(PPCContext& ctx, uint8_t* base);
+extern "C" void sub_82041600(PPCContext& ctx, uint8_t* base) {
+  const u32 out = ctx.r3.u32, axis = ctx.r4.u32;
+  const double angle = ctx.f1.f64;
+  const float one = load_float(0x82000000 + 1732), zero = load_float(0x82000000 + 1740);
+  for (u32 i = 0; i < 16; ++i) store_float(out + i * 4, (i % 5 == 0) ? one : zero);
+  ctx.f1.f64 = angle;
+  sub_8212EA80(ctx, base);
+  const double c = (double)(float)ctx.f1.f64;
+  ctx.f1.f64 = angle;
+  sub_8212E9B0(ctx, base);
+  const double s = (double)(float)ctx.f1.f64;
+  const double t = (double)(float)((double)one - c);
+  auto L = [&](u32 k) { return (double)load_float(axis + k * 4); };
+  auto mul = [](double a, double b) { return (double)(float)(a * b); };
+  auto madd = [](double a, double b, double c2) { return (double)(float)(a * b + c2); };
+  store_float(out + 0, (float)madd(mul(L(0), L(0)), t, c));
+  store_float(out + 4, (float)madd(mul(t, L(0)), L(1), mul(L(2), s)));
+  store_float(out + 8, (float)madd(mul(L(2), t), L(0), -mul(s, L(1))));
+  store_float(out + 16, (float)madd(mul(t, L(0)), L(1), -mul(L(2), s)));
+  store_float(out + 20, (float)madd(mul(L(1), L(1)), t, c));
+  store_float(out + 24, (float)madd(mul(L(2), t), L(1), mul(L(0), s)));
+  store_float(out + 32, (float)madd(mul(L(2), t), L(0), mul(s, L(1))));
+  store_float(out + 36, (float)madd(mul(L(2), t), L(1), -mul(L(0), s)));
+  store_float(out + 40, (float)madd(mul(L(2), L(2)), t, c));
+  ctx.r3.u64 = out;
 }
 
 // Matrix times matrix (guest 0x82041CA0): r3 out, r4 a, r5 b, out = a b, row

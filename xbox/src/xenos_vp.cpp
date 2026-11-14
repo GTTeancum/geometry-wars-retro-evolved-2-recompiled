@@ -30,6 +30,7 @@ using xenos::Source;
 
 enum : u8 { kNone = 0, kTemp = 1, kInput = 2, kConst = 3 };
 constexpr u8 kColourScaleConstant = 64;  // past the shader constants (4..63); see draw_on_gpu
+constexpr u8 kScreenLimitConstant = 65;  // (-2000, 2000, 0, 0): see the epilogue (set in begin_frame)
 enum Mac : u8 { MOV = 1, MUL = 2, ADD = 3, MAD = 4, DP3 = 5, DP4 = 7, MIN = 9, MAX = 10, SLT = 11, SGE = 12 };
 enum Ilu : u8 { IMOV = 1, RCP = 2, RCC = 3, RSQ = 4, EXP = 5, LOG = 6 };
 
@@ -495,7 +496,15 @@ const XvpProgram* xvp_get(const XvsProgram* xvs, int uv_i, int color_i, bool div
   if (divide) {
     b.ilu(RCC, temp(kPos, "wwww"), b.to_temp(kS0, 1));
     b.mac(MUL, temp(kPos), temp(kS0, "xxxx"), Op(), b.to_temp(kS1, 3));
-    b.mac(MAD, temp(kS1), cnst(3, "xyxy"), cnst(3, "zwzw"), pos_xy);
+    // The screen position kept within +-2000 pixels: a point just in front
+    // of the camera (w small) lands far outside the screen, and past the
+    // NV2A's coordinate range its triangles wrapped into huge wedges (the
+    // jagged white mass over the screen when an enemy's broken pieces flew at
+    // the camera: the 360's GPU clips them). Everything on or near the
+    // screen is unchanged; a corner far off it is pulled in.
+    b.mac(MAD, temp(kS1), cnst(3, "xyxy"), cnst(3, "zwzw"), b.to_temp(kS0, 3));
+    b.mac(MAX, temp(kS0), cnst(kScreenLimitConstant, "xxxx"), Op(), b.to_temp(kS0, 3));
+    b.mac(MIN, temp(kS0), cnst(kScreenLimitConstant, "yyyy"), Op(), pos_xy);
   } else {
     b.mac(MAD, temp(kPos), cnst(3, "xyxy"), cnst(3, "zwzw"), pos_xy);
   }

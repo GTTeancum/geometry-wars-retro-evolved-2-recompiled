@@ -14,6 +14,8 @@
 #include <pbkit/pbkit.h>
 #include <windows.h>
 #include <xboxkrnl/xboxkrnl.h>
+
+extern "C" volatile DWORD* pb_gw_semaphore(void);  // third_party/pbkit/pbkit.c: the 3D object's semaphore buffer
 #include <xmmintrin.h>
 
 #ifndef MASK
@@ -59,6 +61,7 @@ bool g_in_frame = false;
 constexpr u32 kArenaBytes = 1024 * 1024;  // (the menus' and game over's screens: up to 860 KiB a frame)
 u8* g_arena;
 u32 g_arena_used;  // bytes
+int g_seg_lo = -1, g_seg_hi = -1;  // the arena segments the latest allocation spans (-1: none this lap; arena_room)
 // Push buffer blocks are batched: every pb_end makes pbkit flush the CPU's
 // write-combining buffer and wait for it through a GPU register, and the
 // renderer used to close a block for each small state change (thousands a
@@ -449,6 +452,8 @@ float as_float(u32 bits) {
   return f;
 }
 
+void upload_constants(u32 first, const u32* values, u32 count);
+
 void begin_frame() {
   blk_flush();
   gw_nv2a_stage = 1;
@@ -497,6 +502,12 @@ void begin_frame() {
   p = pb_push1(p, NV097_SET_DITHER_ENABLE, 1);
   blk_end(p);
   g_arena_used = 0;
+  g_seg_lo = g_seg_hi = -1;  // (the GPU is idle: every fence has passed)
+  {
+    // Constant 65: the translated programs' screen limits (src/xenos_vp.cpp).
+    static const float kScreenLimit[4] = {-2000.0f, 2000.0f, 0, 0};
+    upload_constants(65, (const u32*)kScreenLimit, 1);
+  }
   g_in_frame = true;
 }
 
@@ -681,6 +692,8 @@ struct CensusEntry {
   u32 arena_bytes;  // bytes this kind copied into the vertex arena
   u32 skip;  // why the last skipped draw was skipped (SkipReason), with its detail
   u32 skip_detail;
+  u32 wild;  // (make GEOMETRY_CHECK=y) vertices with a position out of all reason, and the last one
+  float wild_at[3];
 };
 CensusEntry g_census[32];
 CensusEntry g_census_last[32];  // the previous drawn frame's (the flicker detector)
@@ -701,6 +714,28 @@ void note_order(u32 vs, u32 ps) {
   }
 }
 CensusEntry* g_census_entry;
+
+// Test only (make GEOMETRY_CHECK=y): vertices whose position (the first
+// attribute, as given to the vertex program) is not a number or beyond
+// 100,000 in any axis, counted per kind of draw in the census.
+#ifdef GW_GEOMETRY_CHECK
+void check_geometry(const XvpProgram* gp, const u8* v, u32 count) {
+  if (!g_census_entry || !gp->attr_count || gp->attrs[0].format == 6 || gp->attrs[0].components < 2) return;
+  const u32 n = gp->attrs[0].components < 3 ? gp->attrs[0].components : 3;
+  for (u32 i = 0; i < count; ++i) {
+    const float* p = (const float*)(v + i * gp->stride + gp->attrs[0].offset);
+    bool wild = false;
+    for (u32 c = 0; c < n; ++c) wild |= !(p[c] > -1500.0f && p[c] < 1500.0f);
+    if (n == 3) wild |= !(p[2] > -100.0f && p[2] < 100.0f);  // out of the playing plane
+    if (wild) {
+      ++g_census_entry->wild;
+      for (u32 c = 0; c < n; ++c) g_census_entry->wild_at[c] = p[c];
+    }
+  }
+}
+#else
+inline void check_geometry(const XvpProgram*, const u8*, u32) {}
+#endif
 
 enum SkipReason : u32 { kDrawn, kNotMainTarget, kPrimitive, kComputedUv, kTextureFormat };
 const char* const kSkipNames[] = {"", "target", "primitive", "computed texture coordinates", "texture format"};
@@ -773,27 +808,90 @@ u32 float_bits(float f) {
   return u;
 }
 
-// Room for 'bytes' more in the vertex arena. When a busy frame fills it, the
-// GPU finishes what it has been given and the arena starts again from the
-// beginning: one stall instead of dropping draws or falling back to the CPU
-// interpreter. pb_reset only waits until the GPU has read the commands, not
-// until it has drawn them: the draws still in its queue read their vertices
-// from the arena, so it also waits for the GPU to be idle before the arena is
-// written again (without, the menus, the screens that fill it, lost their
-// foreground for single frames).
-bool arena_room(u32 bytes) {
-  if (g_arena_used + bytes <= kArenaBytes) return true;
-  if (bytes > kArenaBytes) return false;
-  static u32 reported = 0;
-  if (reported++ < 4) gw_log("nv2a: frame %u filled the vertex arena, waiting for the GPU\n", g_frames);
+// Room for 'bytes' more in the vertex arena. The arena is a ring of eight
+// segments with GPU fences: when the write position leaves a segment, a
+// semaphore release (pbkit's semaphore buffer, written by the GPU once
+// everything before it has been drawn) marks the end of that segment's
+// draws, and a segment is written again only once its fence has passed. A
+// crowd's frame puts about 9 MB of vertices through the 1 MB arena; before,
+// each time it filled the CPU waited for the GPU to draw all of it (about a
+// tenth of the game's time at the worst), now the CPU waits only for the
+// oldest segment while the GPU goes on with the others. pb_reset alone only
+// waits until the GPU has read the commands, not drawn them: without a wait
+// the menus, the screens that fill it, lost their foreground for single
+// frames. If a fence ever fails to arrive (100 ms), the arena goes back to
+// waiting for the GPU to be idle.
+
+constexpr u32 kSegments = 8, kSegmentBytes = kArenaBytes / kSegments;
+u32 g_segment_fence[kSegments];  // the semaphore value after each segment's last draws
+u32 g_fence_serial;              // the last value released
+bool g_fences_ok = true;
+
+inline bool fence_passed(u32 v) { return (i32)(*pb_gw_semaphore() - v) >= 0; }
+
+// A fence after everything pushed so far, for segments lo..hi.
+void fence_segments(int lo, int hi) {
+  if (lo < 0 || hi < lo) return;
+  ++g_fence_serial;
+  u32* p = blk_begin();
+  p = pb_push1(p, NV097_SET_SEMAPHORE_OFFSET, 0);
+  p = pb_push1(p, NV097_BACK_END_WRITE_SEMAPHORE_RELEASE, g_fence_serial);
+  blk_end(p);
+  for (int k = lo; k <= hi; ++k) g_segment_fence[k] = g_fence_serial;
+}
+
+// The GPU idle (and every fence passed).
+void arena_drain(const char* why) {
   blk_flush();
   const u64 start = gw_wait_begin();
   pb_reset();
   while (pb_busy()) {
   }
-  ++g_frame_arena_refills;
-  gw_wait_end(start, 0, "renderer: vertex arena full mid-frame");
-  g_arena_used = 0;
+  gw_wait_end(start, 0, why);
+}
+
+// Segment k's earlier draws done.
+void wait_segment(int k) {
+  if (fence_passed(g_segment_fence[k])) return;
+  blk_flush();  // (the fence's release on its way to the GPU)
+  const u64 start = gw_wait_begin();
+  const DWORD since = GetTickCount();
+  while (!fence_passed(g_segment_fence[k])) {
+    if (GetTickCount() - since > 100) {
+      g_fences_ok = false;
+      gw_log("nv2a: an arena fence did not arrive (semaphore %08X, waiting for %08X); waiting for an idle GPU from now on\n",
+             (u32)*pb_gw_semaphore(), g_segment_fence[k]);
+      arena_drain("renderer: vertex arena, GPU idle after a lost fence");
+      return;
+    }
+  }
+  gw_wait_end(start, 0, "renderer: vertex arena segment still being drawn");
+}
+
+bool arena_room(u32 bytes) {
+  if (bytes > kArenaBytes) return false;
+  const u32 size = (bytes + 15) & ~15u;
+  if (!g_fences_ok) {
+    if (g_arena_used + size <= kArenaBytes) return true;
+    arena_drain("renderer: vertex arena full mid-frame");
+    ++g_frame_arena_refills;
+    g_arena_used = 0;
+    return true;
+  }
+  if (g_arena_used + size > kArenaBytes) {  // around to the start
+    fence_segments(g_seg_lo, g_seg_hi);
+    g_seg_lo = g_seg_hi = -1;
+    g_arena_used = 0;
+    ++g_frame_arena_refills;
+  }
+  const int first = (int)(g_arena_used / kSegmentBytes), last = (int)((g_arena_used + size - 1) / kSegmentBytes);
+  if (g_seg_lo >= 0 && g_seg_lo < first) fence_segments(g_seg_lo, g_seg_hi < first ? g_seg_hi : first - 1);
+  for (int k = g_seg_hi >= first ? g_seg_hi + 1 : first; k <= last; ++k) {
+    wait_segment(k);
+    if (!g_fences_ok) break;
+  }
+  g_seg_lo = first;
+  g_seg_hi = last;
   return true;
 }
 
@@ -857,6 +955,23 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
     g_loaded_key = gp->key;
   }
   set_program_start(8);
+#ifdef GW_GEOMETRY_CHECK
+  {  // (test only) the clip control and the program's first constants, once per program
+    static u32 told[32], told_count;
+    bool seen = false;
+    for (u32 i = 0; i < told_count; ++i) seen |= told[i] == gp->key;
+    if (!seen && told_count < 32) {
+      told[told_count++] = gp->key;
+      gw_log("clip: program %08X PA_CL_CLIP_CNTL %08X VTE %08X, %u constants:\n", gp->key, regs[0x2204], vte,
+             gp->const_count);
+      for (u32 i = 0; i < gp->const_count && i < 8; ++i) {
+        const float* c = (const float*)&regs[0x4000 + gp->const_xenos[i] * 4];
+        gw_log("  c%u x1000: %d %d %d %d\n", gp->const_xenos[i], (int)(c[0] * 1000), (int)(c[1] * 1000),
+               (int)(c[2] * 1000), (int)(c[3] * 1000));
+      }
+    }
+  }
+#endif
 
   // Constants: 0-2 fixed, 3 viewport, 4+ the shader's.
   // c0.z, c0.w: texture coordinate scale (1 unless a linear texture is bound).
@@ -958,6 +1073,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
   if (source == 2 && !rects) {
     const u32 start = stream + (first + index_offset) * gp->stride;
     if (u8* host = gw_vertex_mirror(start, count * gp->stride)) {
+      check_geometry(gp, host, count);
       set_formats((u32)MmGetPhysicalAddress(host));
       draw_arrays(nv_prim, count);
       if (g_census_entry) g_census_entry->in_place += count;
@@ -974,6 +1090,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
                                                                       : 0;
       const u32 inside = whole ? gw_vertex_mirror_room(start) / gp->stride / whole * whole : 0;
       if (inside && inside < count) {
+        check_geometry(gp, host, inside);
         set_formats((u32)MmGetPhysicalAddress(host));
         draw_arrays(nv_prim, inside);
         if (g_census_entry) g_census_entry->in_place += inside;
@@ -997,6 +1114,17 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
   // frame and they have left the cache, so each line would otherwise wait
   // on memory (most of the command processor's time on the Xbox).
   if (source == 2 && !rects && endian == 2 && !mirrored) {
+    // The native outline builder's deferred chunks (src/shapes_native.cpp):
+    // their vertices built here, straight into the arena.
+    if (gp->stride == 32) {
+      const u32 built = gw_outline_vertices(stream, first + index_offset, count, (u8*)out);
+      if (built) {
+        if (g_census_entry) g_census_entry->in_place += built;
+        first += built;
+        count -= built;
+        out += built * words;
+      }
+    }
     const u32* in = (const u32*)gw_host(stream + (first + index_offset) * gp->stride);
     const u32 total = count * words;
     for (u32 k = 0; k < total; ++k) {
@@ -1039,6 +1167,7 @@ bool draw_on_gpu(const XvpProgram* gp, const u32* regs, u32 nv_prim, u32 first, 
     }
   }
 
+  check_geometry(gp, g_arena + g_arena_used, out_count);
   set_formats(((u32)g_arena & 0x03FFFFFF) + g_arena_used);
   g_arena_used += (bytes + 15) & ~15u;
   if (g_census_entry) g_census_entry->arena_bytes += (bytes + 15) & ~15u;
@@ -1567,8 +1696,21 @@ void apply_glow() {
 void capture_trigger();  // below gw_nv2a_swap
 #endif
 
+// Test only (make DRAW_SKIP=y): draws whose vertex or pixel shader hash is
+// in this table are left out, the table written from the PC while the game
+// runs (tools/xbdm_poke.py), to find which kind of draw makes something seen.
+#ifdef GW_DRAW_SKIP
+extern "C" {
+volatile u32 gw_draw_skip[8];
+}
+#endif
+
 void gw_nv2a_draw(u32 opcode, const u32* words, u32 n, const u32* regs, u32 vs_hash, const XvsProgram* vs,
                   u32 ps_hash) {
+#ifdef GW_DRAW_SKIP
+  for (u32 k = 0; k < 8; ++k)
+    if (gw_draw_skip[k] && (gw_draw_skip[k] == vs_hash || gw_draw_skip[k] == ps_hash)) return;
+#endif
   if (!g_ready) return;
   u32 initiator = opcode == 0x22 ? words[1] : words[0];
   u32 prim = initiator & 0x3F, source = (initiator >> 6) & 3, count = initiator >> 16;
@@ -1903,6 +2045,9 @@ void gw_nv2a_swap() {
                "%u in place, arena %u KiB)%s%s %X\n",
                e.hash, e.ps, e.draws, e.strokes, e.prim, e.vertices, e.gpu, e.cpu, e.in_place, e.arena_bytes / 1024,
                e.skip ? "; skipped: " : "", kSkipNames[e.skip], e.skip_detail);
+        if (e.wild)
+          gw_log("    %u vertices out of range, the last at (%d, %d, %d)\n", e.wild, (int)e.wild_at[0], (int)e.wild_at[1],
+                 (int)e.wild_at[2]);
       }
     }
   }
@@ -1997,6 +2142,30 @@ void gw_nv2a_swap() {
   blk_flush();
 #ifdef GW_SPAWN_CAPTURE
   capture_frame();
+#endif
+#ifdef GW_TEST_PATTERN
+  // Where the frame lands on a TV: a ladder of coloured lines every 8 pixels
+  // in from each edge (white, red, green, blue, yellow, cyan, magenta, grey
+  // at 0, 8, ... 56), and a yellow line through the centre.
+  {
+    wait_for_idle();
+    const u32 w = pb_back_buffer_width(), h = pb_back_buffer_height(), pitch = pb_back_buffer_pitch();
+    u8* const frame = (u8*)pb_back_buffer();
+    static const u16 kLadder[8] = {0xFFFF, 0xF800, 0x07E0, 0x001F, 0xFFE0, 0x07FF, 0xF81F, 0x8410};
+    for (u32 y = 0; y < h; ++y) {
+      u16* row = (u16*)(frame + y * pitch);
+      for (u32 k = 0; k < 8; ++k) {
+        row[k * 8] = kLadder[k];
+        row[w - 1 - k * 8] = kLadder[k];
+      }
+      row[w / 2] = 0xFFE0;
+    }
+    for (u32 k = 0; k < 8; ++k) {
+      u16* top = (u16*)(frame + (k * 8) * pitch);
+      u16* bottom = (u16*)(frame + (h - 1 - k * 8) * pitch);
+      for (u32 x = 0; x < w; ++x) top[x] = bottom[x] = kLadder[k];
+    }
+  }
 #endif
 #ifdef GW_OVERLAY
   pb_erase_text_screen();
