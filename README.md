@@ -28,18 +28,24 @@ small runtime of our own in place of the Xbox 360's: an NV2A renderer for the
 game's graphics, a sound engine that plays the game's sound graphs, and the
 kernel and system services the game expects. It fits in the stock 64 MB.
 
-**v0.8.0 beta** is the first public release. It is a beta: expect rough
-edges, and please report what you find.
+**v0.9.0** is the current release: the fixes for what players reported
+on the v0.8.0 beta, a steadier frame rate, local high scores, and the
+sound moved onto the Xbox's own audio chip. See the
+[release notes](xbox/docs/release-notes-v0.9.0.md).
 
 ## Features
 
 - All of the game's single-player modes and four-player versus and co-op
-- Full game speed: the game runs its 60 updates a second (58.6 median with
-  four players on a console) and draws every second one, 30 pictures a second
+- 30 frames a second, the game updating once per frame: about 29 frames
+  a second in heavy play on a console, with the slowest moments around 23
 - 720p output when 720p is enabled in the Xbox dashboard's video settings,
-  otherwise 480p (letterboxed on a 4:3 TV)
-- Music and sound effects, converted by the installer to the Xbox's own
-  ADPCM format
+  otherwise 480p (letterboxed on a 4:3 TV); 480i and 1080i work too
+- Local high scores: a top 10 for each mode, kept on the hard disk, with
+  arcade initials entered on the game-over screen; the mode select shows
+  each mode's top three
+- Music and sound effects, played by the Xbox's own audio chip (converted
+  by the installer to its ADPCM format), which leaves the processor free
+  for the game
 - Saves on the Xbox hard disk (`E:\UDATA\584108FF`), with the game's icon
   in the dashboard's memory manager
 - The game's name and icon on your dashboard
@@ -50,7 +56,7 @@ edges, and please report what you find.
 ## What you need
 
 - **An original Xbox that can run homebrew** (a softmod or modchip), with
-  the stock 64 MB of memory. About 140 MB free on the hard disk.
+  the stock 64 MB of memory. About 145 MB free on the hard disk.
 - **A Windows 10 or 11 PC** to run the installer (it uses the PowerShell
   that comes with Windows), with **[ffmpeg](https://ffmpeg.org)** on the
   PATH or `ffmpeg.exe` placed next to `install.ps1`. Without ffmpeg the game
@@ -72,7 +78,7 @@ installer checks that it is this game and this version, and refuses any other.
 
 ## Installing
 
-1. Download **gw2-xbox-v0.8.0-beta.zip** from the
+1. Download **gw2-xbox-v0.9.0.zip** from the
    [latest release](https://github.com/GTTeancum/geometry-wars-retro-evolved-2-recompiled/releases/latest)
    and unzip it to a folder.
 2. Open a command prompt in that folder and run:
@@ -82,8 +88,8 @@ installer checks that it is this game and this version, and refuses any other.
    ```
 
    For example: `install.cmd "D:\360\584108FF\000D0000\8343...FDAD58" "D:\GW2 Xbox"`.
-   The output folder must be new or empty. Converting the sounds takes a
-   few minutes.
+   The output folder must be new or empty. It takes about ten minutes,
+   most of it converting the sounds.
 3. Copy the whole output folder to your Xbox's hard disk (with FTP, for
    example to `E:\Games\Geometry Wars 2`).
 4. Start `default.xbe` from your dashboard.
@@ -108,14 +114,21 @@ Up to four controllers. Players join on the multiplayer screen by pressing A.
 
 ## Known issues and limits
 
-- **Xbox Live features are not available**: the leaderboards show the
-  game's own "not available while offline" message, and no Xbox Live
-  achievements are awarded.
-- **Tested on an Xbox development kit running at 64 MB and in XEMU.** A
-  retail console should behave the same, but this release has not been
-  tried on one yet: reports are welcome.
-- The picture is drawn at 30 frames a second while the game itself runs at
-  its full 60 updates a second.
+- **Xbox Live features are not available**: high scores are kept locally
+  instead (see Features), the friends board stays empty, and no Xbox Live
+  achievements are awarded. The Leaderboards screen on the main menu was
+  made for Xbox Live and is only partly filled by the local scores.
+- **Tested on a retail Xbox and in XEMU.** One player reported picture
+  artifacts at 720p on a 1.1 console that could not be reproduced here; if
+  you see them, 480p is the fallback, and a photo and your console's
+  revision would help.
+- The game updates 30 times a second instead of the Xbox 360's 60 (it was
+  made to run at other rates; its clock keeps real time). If anything
+  feels different from the original, shots or controls for example,
+  please report it.
+- In extreme crowds (hundreds of enemies piled up on screen) the frame
+  rate still drops, because drawing that many glowing outlines is more
+  than the Xbox's graphics chip can do at full speed.
 - At most 16,000 particles are shown at once (about three times the busiest
   moment seen in four-player play), so the game cannot run out of memory in
   an extreme explosion.
