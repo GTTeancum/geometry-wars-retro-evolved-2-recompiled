@@ -20,6 +20,7 @@
 
 #include <string.h>
 #include <windows.h>
+#include <xmmintrin.h>
 #include <xboxkrnl/xboxkrnl.h>
 
 namespace {
@@ -27,7 +28,8 @@ namespace {
 // --- registers (BAR0 offsets) -----------------------------------------------------------
 volatile u8* const kBar0 = (volatile u8*)0xFE800000;
 constexpr u32 kISTS = 0x1000, kIEN = 0x1004, kFECTL = 0x1100, kFETFORCE1 = 0x1504;
-constexpr u32 kSECTL = 0x2000, kSECTL_RUN = 0x08;  // XCNTMODE 1: frames run
+constexpr u32 kSECTL = 0x2000, kSECTL_RUN = 0x08;  // XCNTMODE 1: frames run, synced to the AC97 link
+constexpr u32 kSECTL_FREE = 0x18;  // XCNTMODE 3: frames free running
 constexpr u32 kXGSCNT = 0x200C;
 constexpr u32 kVPVADDR = 0x202C, kVPSGEADDR = 0x2030, kVPSSLADDR = 0x2034;
 constexpr u32 kGPSADDR = 0x2040, kGPFADDR = 0x2044, kGPSMAXSGE = 0x20D4, kGPFMAXSGE = 0x20D8;
@@ -49,7 +51,7 @@ constexpr u32 kVolMute = 0xFFF;
 
 // --- sizes ---------------------------------------------------------------------------------
 constexpr u32 kSgeEntries = 4096;          // 16 MiB of sample space (4 KiB pages)
-constexpr u32 kFifoBytes = 256 * 1024;     // the GP's output ring: 4096 frames of the 32 bins
+constexpr u32 kFifoBytes = 128 * 1024;     // the GP's output ring: 128 APU frames of 16 bins (4096 samples)
 constexpr u32 kScratchBytes = 16 * 1024;   // the GP's scratch: its bootstrap image (P:0..$7FF)
 constexpr u32 kGpFrame = 32;               // samples per APU frame
 constexpr u32 kMixbinX = 0x1400;           // bin n at X:$1400 + 32n
@@ -64,9 +66,17 @@ constexpr u32 kMixbinX = 0x1400;           // bin n at X:$1400 + 32n
 //   P:8  movep #1,x:$FFFFD6     DMA: start
 //   P:A  inc   a
 //   P:B  move  a0,x:$10         frame counter
-//   P:C  jmp   P:0
-const u32 kGpProgram[] = {0x08F484, 0x000001, 0x0A8581, 0x000002, 0x08F485, 0x000002, 0x08F494,
-                          0x000000, 0x08F496, 0x000001, 0x000008, 0x501000, 0x0C0000};
+//   P:C  jset  #4,x:$FFFFD6,P:C wait while the DMA runs
+//   P:E  jmp   P:0
+// The wait: the setup engine runs frames back to back when it is behind (64
+// at start, a few after any pause); without it the next frame's DMA start cut
+// the last transfer short and the output ring was left half a block out of
+// step with the reader (bins 8-15 read as bins 0-7). Bit 4 of the DMA control
+// word as "running" is xemu's reading of it; if a console never cleared it,
+// no frame would complete and gw_apu_init would find no frames (the sound
+// then stays in software).
+const u32 kGpProgram[] = {0x08F484, 0x000001, 0x0A8581, 0x000002, 0x08F485, 0x000002, 0x08F494, 0x000000,
+                          0x08F496, 0x000001, 0x000008, 0x501000, 0x0A96A4, 0x00000C, 0x0C0000};
 constexpr u32 kFrameCounterX = 0x10;
 // The DMA chain: two descriptors, at X:0 and X:7, each interleaved, to
 // memory, FIFO 0, 16-bit, the channels 32 DSP words apart, 32 frames of 8
@@ -100,6 +110,16 @@ u32 g_pending_n;
 bool g_settling[kMaxVoices];
 u32 g_unlinked_at[kMaxVoices];  // the GP's frame count when it came off
 
+// A voice's routes as last written (gw_apu_voice_mix): the record's words
+// (the record is uncached; only what changed is written), and the format
+// word's other bits as gw_apu_voice_start set them.
+struct LastMix {
+  bool valid;
+  u32 fmt_rest, vbin, fmt_bins, a, b, c;
+  i16 pitch;
+};
+LastMix g_last_mix[kMaxVoices];
+
 inline void wr(u32 off, u32 v) { *(volatile u32*)(kBar0 + off) = v; }
 inline u32 rd(u32 off) { return *(volatile u32*)(kBar0 + off); }
 inline volatile u32* voice(u32 h, u32 off) { return (volatile u32*)(g_voices + h * kVoiceSize + off); }
@@ -113,11 +133,25 @@ void* alloc_table(u32 bytes, u32* phys, u32 protect = PAGE_READWRITE | PAGE_NOCA
 }
 
 // 12-bit attenuation (0 = unity, 0xFFF = muted) for a linear gain.
+// (-1280 log10 g = -385.3184 log2 g; the logarithm from the float's exponent
+// and a table over its mantissa, interpolated: a library logarithm per gain
+// was most of the cost of the routes, 8 gains a voice a pass.)
+float g_log2[257];  // log2(1 + i / 256)
 u32 atten(float gain) {
   if (!(gain > 6.3e-4f)) return kVolMute;
   if (gain >= 1.0f) return 0;
-  float a = -1280.0f * log10f(gain) + 0.5f;
-  return a > (float)0xFFE ? 0xFFE : (u32)a;
+  if (g_log2[256] == 0)
+    for (u32 i = 0; i <= 256; ++i) g_log2[i] = logf(1.0f + (float)i * (1.0f / 256)) * 1.44269504f;
+  union {
+    float f;
+    u32 u;
+  } bits = {gain};
+  const int exponent = (int)((bits.u >> 23) & 0xFF) - 127;
+  const u32 m = (bits.u >> 15) & 0xFF;
+  const float frac = (float)(bits.u & 0x7FFF) * (1.0f / 32768);
+  const float l2 = (float)exponent + g_log2[m] + (g_log2[m + 1] - g_log2[m]) * frac;
+  const float a = -385.3184f * l2 + 0.5f;
+  return a > (float)0xFFE ? 0xFFE : a < 0 ? 0 : (u32)a;
 }
 
 // Outputs 0 and 1 (front left, right) at their attenuations, the other six muted.
@@ -170,10 +204,81 @@ bool settled(u32 h) {
   return true;
 }
 
+// The APU reset as a cold boot leaves it: through its PCI power management
+// (capability at config 0x44, PMCSR at 0x48), put in D3hot and back in D0,
+// which resets the whole function, its configuration included; the command
+// register, BAR0 and the interrupt line are put back as they were. A session
+// killed mid-frame (a debug-monitor warm restart) leaves the setup engine
+// waiting for a frame that never completes (its frame sample count 0x2008
+// frozen, the GP's clock stopped) and nothing in BAR0 restarts it; a power
+// cycle did, and so does this (found on the console with tools/xbdm_apu.py:
+// frames at the full rate afterwards). Nothing else uses the APU meanwhile.
+constexpr u32 kPciBus = 0, kPciSlot = 5;  // device 5, function 0
+constexpr u32 kPciCommand = 0x04, kPciBar0 = 0x10, kPciIntLine = 0x3C, kPciCapPtr = 0x34, kPciPmcsr = 0x48;
+
+u32 pci_read(u32 off) {
+  ULONG v = 0;
+  HalReadWritePCISpace(kPciBus, kPciSlot, off, &v, 4, FALSE);
+  return v;
+}
+void pci_write(u32 off, u32 v) {
+  ULONG w = v;
+  HalReadWritePCISpace(kPciBus, kPciSlot, off, &w, 4, TRUE);
+}
+
+bool pci_reset_quiet();
+bool pci_reset() {
+  const bool ok = pci_reset_quiet();
+  gw_log("apu: reset through power management (D3hot, D0): %s\n", ok ? "configuration restored" : "NOT DONE OR NOT RESTORED");
+  return ok;
+}
+bool pci_reset_quiet() {
+  // Only on the chip this was found on (nVidia MCPX APU, 10DE:01B0) with its
+  // power management capability where it was.
+  if (pci_read(0x00) != 0x01B010DE || (pci_read(kPciCapPtr) & 0xFF) != 0x44 || (pci_read(0x44) & 0xFF) != 0x01) {
+    return false;
+  }
+  const u32 command = pci_read(kPciCommand) & 0xFFFF, bar0 = pci_read(kPciBar0), int_line = pci_read(kPciIntLine);
+  pci_write(kPciPmcsr, 3);  // D3hot
+  Sleep(10);
+  pci_write(kPciPmcsr, 0);  // D0: the function reset
+  Sleep(10);
+  pci_write(kPciBar0, bar0);
+  pci_write(kPciIntLine, int_line);
+  pci_write(kPciCommand, command);
+  return pci_read(kPciBar0) == bar0 && (pci_read(kPciCommand) & 0xFFFF) == command;
+}
+
+// The setup engine's settings as a console has them after a cold boot (read
+// there with tools/xbdm_apu.py), which the reset clears: without them the VP
+// mixes into bins that stay silent (every bin read back 0). Their meaning is
+// not documented; 0x208C-0x20AC look like a byte per mix bin. Only plain
+// values: the cold-boot registers holding memory addresses (0x2038, 0x203C,
+// 0x2048, 0x204C, 0x115C) are left cleared, since that memory is not ours.
+struct RegValue {
+  u32 off, value;
+};
+const RegValue kSeColdBoot[] = {
+    {0x2010, 0x800},      {0x2014, 0x400},      {0x2018, 0x7FF},      {0x2020, 0xE21600},   {0x2024, 0x100},
+    {0x2028, 0x100},      {0x2078, 0xFFF},      {0x207C, 0xFFF},      {0x2080, 0xFFF},      {0x2084, 0xFFF},
+    {0x2088, 0xFFF},      {0x208C, 0x01010101}, {0x2090, 0x01010101}, {0x2094, 0x01010101}, {0x2098, 0x01010101},
+    {0x209C, 0x01010101}, {0x20A0, 0x01010101}, {0x20A4, 0x01010101}, {0x20A8, 0x00010101}, {0x20AC, 0x09070806},
+};
+
 }  // namespace
+
+// A build that plays on the APU, first thing in main (gw_audio_boot_reset,
+// the AC97's bus masters stopped first): whatever an earlier session left
+// running on the APU (the GP's DMA writing its output ring, the VP reading
+// voice tables, at physical addresses that now belong to this program, after
+// a debug-monitor restart) is stopped by the reset. (The log is not up yet.)
+void gw_apu_reset_at_boot() { pci_reset_quiet(); }
 
 bool gw_apu_init() {
   if (g_ready) return true;
+  // A fresh chip whatever the last session left (see pci_reset).
+  if (!pci_reset() && pci_read(kPciBar0) != 0xFE800000) return false;
+  for (const RegValue& r : kSeColdBoot) wr(r.off, r.value);
   u32 voices_phys, sge_phys, ssl_phys, scratch_phys, scratch_sge_phys, fifo_phys, fifo_sge_phys;
   g_voices = (u8*)alloc_table(kMaxVoices * kVoiceSize, &voices_phys);
   g_sge = (u32*)alloc_table(kSgeEntries * 8, &sge_phys);
@@ -190,8 +295,17 @@ bool gw_apu_init() {
     gw_log("apu: no memory for its tables\n");
     return false;
   }
-  // Quiet: no frames, front end free running and untouched, both DSPs held.
+  // Every voice record's link at the list's end before the VP is given the
+  // table: a zeroed record links to voice 0, itself. After a warm restart
+  // from a session that used the APU, the VP could still be walking that
+  // session's list when its table address changed, and it looped on voice 0
+  // for good: no frame ever finished, the GP got no frames, the sound
+  // starved (heard as a garbled buzz now and then).
+  for (u32 h = 0; h < kMaxVoices; ++h) *(volatile u16*)(g_voices + h * kVoiceSize + kV_PITCH_LINK) = (u16)kListEnd;
+  // Quiet: no frames, front end free running and untouched, both DSPs held
+  // (and a moment for a frame in progress to finish).
   wr(kSECTL, 0);
+  Sleep(2);
   wr(kFECTL, 0);
   wr(kGPRST, 0);
   wr(kEPRST, 0);
@@ -234,15 +348,77 @@ bool gw_apu_init() {
   // Frames on.
   wr(kSECTL, kSECTL_RUN);
   Sleep(20);
-  const u32 frames = gw_apu_frames();
+  u32 frames = gw_apu_frames();
+  if (frames == 0) {
+    const u32 count0 = rd(kXGSCNT);
+    Sleep(2);
+    gw_log("apu: no GP frames: SECTL %08X ISTS %08X FECTL %08X, frame count %08X, sample counter +%u in 2 ms\n",
+           rd(kSECTL), rd(kISTS), rd(kFECTL), rd(0x2008), rd(kXGSCNT) - count0);
+  }
   gw_log("apu: ready, GP program %s, %u frames in 20 ms (XGSCNT %u)\n", loaded ? "loaded" : "NOT loaded", frames,
          rd(kXGSCNT));
-  g_fifo_read = 0;
-  g_ready = loaded;
+  g_ready = loaded && frames > 0;
+  // The frames just started ran in a burst (the setup engine works ahead of
+  // the sample clock by 0x2010's count, 2048 samples, and makes it up at
+  // once). The GP's program waits for each DMA, so the ring should be in
+  // step with the reader's blocks; checked, and put in step if not.
+  if (g_ready && !gw_apu_settle()) gw_log("apu: its output ring was out of step after the start: put in step\n");
+  // No frames even after the reset: not used, the sound in software.
+  if (frames == 0) gw_log("apu: its GP runs no frames: not used, the sound is mixed in software\n");
+  g_ready = loaded && frames > 0;
   return g_ready;
 }
 
 bool gw_apu_ready() { return g_ready; }
+
+// The GP's output ring back in step with the blocks the reader takes: frames
+// off, the DMA let finish, the ring's cursor (and the reader's) at its start,
+// frames on. (Frames stopped and started this way do not run in a burst: the
+// engine's lead is kept. Checked on the console.)
+void gw_apu_realign() {
+  if (!g_ready) return;  // (shut down meanwhile: nothing of the APU is touched)
+  wr(kSECTL, 0);
+  Sleep(2);
+  wr(kGPOFCUR0, 0);
+  g_fifo_read = 0;
+  wr(kSECTL, kSECTL_RUN);
+  Sleep(2);
+}
+bool gw_apu_in_step() { return !g_ready || rd(kGPOFCUR0) % kGpBlockBytes == 0; }
+
+// In step, looked at over a few milliseconds (a single look may fall between
+// two of the GP's transfers); put in step if not. True if it was.
+bool gw_apu_settle() {
+  if (!g_ready) return true;
+  for (u32 t = 0; t < 6; ++t) {
+    if (rd(kGPOFCUR0) % kGpBlockBytes == 0) return true;
+    Sleep(1);
+  }
+  gw_apu_realign();
+  return false;
+}
+
+// Left quiet for whatever runs next (the game's return to the dashboard): the
+// voice lists emptied, a frame in progress let finish, frames off, the GP
+// held. Killed mid-frame instead (a warm restart by the debug monitor), the
+// next start found the GP running no frames (gw_apu_init falls back to
+// software then).
+void gw_apu_shutdown() {
+  if (!g_ready) return;
+  wr(kTVL2D, kListEnd);
+  wr(kTVL3D, kListEnd);
+  wr(kTVLMP, kListEnd);
+  Sleep(2);
+  wr(kSECTL, 0);
+  Sleep(2);
+  wr(kGPRST, 0);
+  g_ready = false;
+}
+
+// For the return to the dashboard, after gw_apu_shutdown and with the AC97's
+// bus masters stopped (gw_audio_stop): the APU reset, as a cold boot leaves
+// it, for the dashboard's own sound start-up.
+void gw_apu_reset_for_exit() { pci_reset(); }
 
 u32 gw_apu_frames() { return g_voices ? rd(kGP_XMEM + 4 * kFrameCounterX) & 0xFFFFFF : 0; }
 namespace {
@@ -268,6 +444,7 @@ u32 gw_apu_map(const void* data, u32 bytes) {
 
 bool gw_apu_voice_start(u32 h, const GwApuVoice& v) {
   if (!gw_apu_voice_free(h)) return false;  // (still listed, or the VP may still reach it)
+  g_last_mix[h].valid = false;  // (its format word's other bits: below)
   for (u32 i = 0; i < g_pending_n; ++i)
     if (g_pending[i] == h) g_pending[i--] = g_pending[--g_pending_n];
   *voice(h, kV_STATE) = 0;
@@ -280,6 +457,7 @@ bool gw_apu_voice_start(u32 h, const GwApuVoice& v) {
   u32 fmt = kFmt_S16 | (v.bits == 4 ? kFmt_ADPCM : 1u << 30) | kFmt_Loop | 6 | (7 << 5);
   if (v.channels == 2) fmt |= kFmt_Stereo | (1u << kFmt_SpbShift);
   *voice(h, kV_FMT) = fmt;
+  g_last_mix[h].fmt_rest = fmt & ~0x3FFu;
   *voice(h, kV_HRTF) = 0xFFFF;
   *voice(h, kV_BA) = v.ba;
   *voice(h, kV_LBO) = v.loop_start;
@@ -347,17 +525,31 @@ void gw_apu_voice_mix(u32 h, i16 pitch, u32 n, const u8* bins, const float* gain
     v[k] = k < n ? atten(gains[k]) : kVolMute;
   }
   const u32 vbin = b[0] | (b[1] << 5) | (b[2] << 10) | (b[3] << 16) | (b[4] << 21) | ((u32)b[5] << 26);
-  volatile u32* fmt = voice(h, kV_FMT);
-  *voice(h, kV_VBIN) = vbin;
-  *fmt = (*fmt & ~0x3FFu) | b[6] | (b[7] << 5);
-  *voice(h, kV_TAR_VOLA) = (v[0] << 4) | (v[1] << 20) | (v[6] & 0xF) | ((v[7] & 0xF) << 16);
-  *voice(h, kV_TAR_VOLB) = (v[2] << 4) | (v[3] << 20) | ((v[6] >> 4) & 0xF) | (((v[7] >> 4) & 0xF) << 16);
-  *voice(h, kV_TAR_VOLC) = (v[4] << 4) | (v[5] << 20) | ((v[6] >> 8) & 0xF) | (((v[7] >> 8) & 0xF) << 16);
-  *(volatile u16*)(g_voices + h * kVoiceSize + kV_PITCH_LINK + 2) = (u16)pitch;
+  const u32 fmt_bins = b[6] | (b[7] << 5);
+  const u32 va = (v[0] << 4) | (v[1] << 20) | (v[6] & 0xF) | ((v[7] & 0xF) << 16);
+  const u32 vb = (v[2] << 4) | (v[3] << 20) | ((v[6] >> 4) & 0xF) | (((v[7] >> 4) & 0xF) << 16);
+  const u32 vc = (v[4] << 4) | (v[5] << 20) | ((v[6] >> 8) & 0xF) | (((v[7] >> 8) & 0xF) << 16);
+  // Only the words that changed since the last pass.
+  LastMix& last = g_last_mix[h];
+  const bool all = !last.valid;
+  if (all || vbin != last.vbin) *voice(h, kV_VBIN) = vbin;
+  if (all || fmt_bins != last.fmt_bins) *voice(h, kV_FMT) = last.fmt_rest | fmt_bins;
+  if (all || va != last.a) *voice(h, kV_TAR_VOLA) = va;
+  if (all || vb != last.b) *voice(h, kV_TAR_VOLB) = vb;
+  if (all || vc != last.c) *voice(h, kV_TAR_VOLC) = vc;
+  if (all || pitch != last.pitch) *(volatile u16*)(g_voices + h * kVoiceSize + kV_PITCH_LINK + 2) = (u16)pitch;
+  last.valid = true;
+  last.vbin = vbin;
+  last.fmt_bins = fmt_bins;
+  last.a = va;
+  last.b = vb;
+  last.c = vc;
+  last.pitch = pitch;
 }
 
 void gw_apu_voice_set(u32 h, i16 pitch, float left, float right) {
   if (!g_ready || h >= kMaxVoices) return;
+  g_last_mix[h].valid = false;
   u32 a, b, c;
   volumes(left, right, &a, &b, &c);
   *voice(h, kV_TAR_VOLA) = a;
@@ -391,6 +583,8 @@ i16 gw_apu_pitch(float ratio) {
   return (i16)(p < 0 ? p - 0.5f : p + 0.5f);
 }
 
+u32 gw_apu_out_cursor() { return g_ready ? rd(kGPOFCUR0) : 0; }
+
 u32 gw_apu_available() {
   if (!g_ready) return 0;
   const u32 cur = rd(kGPOFCUR0) % kRingBytes / kGpBlockBytes * kGpBlockBytes;  // whole APU frames
@@ -403,13 +597,29 @@ void gw_apu_skip(u32 frames) {
 
 void gw_apu_read_bins(float (*bins)[256], const u8* wanted, float scale) {
   // 256 frames = 8 APU frames, each 32 frames of bins 0-7, then of bins 8-15.
+  // Each half wanted is turned into floats in one run over its samples
+  // (they follow each other in memory), then its wanted bins are picked out
+  // of that.
+  float half[kGpFrame * kDescChannels];
   for (u32 f = 0; f < 256 / kGpFrame; ++f) {
     const i16* block = (const i16*)(g_fifo + g_fifo_read);
-    for (u32 bin = 0; bin < kBinsCopied; ++bin) {
-      if (!wanted[bin]) continue;
-      const i16* p = block + (bin / kDescChannels) * kGpFrame * kDescChannels + bin % kDescChannels;
-      float* out = bins[bin] + f * kGpFrame;
-      for (u32 n = 0; n < kGpFrame; ++n) out[n] = (float)p[n * kDescChannels] * scale;
+    for (u32 d = 0; d < kBinsCopied / kDescChannels; ++d) {
+      bool any = false;
+      for (u32 c = 0; c < kDescChannels; ++c) any |= wanted[d * kDescChannels + c] != 0;
+      if (!any) continue;
+      const i16* p = block + d * kGpFrame * kDescChannels;
+      // (The APU wrote this memory: none of it is in the cache. Each line
+      // is asked for a few lines before it is read; past the block's end
+      // that is the next block, or a harmless miss at the ring's end.)
+      for (u32 i = 0; i < kGpFrame * kDescChannels; i += 16) {
+        __builtin_prefetch((const char*)(p + i) + 160, 0, 0);
+        for (u32 n = i; n < i + 16; ++n) half[n] = (float)p[n] * scale;
+      }
+      for (u32 c = 0; c < kDescChannels; ++c) {
+        if (!wanted[d * kDescChannels + c]) continue;
+        float* out = bins[d * kDescChannels + c] + f * kGpFrame;
+        for (u32 n = 0; n < kGpFrame; ++n) out[n] = half[n * kDescChannels + c];
+      }
     }
     g_fifo_read = (g_fifo_read + kGpBlockBytes) % kRingBytes;
   }
@@ -429,3 +639,70 @@ u32 gw_apu_read(i16* out, u32 frames) {
   }
   return got;
 }
+
+// --- the probe (test only: make APU_PROBE=y) ------------------------------------
+// The PC (tools/xbdm_apu.py) fills gw_apu_probe through the debug monitor, the
+// sequence number last; the sound thread carries the command out on its next
+// pass and stores the sequence number in done. Register offsets are checked
+// against BAR0's size (512 KiB), counts against the result buffer; the results
+// go only into gw_apu_probe_out (ours).
+#ifdef GW_APU_PROBE
+extern "C" {
+// op, offset, value, count, seq, done
+volatile u32 gw_apu_probe[6];
+volatile u32 gw_apu_probe_out[256];
+}
+void gw_apu_probe_poll() {
+  const u32 seq = gw_apu_probe[4];
+  if (seq == gw_apu_probe[5]) return;
+  const u32 op = gw_apu_probe[0], off = gw_apu_probe[1], value = gw_apu_probe[2];
+  u32 count = gw_apu_probe[3];
+  constexpr u32 kBar0Bytes = 0x80000, kOut = sizeof(gw_apu_probe_out) / 4;
+  if (count > kOut) count = kOut;
+  const bool in_range = (off & 3) == 0 && off < kBar0Bytes && count <= (kBar0Bytes - off) / 4;
+  switch (op) {
+    case 1:  // read count words from off
+      if (in_range)
+        for (u32 i = 0; i < count; ++i) gw_apu_probe_out[i] = rd(off + 4 * i);
+      break;
+    case 2:  // write value at off, read it back
+      if (in_range) {
+        wr(off, value);
+        gw_apu_probe_out[0] = rd(off);
+      }
+      break;
+    case 3:  // sleep value ms (at most 200)
+      Sleep(value > 200 ? 200 : value);
+      break;
+    case 4:  // the GP frame count, then after value ms (at most 200) again, and the sample counter both times
+      gw_apu_probe_out[0] = rd(kGP_XMEM + 4 * kFrameCounterX) & 0xFFFFFF;
+      gw_apu_probe_out[1] = rd(kXGSCNT);
+      Sleep(value > 200 ? 200 : value);
+      gw_apu_probe_out[2] = rd(kGP_XMEM + 4 * kFrameCounterX) & 0xFFFFFF;
+      gw_apu_probe_out[3] = rd(kXGSCNT);
+      break;
+    case 6:  // the APU's PCI configuration (bus 0, device 5, function 0): 256 bytes
+      HalReadWritePCISpace(0, value ? value : 5, 0, (PVOID)gw_apu_probe_out, 256, FALSE);  // (value: another slot)
+      break;
+    case 7:  // a dword of it written (off < 256), read back
+      if ((off & 3) == 0 && off < 256) {
+        ULONG v = value;
+        const u32 slot = count > 1 && count < 32 ? count : 5;  // (count: another slot)
+        HalReadWritePCISpace(0, slot, off, &v, 4, TRUE);
+        HalReadWritePCISpace(0, slot, off, &v, 4, FALSE);
+        gw_apu_probe_out[0] = v;
+      }
+      break;
+    case 5:  // the whole bring-up again (its tables allocated afresh)
+      g_ready = false;
+      g_sge_next = 0;
+      gw_apu_probe_out[0] = gw_apu_init();
+      gw_apu_probe_out[1] = gw_apu_frames();
+      break;
+  }
+  gw_log("apu probe %u: op %u off %05X value %08X count %u -> %08X\n", seq, op, off, value, count, gw_apu_probe_out[0]);
+  gw_apu_probe[5] = seq;
+}
+#else
+void gw_apu_probe_poll() {}
+#endif

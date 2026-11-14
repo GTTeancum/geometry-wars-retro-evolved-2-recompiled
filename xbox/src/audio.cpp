@@ -104,7 +104,11 @@ void ac97_queue(u8* buffer, u32 bytes) {
 
 // The AC97's two bus masters stopped and reset, so nothing is still playing
 // out of this program's buffers when the console reboots to the dashboard.
-void gw_audio_stop() {
+volatile bool gw_audio_stopping;  // the audio thread parks (gw_audio_stop)
+
+namespace {
+// The AC97's two bus masters stopped and reset.
+void ac97_halt() {
   kAc97[0x11B] = 0;
   kAc97[0x17B] = 0;
   kAc97[0x11B] = 2;
@@ -113,6 +117,32 @@ void gw_audio_stop() {
   }
   for (int t = 0; (kAc97[0x17B] & 2) && t < 100000; ++t) {
   }
+}
+}  // namespace
+
+void gw_audio_stop() {
+  // The audio thread first (it parks at its next turn, within a few
+  // passes): nothing of ours touches the AC97 or the APU after this.
+  gw_audio_stopping = true;
+  Sleep(60);
+  ac97_halt();
+#ifdef GW_SOUND_APU
+  // The APU quiet, then reset for the dashboard: only with the AC97 stopped
+  // (the order kept everywhere: the APU's power-management reset is never
+  // done under a running AC97).
+  gw_apu_shutdown();
+  gw_apu_reset_for_exit();
+#endif
+}
+
+// First thing in main, in a build that plays on the APU: the AC97's bus
+// masters stopped (a session restarted from the debug monitor leaves them
+// running), then the APU reset (gw_apu_reset_at_boot).
+void gw_audio_boot_reset() {
+#ifdef GW_SOUND_APU
+  ac97_halt();
+  gw_apu_reset_at_boot();
+#endif
 }
 
 namespace {
@@ -260,6 +290,8 @@ DWORD WINAPI audio_thread(LPVOID) {
   kAc97[0x11B] = 1;  // run, no interrupts
   kAc97[0x17B] = 1;
   for (;;) {
+    while (gw_audio_stopping) Sleep(1000);  // (the return to the dashboard: parked for good)
+    gw_apu_probe_poll();  // (test only; nothing in a normal build)
     // Frames queued and not yet played: from the buffer playing to the next
     // one to fill.
     const u32 playing = kAc97[0x114] & 31;
@@ -272,6 +304,25 @@ DWORD WINAPI audio_thread(LPVOID) {
       kAc97[0x116] = 0x1C;  // clear the status bits that latch
     }
     if (ahead < low) low = ahead;
+    // The AC97 taking no frames (its buffer index still for a second while
+    // frames wait): seen once on the console, through restarts and until a
+    // power cycle, the sound silent and the sound thread idle. Reported with
+    // its registers (the cause is not known).
+    {
+      static u32 last_playing = ~0u;
+      static DWORD moved_at, reported_at;
+      const DWORD now = GetTickCount();
+      if (playing != last_playing) {
+        last_playing = playing;
+        moved_at = now;
+      } else if (ahead && now - moved_at > 1000 && now - reported_at > 30000) {
+        reported_at = now;
+        gw_log("audio: the AC97 takes no frames: buffer %u of last %u, status %04X, left %u, control %02X, global "
+               "%08X %08X\n",
+               playing, kAc97[0x115] & 31, *(volatile u16*)(kAc97 + 0x116), *(volatile u16*)(kAc97 + 0x118),
+               kAc97[0x11B], *(volatile u32*)(kAc97 + 0x12C), *(volatile u32*)(kAc97 + 0x130));
+      }
+    }
     static DWORD last = 0;
     if (GetTickCount() - last > 5000) {
       last = GetTickCount();

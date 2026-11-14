@@ -23,6 +23,10 @@ struct GwApuVoice {
 
 bool gw_apu_init();   // tables, the GP program, frames on; false if the APU did not come up
 bool gw_apu_ready();
+void gw_apu_shutdown();  // quiet (lists empty, frames off, the GP held), for whatever runs next
+void gw_apu_reset_for_exit();  // then, with the AC97 stopped: reset as a cold boot leaves it
+void gw_apu_reset_at_boot();   // (gw_audio_boot_reset)
+void gw_apu_probe_poll();  // test only (APU_PROBE=y): the PC's register commands (tools/xbdm_apu.py)
 u32 gw_apu_frames();  // APU frames the GP has run (32 samples each)
 
 // Maps physically contiguous memory into the VP's sample space (once, for
@@ -49,6 +53,13 @@ i16 gw_apu_pitch(float ratio);     // the VP's pitch (log2 in 4.12) for a rate r
 // into bins[kBins][256] (16-bit values times scale); and (the test) up to
 // frames frames of bins 0 and 1 as stereo 16-bit, how many.
 u32 gw_apu_available();
+// The ring in step with the reader's blocks (its cursor on a whole APU frame;
+// read between two of the GP's transfers), and put back in step (the frames
+// waiting are dropped).
+bool gw_apu_in_step();
+bool gw_apu_settle();  // in step over a few ms, put in step if not (true if it was)
+void gw_apu_realign();
+u32 gw_apu_out_cursor();  // the GP's output ring write position, as the chip reports it (diagnostics)
 void gw_apu_skip(u32 frames);
 void gw_apu_read_bins(float (*bins)[256], const u8* wanted, float scale);
 u32 gw_apu_read(i16* out, u32 frames);

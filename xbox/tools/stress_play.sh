@@ -8,7 +8,7 @@ name="$1"
 seconds="${2:-360}"
 xbox="$(cd "$(dirname "$0")/.." && pwd)"
 host=10.0.0.231
-/c/XDK/Xbox/Bin/xbreboot.exe 'xe:\Games\GW2\default.xbe'
+bash "$xbox/tools/xbdm_restart.sh"  # (the APU left quiet first)
 python -c "import time; time.sleep(25)"
 python "$xbox/tools/xemu_pad.py" --xbdm "$host" "press A" "sleep 3" "press UP" "sleep 0.5" "press UP" "sleep 0.5" \
   "press UP" "sleep 0.5" "press DOWN" "sleep 0.5" "press DOWN" "sleep 1" "press A" "sleep 3" "press A" "sleep 3" >/dev/null

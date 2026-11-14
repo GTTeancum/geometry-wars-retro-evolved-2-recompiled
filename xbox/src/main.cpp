@@ -7,6 +7,7 @@
 #include <windows.h>
 
 void gw_kernel_threads_init();
+void gw_audio_boot_reset();  // src/audio.cpp
 void gw_kernel_variables_init(const u8* xex_header, u32 xex_header_size);
 
 namespace {
@@ -27,6 +28,11 @@ bool read_file(const char* path, u32 offset, void* out, u32 size, u32* got) {
 extern "C" volatile const u32 gw_build_stamp[2];  // src/build_stamp.cpp
 
 int main() {
+  // First of all, in a build that plays on the APU, the audio chips quiet and
+  // the APU reset (src/audio.cpp): a session restarted from the debug monitor
+  // while the APU played left it running, its DMA writing into memory this
+  // program now owns. (Nothing in a build that mixes in software.)
+  gw_audio_boot_reset();
   // Reserve the guest windows before anything else allocates (the virtual
   // heap window starts just above the XBE).
   bool reserved = gw_memory_init();

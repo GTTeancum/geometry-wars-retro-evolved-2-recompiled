@@ -130,6 +130,8 @@ DWORD WINAPI status_thread(LPVOID) {
     last_tick = now;
 #ifdef GW_PARTICLE_STRESS
     if (seconds % 5 == 4) gw_log_memory("every 5 s (particle stress)");
+#elif defined(GW_MEMORY_WATCH)
+    if (seconds % 10 == 9) gw_log_memory("every 10 s (memory watch)");
 #else
     if (seconds % 300 == 299) gw_log_memory("every 5 minutes");
 #endif  // (a soak's memory over time)

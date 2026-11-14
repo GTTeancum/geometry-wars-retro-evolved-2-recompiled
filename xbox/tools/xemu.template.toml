@@ -1,6 +1,6 @@
 [general]
 show_welcome = false
-screenshot_dir='C:/Programming/GitHub/Geometry Wars 2/xbox/test-artifacts/captures'
+screenshot_dir='D:/Programming/GitHub/GeometryWars2Xbox/xbox/test-artifacts/captures'
 skip_boot_anim = true
 
 [input]
@@ -27,9 +27,9 @@ use_dsp = true
 [sys.files]
 bootrom_path = 'C:/Games/Emulators/Xemu/MCPX/mcpx_1.0.bin'
 flashrom_path = 'C:/Games/Emulators/Xemu/BIOS/xbox-4627_debug.bin'
-eeprom_path='C:/Programming/GitHub/Geometry Wars 2/xbox/build/xemu/eeprom-test.bin'
+eeprom_path='D:/Programming/GitHub/GeometryWars2Xbox/xbox/build/xemu/eeprom-test.bin'
 hdd_path='C:/Games/Emulators/Xemu/HDD/xbox_hdd.qcow2'
-dvd_path='C:/Programming/GitHub/Geometry Wars 2/xbox/test-artifacts/gw2-current.iso'
+dvd_path='D:/Programming/GitHub/GeometryWars2Xbox/xbox/test-artifacts/gw2-current.iso'
 [display.ui]
 fit='scale'
 aspect_ratio='16x9'

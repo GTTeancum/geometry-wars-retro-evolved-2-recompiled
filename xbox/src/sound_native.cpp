@@ -148,7 +148,15 @@ struct Bank {
   u32 count;
   Wave* waves;
   volatile bool resident;
+  // The waves held in memory (bank_resident), when in one block of
+  // physically contiguous memory with a silent tail after each Xbox ADPCM
+  // wave (GW_SOUND_APU: the APU plays them where they are).
+  u8* held;
+  u32 held_bytes;
 };
+// Silent Xbox ADPCM blocks after each wave held for the APU: a one-shot loops
+// there until it is taken off the APU's list.
+constexpr u32 kTailBlocks = 16;
 constexpr u32 kBanks = 8;
 Bank g_banks[kBanks];
 CRITICAL_SECTION g_lock;
@@ -306,9 +314,29 @@ bool bank_open(const char* name) {
 // others stream (from their first blocks, held by the reader thread).
 void bank_resident(Bank& b, u32 limit) {
   u32 total = 0, held = 0;
+  // Held whatever its size: the ship's thrust, a streamed loop that plays for
+  // the whole game and is not a whole number of Xbox ADPCM blocks long, so
+  // the APU cannot play it from a stream's ring (45 KiB).
+  auto wanted = [limit](const Wave& w) { return w.size <= limit || !strcmp(w.name, "Ship_thrust_loop"); };
+#ifdef GW_SOUND_APU
+  // (contiguous, each Xbox ADPCM wave followed by its silent tail: see Bank::held)
+  auto tail = [](const Wave& w) { return w.xa && w.channels >= 1 && w.channels <= 2 ? kTailBlocks * 36 * w.channels : 0u; };
   for (u32 i = 0; i < b.count; ++i)
-    if (b.waves[i].size <= limit) total += b.waves[i].size;
+    if (wanted(b.waves[i])) total += b.waves[i].size + tail(b.waves[i]);
+  u8* data = total ? (u8*)MmAllocateContiguousMemoryEx(total, 0, 0x03FFAFFF, 0, PAGE_READWRITE) : nullptr;
+  if (data) {
+    memset(data, 0, total);
+    b.held = data;
+    b.held_bytes = total;
+  } else {
+    data = (u8*)malloc(total ? total : 1);
+  }
+#else
+  auto tail = [](const Wave&) { return 0u; };
+  for (u32 i = 0; i < b.count; ++i)
+    if (wanted(b.waves[i])) total += b.waves[i].size;
   u8* data = (u8*)malloc(total ? total : 1);
+#endif
   if (!data) {
     gw_log("sound: no memory for bank %s (%u KiB)\n", b.name, total / 1024);
     return;
@@ -316,13 +344,13 @@ void bank_resident(Bank& b, u32 limit) {
   u32 at = 0;
   for (u32 i = 0; i < b.count; ++i) {
     Wave& w = b.waves[i];
-    if (w.size > limit) continue;
+    if (!wanted(w)) continue;
     DWORD done = 0;
     SetFilePointer(b.file, w.offset, nullptr, FILE_BEGIN);
     ReadFile(b.file, data + at, w.size, &done, nullptr);
     if (done != w.size) continue;  // (left to stream)
     w.data = data + at;
-    at += w.size;
+    at += w.size + tail(w);
     ++held;
   }
   gw_log("sound: bank %s: %u of %u waves in memory (%u KiB)\n", b.name, held, b.count, at / 1024);
@@ -813,6 +841,13 @@ struct Voice {
   u8 rt_n[2] = {0, 0};
   u8 rt_bin[2][4];
   float rt_gain[2][4];
+  // A looping voice is on the APU only while it is heard: hw_quiet counts
+  // its passes there at silence (back to software, where silence costs
+  // nothing, after kHwQuietPasses); hw_want: heard in software this pass, to
+  // move to the APU at the pass's end.
+  u16 hw_quiet = 0;
+  bool hw_want = false;
+  float hw_loud = 0;  // (diagnostics) its loudest route last pass
 };
 
 struct Comp {
@@ -1115,7 +1150,7 @@ void sound_action(Graph& g, Comp& c, u32 action) {
       const float start = read_slot(g, c.b + 0x3C);
       c.s[1] = 1;
       voice_start(v, v.r.wave ? (u32)((float)v.r.wave->samples * start) : 0);
-      hw_voice_start(g, c, v);
+      // (to the APU once it is heard: hw_want_note)
     } else {
       i32 v = c.last_voice + 1;
       if (v >= (i32)c.voice_count) v = 0;
@@ -1133,6 +1168,55 @@ void sound_action(Graph& g, Comp& c, u32 action) {
 
 
 // One voice's 256 samples into out (channels of c), gain applied; false if silent.
+// Which sounds are still decoded in software, and why (the APU report).
+#ifdef GW_SOUND_APU
+struct SwNote {
+  const char* name;
+  u32 why, passes;
+};
+SwNote g_sw_notes[16];
+const char* const kSwWhy[] = {"APU off", "route not plain", "stream not Xbox ADPCM", "stream loop not whole blocks",
+                              "no APU copy", "refused or not started"};
+bool apu_on_now();
+void sw_voice_note(const Comp& c, const Voice& v) {
+  const Wave* w = v.r.wave;
+  const bool stream = !w->data;
+  u32 why = !apu_on_now()                      ? 0
+            : !c.apu_ok                        ? 1
+            : stream && !w->xa                 ? 2
+            : stream && v.r.loop && w->samples % 64 ? 3
+            : !stream && !w->apu_samples       ? 4
+                                               : 5;
+  const char* name = c.name ? c.name : "?";
+  for (SwNote& n : g_sw_notes) {
+    if (n.name == name || !n.name) {
+      n.name = name;
+      n.why = why;
+      ++n.passes;
+      return;
+    }
+  }
+}
+// A looping voice heard in software: moved to the APU at the pass's end
+// (hw_apply), where its next pass plays.
+struct HwWant {
+  Graph* g;
+  Comp* c;
+  Voice* v;
+};
+HwWant g_hw_want[64];
+u32 g_hw_want_n;
+bool is_looping(u32 type);
+void hw_want_note(Graph& g, Comp& c, Voice& v) {
+  if (!apu_on_now() || !c.apu_ok || !is_looping(c.type) || v.hw_want || g_hw_want_n == 64) return;
+  v.hw_want = true;
+  g_hw_want[g_hw_want_n++] = {&g, &c, &v};
+}
+#else
+inline void sw_voice_note(const Comp&, const Voice&) {}
+inline void hw_want_note(Graph&, Comp&, Voice&) {}
+#endif
+
 // *first: nothing written to out yet this pass (the first voice to sound
 // writes it instead of adding, so out is never cleared for nothing).
 bool voice_render(Graph& g, Comp& c, Voice& v, float (*out)[kPass], bool needed, bool* first) {
@@ -1180,6 +1264,8 @@ bool voice_render(Graph& g, Comp& c, Voice& v, float (*out)[kPass], bool needed,
   const u32 got = v.r.render(dst, ch, 1, n, &ended);
   PROF_END(decode);
   ++gw_sound_voices;
+  sw_voice_note(c, v);
+  hw_want_note(g, c, v);
   // A stream not there yet: silence, but the wave keeps its place (in time
   // with the music's other layers).
   if (got < n && !ended) {
@@ -2707,13 +2793,13 @@ const float* g_wet;     // its reverb send
 // hardware voice plays in software as before.
 #ifdef GW_SOUND_APU
 bool g_apu_on;
+bool apu_on_now() { return g_apu_on; }
 constexpr u32 kHwFirst = 64;             // xemu runs voices 0-63 through its HRTF stage (silent without an entry)
 constexpr u32 kBinsUsed = kBinsCopied - 1;  // the last copied bin is where muted outputs go
 constexpr u8 kBinMuted = kBinsCopied - 1;
 constexpr float kHeadroom = 0.25f;       // the bins are 16-bit: gains go in at a quarter, read back times 4
-constexpr u32 kTailBlocks = 16;          // silent blocks after each wave: a one-shot loops there until it is taken off
-constexpr u32 kHwRings = 32;             // streams on the APU at once
-constexpr u32 kRingBlocks = 256;         // a stream's ring: 256 blocks (16384 samples, 0.34 s)
+constexpr u32 kHwRings = 40;             // streams on the APU at once (about 30 are heard together; more play in software)
+constexpr u32 kRingBlocks = 128;         // a stream's ring: 128 blocks (8192 samples, 0.17 s; refilled every pass)
 u8* g_ring_mem;                          // kHwRings rings of kRingBlocks * 72 bytes
 u32 g_ring_ba;                           // their offset in the sample space
 bool g_ring_used[kHwRings];
@@ -2732,6 +2818,7 @@ u8 g_bins_wanted[kBinsCopied];
 // muted or not, and one-shots play a silent tail, so most bins are often
 // silent.
 bool g_bin_live[kBinsCopied];
+u32 g_hw_no_ring, g_hw_start_fail, g_hw_back, g_apu_realigns;
 u32 g_hw_starts, g_hw_full, g_hw_no_bins, g_apu_waves, g_apu_able, g_apu_sounds;
 float g_bin_scale = 4.0f / 32768.0f;  // a bin's 16-bit value to the engine's level (apu_calibrate)
 
@@ -2751,16 +2838,22 @@ void apu_calibrate() {
   v.left = v.right = 1.0f;
   gw_apu_voice_start(kMaxVoices - 1, v);
   gw_apu_voices_go();
-  Sleep(60);
-  gw_apu_skip(gw_apu_available());
-  for (u32 t = 0; t < 100 && gw_apu_available() < kPass; ++t) Sleep(1);
   static float probe[kBinsCopied][kPass];
   u8 want[kBinsCopied] = {1, 1};
   float level = 0;
-  if (gw_apu_available() >= kPass) {
-    gw_apu_read_bins(probe, want, 1.0f / 32768.0f);
-    for (u32 n = 0; n < kPass; ++n) level += probe[0][n];
-    level /= kPass;
+  // (Up to three tries, the ring checked to be in step before each: read
+  // out of step, bin 0 holds another bin and the level comes back 0.)
+  for (u32 attempt = 0; attempt < 3 && !(level > 0.01f); ++attempt) {
+    Sleep(60);
+    gw_apu_settle();
+    gw_apu_skip(gw_apu_available());
+    for (u32 t = 0; t < 100 && gw_apu_available() < kPass; ++t) Sleep(1);
+    level = 0;
+    if (gw_apu_available() >= kPass) {
+      gw_apu_read_bins(probe, want, 1.0f / 32768.0f);
+      for (u32 n = 0; n < kPass; ++n) level += probe[0][n];
+      level /= kPass;
+    }
   }
   gw_apu_voice_stop(kMaxVoices - 1);
   Sleep(10);
@@ -2781,10 +2874,25 @@ void apu_prepare(Bank& b) {
     if (w.size % w.block > 4 * w.channels) n += (w.size % w.block - 4 * w.channels) * 2 / w.channels + 1;
     return n < w.samples ? n : w.samples;
   };
+  // A wave held in the bank's contiguous block as whole Xbox ADPCM blocks
+  // (its silent tail right after it) is played where it is; the others get
+  // a copy.
+  const u32 held_base = b.held ? gw_apu_map(b.held, b.held_bytes) : 0xFFFFFFFF;
+  auto in_place = [&](const Wave& w) {
+    return held_base != 0xFFFFFFFF && w.xa && w.size == gw_xadpcm_blocks(w.samples) * 36 * w.channels;
+  };
+  u32 placed = 0;
   for (u32 i = 0; i < b.count; ++i) {
-    const Wave& w = b.waves[i];
-    if (w.data && w.channels >= 1 && w.channels <= 2)
+    Wave& w = b.waves[i];
+    if (!w.data || w.channels < 1 || w.channels > 2) continue;
+    if (in_place(w)) {
+      w.apu_ba[0] = held_base + (u32)(w.data - b.held);
+      w.apu_samples = w.samples;
+      ++placed;
+      ++g_apu_waves;
+    } else {
       total += (gw_xadpcm_blocks(have_samples(w)) + kTailBlocks) * 36 * w.channels;
+    }
   }
   total += kHwRings * kRingBlocks * 72;  // the streams' rings, after the waves
   u8* mem = total ? (u8*)MmAllocateContiguousMemoryEx(total, 0, 0x03FFAFFF, 0, PAGE_READWRITE | PAGE_WRITECOMBINE)
@@ -2801,7 +2909,7 @@ void apu_prepare(Bank& b) {
   u32 at = 0, n = 0;
   for (u32 i = 0; i < b.count; ++i) {
     Wave& w = b.waves[i];
-    if (!w.data || w.channels < 1 || w.channels > 2) continue;
+    if (!w.data || w.channels < 1 || w.channels > 2 || in_place(w)) continue;
     const u32 samples = have_samples(w), bytes = (gw_xadpcm_blocks(samples) + kTailBlocks) * 36 * w.channels;
     memset(mem + at, 0, bytes);
     if (w.xa) memcpy(mem + at, w.data, gw_xadpcm_blocks(samples) * 36 * w.channels);
@@ -2815,7 +2923,8 @@ void apu_prepare(Bank& b) {
   memset(mem + at, 0, kHwRings * kRingBlocks * 72);
   g_ring_mem = mem + at;
   g_ring_ba = base + at;
-  gw_log("sound: bank %s: %u waves for the APU (%u KiB)\n", b.name, n, total / 1024);
+  gw_log("sound: bank %s for the APU: %u waves played where they are, %u copied; copies and stream rings %u KiB\n", b.name,
+         placed, n, total / 1024);
 }
 
 // The bin mixers a sound reaches through plain mixing; false when one of its
@@ -2918,30 +3027,54 @@ void hw_voice_stop(Voice& v) {
 // from the start again when it loops; silence past a one-shot's end). A
 // block not read from the disc yet waits, unless the voice is about to play
 // it: then it is silence there, and the wave keeps its place.
+extern u32 g_hwpos_blocks;
+// A copy into the rings' write-combined memory: 16 bytes at a time with
+// non-temporal stores once the destination is on a 16-byte boundary, 4 at a
+// time before and after (the library's memcpy took about 12 cycles a byte
+// there). (The blocks are whole 4-byte words: 36 bytes a channel.)
+inline void wc_copy(u8* dst, const u8* src, u32 bytes) {
+  u32 i = 0;
+  for (; i + 4 <= bytes && ((u32)(dst + i) & 15); i += 4) *(u32*)(dst + i) = *(const u32*)(src + i);
+  for (; i + 16 <= bytes; i += 16) _mm_stream_ps((float*)(dst + i), _mm_loadu_ps((const float*)(src + i)));
+  for (; i + 4 <= bytes; i += 4) *(u32*)(dst + i) = *(const u32*)(src + i);
+  for (; i < bytes; ++i) dst[i] = src[i];
+}
 void hw_ring_fill(Voice& v) {
   const Wave& w = *v.r.wave;
   const u32 ch = w.channels, bytes = 36 * ch, group = w.block / bytes;
   const u32 wave_blocks = gw_xadpcm_blocks(w.samples);
   const u32 played_blocks = (v.hw_start % 64 + v.hw_played) / 64;
+  const u32 limit = played_blocks + kRingBlocks - 2;
   u8* ring = g_ring_mem + v.hw_ring * kRingBlocks * 72;
-  while (v.hw_out < played_blocks + kRingBlocks - 2) {
-    u8* dst = ring + (v.hw_out % kRingBlocks) * bytes;
+  while (v.hw_out < limit) {
+    const u32 slot = v.hw_out % kRingBlocks;
+    u8* dst = ring + slot * bytes;
     u32 wb = v.hw_start / 64 + v.hw_out;
     if (v.r.loop) wb %= wave_blocks;
     if (wb >= wave_blocks) {
       memset(dst, 0, bytes);
-    } else {
-      const u8* src = v.r.block_data(wb / group);
-      if (src) {
-        memcpy(dst, src + (wb % group) * bytes, bytes);
-      } else if (v.hw_out < played_blocks + 8) {
-        memset(dst, 0, bytes);  // (the stream is behind: silence, in place)
-        ++gw_sound_late;
-      } else {
-        break;
-      }
+      ++v.hw_out;
+      continue;
     }
-    ++v.hw_out;
+    const u32 in_group = wb % group;
+    const u8* src = v.r.block_data(wb / group);
+    if (src) {
+      // As many blocks as follow each other in the stream's group, the
+      // wave and the ring, in one copy.
+      u32 n = group - in_group;
+      if (n > wave_blocks - wb) n = wave_blocks - wb;
+      if (n > kRingBlocks - slot) n = kRingBlocks - slot;
+      if (n > limit - v.hw_out) n = limit - v.hw_out;
+      wc_copy(dst, src + in_group * bytes, n * bytes);
+      g_hwpos_blocks += n;
+      v.hw_out += n;
+    } else if (v.hw_out < played_blocks + 8) {
+      memset(dst, 0, bytes);  // (the stream is behind: silence, in place)
+      ++gw_sound_late;
+      ++v.hw_out;
+    } else {
+      break;
+    }
   }
 }
 
@@ -2963,6 +3096,7 @@ void hw_voice_start(Graph& g, Comp& c, Voice& v) {
       if (!g_ring_used[k]) ring = (i16)k;
   if (h < 0 || (stream && ring < 0)) {
     ++g_hw_full;
+    if (h >= 0) ++g_hw_no_ring;
     return;  // (no hardware voice or ring free: software)
   }
   if (!bins_take(c)) {
@@ -3003,6 +3137,7 @@ void hw_voice_start(Graph& g, Comp& c, Voice& v) {
     }
     bins_give_back(c);
     ++g_hw_full;
+    ++g_hw_start_fail;
     return;
   }
   g_hw[h] = {&g, &c, &v};
@@ -3026,13 +3161,18 @@ void hw_pause_changed() {
 // Where the hardware voices are: the software voices follow (the songs' sync
 // tracks and progress outputs read them); one-shots past their end end;
 // streams' rings are filled ahead.
+u64 g_hwpos_read, g_hwpos_fill;  // (diagnostics) cycles reading positions, filling rings
+u32 g_hwpos_voices, g_hwpos_blocks;
 void hw_positions() {
   if (!g_apu_on) return;
   for (u32 h = kHwFirst; h < kMaxVoices; ++h) {
     HwOwner o = g_hw[h];
     if (!o.v || hw_paused(o)) continue;
     Voice& v = *o.v;
+    const u64 t0 = __builtin_ia32_rdtsc();
     const u32 pos = gw_apu_voice_position(h);
+    g_hwpos_read += __builtin_ia32_rdtsc() - t0;
+    ++g_hwpos_voices;
     if (v.hw_ring >= 0) {
       const u32 span = kRingBlocks * 64;
       v.hw_played += (pos % span + span - v.hw_cbo) % span;
@@ -3044,7 +3184,9 @@ void hw_positions() {
         continue;
       }
       v.r.pos = v.r.loop ? at % samples : at;
+      const u64 t1 = __builtin_ia32_rdtsc();
       hw_ring_fill(v);
+      g_hwpos_fill += __builtin_ia32_rdtsc() - t1;
     } else {
       const u32 samples = v.r.wave->apu_samples;
       if (!v.r.loop && pos >= samples) {
@@ -3093,13 +3235,45 @@ void hw_route_add(Graph& g, Comp& d, Comp& s, const float* A) {
 // The pass's routes to the hardware (none: muted), with each voice's pitch:
 // a mono voice's routes on outputs 0-3, a stereo voice's left channel's on
 // 0 2 4 6 and right's on 1 3 5 7.
+// A looping voice silent on the APU this long (passes) goes back to software.
+constexpr u32 kHwQuietPasses = 48;  // (a quarter of a second)
+
 void hw_apply() {
   if (!g_apu_on) return;
   hw_pause_changed();
+  // The looping voices heard in software this pass, to the APU (their routes
+  // from the next pass on).
+  for (u32 i = 0; i < g_hw_want_n; ++i) {
+    HwWant w = g_hw_want[i];
+    w.v->hw_want = false;
+    if (w.v->playing && w.v->hw[0] < 0) {
+      hw_voice_start(*w.g, *w.c, *w.v);
+      w.v->hw_quiet = 0;
+    }
+  }
+  g_hw_want_n = 0;
   for (u32 h = kHwFirst; h < kMaxVoices; ++h) {
     HwOwner o = g_hw[h];
     if (!o.v || hw_paused(o)) continue;  // (a paused song's voice keeps its routes)
     Voice& v = *o.v;
+    float loudest = 0;
+    for (u32 ch = 0; ch < 2; ++ch)
+      for (u32 k = 0; k < v.rt_n[ch]; ++k) loudest = fmaxf(loudest, v.rt_gain[ch][k]);
+    v.hw_loud = loudest;
+    if (is_looping(o.c->type)) {
+      // Silent (every route under the skip level) for long enough: back to
+      // software, where it is skipped and its stream rests.
+      v.hw_quiet = loudest < kSilentGain ? (u16)(v.hw_quiet + 1) : 0;
+      if (v.hw_quiet >= kHwQuietPasses) {
+        hw_voice_stop(v);  // (its play position kept: hw_positions)
+        v.hw_quiet = 0;
+        v.r.block = -1;  // (the decoder finds its place again)
+        for (u32 cc = 0; cc < 2; ++cc) v.carry[cc] = v.fx1[cc] = v.fy1[cc] = 0;
+        v.gain_prev = v.gain_last = 0;
+        ++g_hw_back;
+        continue;
+      }
+    }
     float step = (float)v.r.wave->rate * 2.08333e-5f * v.pitch;
     step = step < 1.0f / 256 ? 1.0f / 256 : step > 4 ? 4 : step;
     u8 bins[8];
@@ -3149,22 +3323,74 @@ bool hw_bins_add(Graph& g, Comp& d, bool* fresh) {
 // The APU's output for this pass (256 frames), waited for: the mix follows
 // the APU's clock. A backlog of more than 2048 frames is skipped (xemu's APU
 // runs a little fast).
+// Set from the PC before a debug restart (tools/xbdm_poke.py
+// gw_apu_quiet_request 1, done by the stress scripts): the APU left quiet
+// (gw_apu_shutdown) and the sound in software, so the next start finds it
+// usable (a session killed mid-frame left its GP running no frames).
+extern "C" {
+volatile u32 gw_apu_quiet_request;
+}
+
 void apu_read_bins() {
+  gw_apu_probe_poll();
+  if (g_apu_on && gw_apu_quiet_request) {
+    gw_apu_shutdown();
+    g_apu_on = false;
+    gw_log("apu: left quiet for a restart\n");
+  }
   if (!g_apu_on) return;
   static bool started = false;
+  // Out of step on 8 passes in a row (one pass may fall between two of the
+  // GP's transfers): the ring put back in step, the reader started afresh.
+  static u32 out_of_step;
+  out_of_step = gw_apu_in_step() ? 0 : out_of_step + 1;
+  if (out_of_step >= 8) {
+    out_of_step = 0;
+    gw_apu_realign();
+    started = false;
+    ++g_apu_realigns;
+    gw_log("apu: its output ring was out of step with the reader: put back (%u times)\n", g_apu_realigns);
+  }
   if (!started) {
+    // A cushion of 3 passes first (the reader then follows the APU's clock
+    // without waiting on each pass), what is beyond it dropped.
     started = true;
-    gw_apu_skip(gw_apu_available());
+    for (u32 t = 0; t < 40 && gw_apu_available() < 3 * kPass; ++t) Sleep(1);
+    const u32 have0 = gw_apu_available();
+    if (have0 > 3 * kPass) gw_apu_skip(have0 - 3 * kPass);
   }
   for (u32 b = 0; b < kBinsCopied; ++b) g_bins_wanted[b] = g_bin_owner[b] != nullptr;
   u32 waited = 0;
   const u64 wait_from = __builtin_ia32_rdtsc();
+  const u32 had = gw_apu_available();
   while (gw_apu_available() < kPass && waited < 40) {
     Sleep(1);
     ++waited;
   }
   gw_sound_wait_cycles += __builtin_ia32_rdtsc() - wait_from;
   const u32 have = gw_apu_available();
+  {  // the hand-back measured: the GP's own frame count, waits, lates
+    static u32 passes, waits, wait_ms, lates, had_min = ~0u, had_max, gp_last;
+    static DWORD since;
+    ++passes;
+    if (waited) ++waits;
+    wait_ms += waited;
+    if (have < kPass) ++lates;
+    if (had < had_min) had_min = had;
+    if (had > had_max) had_max = had;
+    if (!since) since = GetTickCount(), gp_last = gw_apu_frames();
+    if (GetTickCount() - since >= 5000) {
+      const u32 gp = gw_apu_frames(), ms = GetTickCount() - since;
+      gw_log("apu: %u passes in %u ms (want %u); waited in %u (%u ms in all), late %u; GP frames %u (%u a second, "
+             "want 1500); frames waiting at a pass %u-%u; out cursor %08X\n",
+             passes, ms, ms * 48 / 256, waits, wait_ms, lates, gp - gp_last, (gp - gp_last) * 1000 / ms, had_min,
+             had_max, gw_apu_out_cursor());
+      passes = waits = wait_ms = lates = had_max = 0;
+      had_min = ~0u;
+      gp_last = gp;
+      since = GetTickCount();
+    }
+  }
   if (have < kPass) {
     static u32 told;
     if (told++ < 8) gw_log("sound: the APU's output is late (%u frames)\n", have);
@@ -3180,16 +3406,57 @@ void apu_read_bins() {
       for (u32 n = 0; n < kPass && !live; ++n) live = g_bins[b][n] != 0.0f;
     g_bin_live[b] = live;
   }
+  // (diagnostics) each bin's loudest sample over the report's 5 s
+  static float bin_peak[kBinsCopied];
+  for (u32 b = 0; b < kBinsCopied; ++b)
+    if (g_bins_wanted[b])
+      for (u32 n = 0; n < kPass; ++n) bin_peak[b] = fmaxf(bin_peak[b], fabsf(g_bins[b][n]));
   static DWORD last;
   if (GetTickCount() - last > 5000) {
     last = GetTickCount();
     u32 in_use = 0, bins = 0;
     for (u32 h = kHwFirst; h < kMaxVoices; ++h) in_use += g_hw[h].v != nullptr;
     for (u32 b = 0; b < kBinsUsed; ++b) bins += g_bin_owner[b] != nullptr;
+    u32 rings = 0;
+    for (u32 k = 0; k < kHwRings; ++k) rings += g_ring_used[k];
+    gw_log("sound: APU rings in use %u of %u; refused for want of a ring %u, by the APU %u; back to software at silence %u\n", rings, kHwRings, g_hw_no_ring,
+           g_hw_start_fail, g_hw_back);
     gw_log("sound: APU voices in use %u, started %u, refused %u (no voice) %u (no bins); bins in use %u; %u frames "
            "waiting (%u waves, %u of %u sounds can play there)\n",
            in_use, g_hw_starts, g_hw_full, g_hw_no_bins, bins, gw_apu_available(), g_apu_waves, g_apu_able,
            g_apu_sounds);
+    char line[600];
+    u32 at = 0;
+    for (u32 b = 0; b < kBinsCopied && at < sizeof(line) - 48; ++b)
+      if (g_bin_owner[b])
+        at += (u32)snprintf(line + at, sizeof(line) - at, " %u:%.20s=%d", b, g_bin_owner[b]->name ? g_bin_owner[b]->name : "?",
+                            (int)(bin_peak[b] * 1000));
+    line[at] = 0;
+    gw_log("sound: APU bins (peak x1000):%s\n", line);
+    for (float& p : bin_peak) p = 0;
+    at = 0;
+    for (SwNote& n : g_sw_notes)
+      if (n.name && at < sizeof(line) - 80)
+        at += (u32)snprintf(line + at, sizeof(line) - at, " %.24s=%u (%s);", n.name, n.passes, kSwWhy[n.why]);
+    line[at] = 0;
+    gw_log("sound: still in software (voice passes in 5 s):%s\n", line);
+    memset(g_sw_notes, 0, sizeof(g_sw_notes));
+    // (diagnostics) the hardware voices now: sound, looping, loudest route
+    // last pass (x1000), play position, wave length
+    at = 0;
+    for (u32 h = kHwFirst; h < kMaxVoices && at < sizeof(line) - 80; ++h) {
+      const HwOwner& o = g_hw[h];
+      if (!o.v) continue;
+      at += (u32)snprintf(line + at, sizeof(line) - at, " %u:%.16s%s=%d@%u/%u", h, o.c->name ? o.c->name : "?",
+                          is_looping(o.c->type) ? "(L)" : "", (int)(o.v->hw_loud * 1000), gw_apu_voice_position(h),
+                          o.v->r.wave ? o.v->r.wave->apu_samples : 0);
+    }
+    line[at] = 0;
+    gw_log("sound: APU voices:%s\n", line);
+    gw_log("sound: APU positions in 5 s: %u voice passes, reading %u us, ring fills %u us (%u blocks)\n", g_hwpos_voices,
+           (u32)(g_hwpos_read / 733), (u32)(g_hwpos_fill / 733), g_hwpos_blocks);
+    g_hwpos_read = g_hwpos_fill = 0;
+    g_hwpos_voices = g_hwpos_blocks = 0;
   }
 }
 #else

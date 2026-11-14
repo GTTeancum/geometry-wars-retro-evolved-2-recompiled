@@ -147,10 +147,23 @@ ifeq ($(AUDIO_CAPTURE),y)
 src/audio.obj src/sound_native.obj: NXDK_CXXFLAGS += -DGW_AUDIO_CAPTURE
 endif
 
-# The game's sounds on the APU where they can play there (src/sound_native.cpp,
-# src/apu.cpp): make SOUND_APU=y
-ifeq ($(SOUND_APU),y)
-src/sound_native.obj: NXDK_CXXFLAGS += -DGW_SOUND_APU
+# The game's sounds on the APU, the Xbox's audio chip (src/sound_native.cpp,
+# src/apu.cpp): the default; make SOUND_APU=n to mix every sound in software.
+# (The sound sources see the switch: rebuild src/sound_native.cpp,
+# src/audio.cpp and src/apu.cpp when changing it.)
+ifneq ($(SOUND_APU),n)
+src/sound_native.obj src/audio.obj: NXDK_CXXFLAGS += -DGW_SOUND_APU
+endif
+
+# Free memory logged every 10 s (test only): make MEMORY_WATCH=y
+ifeq ($(MEMORY_WATCH),y)
+src/status.obj: NXDK_CXXFLAGS += -DGW_MEMORY_WATCH
+endif
+
+# The APU's registers read and written from the PC while the game runs
+# (tools/xbdm_apu.py; test only): make APU_PROBE=y
+ifeq ($(APU_PROBE),y)
+src/apu.obj: NXDK_CXXFLAGS += -DGW_APU_PROBE
 endif
 
 # The APU test (src/audio.cpp): one effect on a hardware voice, the GP's

@@ -208,6 +208,160 @@ release thread, 2026-11-12).
        tick in guest 0x8205C8F8): now reset and flipped between the steps.
      Not yet checked: whether fast shots now pass through small enemies
      between ticks (twice the distance a tick), and how the controls feel.
+   - Sound on the APU, investigated (2026-11-13/14), still off:
+     - The garble was the GP running no frames at all (frame counter at 0,
+       its output cursor at 0); each sound pass then waited 40 ms for output
+       that never came (about 12 passes a second of 187) while the AC97
+       replayed stale buffers. With the GP running, the output is clean
+       (lined up with the software engine: correlation 0.998, no repeats,
+       no block-edge jumps) and effects play (PlayerMixer and the effects
+       mixers carry signal; the "music only" heard was the dead GP: only the
+       two sounds that stay in software got through).
+     - When: after a debug-monitor warm restart of a session that used the
+       APU (killed mid-frame). It stays dead through further warm restarts;
+       a cold boot clears it; starting from the dashboard after a clean
+       session is fine (the dashboard's own sound start-up resets it).
+       Leaving for the dashboard while it is dead hung the console (black
+       screen; power cycle).
+     - Tried at start-up, none brings frames back: the GP reset and loaded
+       again (the program memory cleared first: it does reload), the frame
+       counter free running instead of AC97-synced, every voice record's
+       link set to the list end before the table is given to the VP. (A DMA
+       abort through GPRST bit 3 was tried once; the console hung right
+       after: removed.) Likely the VP halted mid-frame (it stops when a
+       listed voice ends, see src/apu.cpp) and nothing we do acknowledges it.
+     - In place: gw_apu_init falls back to software sound when the GP runs
+       no frames (checked); the APU left quiet on the return to the
+       dashboard (gw_apu_shutdown) and before the test scripts' restarts
+       (tools/xbdm_restart.sh pokes gw_apu_quiet_request). The hand-back and
+       per-bin levels are logged every 5 s.
+     - SOLVED (2026-11-13): the dead state is the setup engine waiting for a
+       frame that never completes (its frame sample count, BAR0 0x2008,
+       frozen; the GP's clock count at 0x3FF18 frozen; the GP runs no code
+       at all, even with its wait patched out). Found by comparing the
+       registers healthy and dead live on the console (make SOUND_APU=y
+       APU_PROBE=y, tools/xbdm_apu.py). Nothing in BAR0 restarts it, but
+       the APU's PCI power management does: D3hot then D0 (PMCSR, config
+       0x48; capability at 0x44) resets the whole function like a power
+       cycle; BAR0, the command register and the interrupt line are put
+       back. gw_apu_init now always starts with that reset (sample counter
+       at about 960 after it, as after a cold boot), and gw_apu_shutdown
+       ends with it so the dashboard finds a fresh chip. Checked: three
+       debug restarts in a row with voices playing, each came up at the full
+       1,500 frames a second. (Also fixed: gw_audio_stop's APU shutdown was
+       never built in, the SOUND_APU define reached only sound_native.)
+     - A hazard that came with it: a healthy APU keeps running through a
+       debug-monitor restart, its GP writing the output ring and its VP
+       reading voice tables at physical addresses the next program now owns.
+       Twice that crashed the next start (a kernel exception at start-up;
+       once the console stopped with the LED blinking red/orange and needed
+       two power cycles). Both times the test script's quiet request had gone
+       to the wrong address (it used the new build's link map, not the
+       running one's). Now: every build resets the APU first thing in main
+       (gw_apu_reset_at_boot); tools/xbdm_deploy.sh quiets the running game
+       at its own address (build/deployed.map, which the xbdm tools now read)
+       before copying and restarting. A player never restarts this way: the
+       return to the dashboard quiets and resets the chip.
+     - The songs play about 58 layers at once, nearly all muted. On the APU
+       every layer played (muted) took a voice and a disc stream: the 64
+       voices filled and the streams fell behind. Now a looping voice moves
+       to the APU only once it is heard in software, and back to software
+       after a quarter second of silence on the APU (where a silent layer
+       is skipped and its stream rests). Effects (one-shots) start on the
+       APU as before. (The 1,100 us measured then was with the bins read
+       back silent, see the next point: the real figures are below.)
+     - After the reset the bins read back silent, then wrong: two faults.
+       - The reset clears setup-engine settings a cold-booted console has
+         (BAR0 0x2010-0x2028, 0x2078-0x20AC; the bytes at 0x208C look like a
+         headroom per mix bin): without them every bin is silent. Restored
+         from a cold-boot snapshot (kSeColdBoot in src/apu.cpp); the
+         registers that held memory addresses are left cleared. (The bins
+         now come back at half level; the start-up calibration scales it.)
+       - With those settings the engine works 2,048 samples ahead of the
+         sample clock and makes that up in a burst of 64 frames at start:
+         the GP starts its next DMA before the last ends, and the output
+         ring is left half a block out of step (bins 8-15 read as bins 0-7:
+         heard as "music and the ship's explosion only, no firing"). Now
+         put in step after the burst (gw_apu_realign: frames off, cursor to
+         0, frames on), and watched: 8 passes out of step in a row put it
+         back again (logged). The reader keeps a cushion of 3 passes.
+       - Checked by recording (make AUDIO_CAPTURE=y): three matched 8 s
+         windows of the playing benchmark, APU against software, agree
+         within 1-2 dB in every octave band, the firing's 30 ms bursts
+         present in both. Not yet heard by the user with these fixes.
+     - Cost, playing benchmark (heavy play, same 150 s): the sound thread
+       takes 1,360-1,540 us a 5.3 ms pass on the APU against 1,690-1,920 in
+       software (about 8% of the processor back, 2.8 ms a 33 ms frame);
+       game speed median 29.3 against 28.2 updates/s, lowest 24.0 against
+       20.6. What is left on the APU's side: control 150, the graph's
+       combining 240, effects 125, reverb 65, reading the bins 100, ring
+       fills and positions 190 (120 of it copying blocks one at a time),
+       routes 65, the ship's thrust in software 96. Since trimmed (not yet
+       measured on the console, the code runs in xemu): ring fills copy
+       runs of blocks, routes are written only when they change, the bins
+       are prefetched, and the thrust (45 KiB, held in memory whole) plays
+       on the APU: nothing is left in software in play.
+     - Memory (64 MB): the APU build had 1.2 MiB free in heavy play against
+       3.0 in software (a second copy of the 65 effects as the APU wants
+       them, 820 KiB; stream rings 590; the GP's ring 256). Now the
+       effects are held once, in contiguous memory with their silent tails,
+       and played where they are (Bank::held); 40 stream rings; a 128 KiB GP
+       ring: 2.4 MiB free in the same play. (The recorder's 1.5 MiB with all
+       of that did not fit: the two "freezes" in capture runs were the game
+       out of memory.)
+     - OPEN, found at the end of the night (2026-11-14, about 03:40): the
+       AC97 stopped taking frames (buffer index 0, control "run", status
+       0, nothing left to play; its PCI command 0007, power state D0; codec
+       registers read 0), in every build, software sound too, through warm
+       restarts. Cause not known. Suspected: the APU's power-management
+       reset done under a running AC97 (the quiet request did it from the
+       sound thread; about a dozen times that night without harm). Changed
+       since, untested on the console: the reset is only ever done with the
+       AC97's bus masters stopped (gw_audio_stop: sound thread parked, AC97
+       halted, APU quiet, then reset; at boot in APU builds: AC97 halted,
+       then reset; the quiet request no longer resets). The boot reset is
+       now only in builds that play on the APU. The sound thread reports
+       "the AC97 takes no frames" with its registers.
+       - NEVER put the AC97 (PCI device 6) in D3hot: tried to revive it
+         that way from the probe and the console hung at once (no network);
+         power cycle.
+       - After the power cycle (2026-11-14, morning): the AC97 runs again,
+         in the software build and in the APU build, through three quiet
+         restarts and through a return to the dashboard and a start from
+         there (the APU reset, calibrated and at the menu's level each
+         time). The stuck state was the hardware's, cleared by power; with
+         the reset never done under a running AC97 it has not come back.
+         Its cause is still not proven.
+     - The out-of-step ring fixed at its cause (2026-11-14): the GP's
+       program now waits while its DMA runs (jset #4,x:$FFFFD6) before it
+       reports the frame complete, so frames run back to back cannot cut a
+       transfer short. On the console frames run at the full rate with it
+       (the bit works as xemu has it) and the ring is in step from the
+       start every time; before, the start-up put-in-step sometimes failed
+       (a few frames run back to back when frames resume) and the level
+       calibration then read 0 (half level until restarted). The
+       calibration also checks the ring first and tries up to three times.
+     - Cost with the trims, playing benchmark: the sound thread takes
+       1,200-1,350 us a 5.3 ms pass on the APU (software: 1,690-1,920):
+       about 500 us a pass, 9% of the processor, 3 ms of a 33 ms frame.
+       Nothing is decoded in software in play (the thrust plays on the
+       APU). On the APU's side now: reading the bins 119 (the APU wrote
+       that memory, every line is a cache miss: 8 KiB a pass), positions
+       and rings 88 (was 187: runs of blocks, non-temporal stores), routes
+       43 (was 60: table logarithm, only changed words written). (MMX
+       intrinsics do not build for the Pentium III with this clang: they
+       are lowered to SSE2.) Free memory in the same play: 2.3 MiB.
+     - DONE (2026-11-14): heard on the TV by the user ("sounds right",
+       firing included); sound on the APU is now the default (make
+       SOUND_APU=n for software mixing). Builds kept: build/variants/
+       normal-apu (on the console), normal-sw, test-apu, test-sw.
+     - Test tools: tools/xbdm_apu.py (the probe: BAR0 and PCI reads and
+       writes, make APU_PROBE=y), tools/xbdm_apu_voice.py (voice records),
+       tools/apu_bins.sh, tools/xbdm_quiet.py (asks the running game to
+       leave the APU quiet, only after checking it is the build last
+       deployed), tools/xbdm_deploy.sh and tools/keep_build.sh (builds kept
+       under build/variants with their link maps), make MEMORY_WATCH=y.
+     Earlier notes:
    - Sound on the APU (make SOUND_APU=y): BROKEN on the console. Heard on
      the TV as garbled, modem-like sound coming in only now and then: the
      AC97 output starves (about 700 frames sent in 4 minutes, against 187 a
@@ -273,7 +427,12 @@ release thread, 2026-11-12).
      pass after the decoded-effects cache), then particles (6-11 ms a drawn
      frame).
 2. **720p artifacts on a v1.1 console** (reported with a photo we have not
-   seen): "unplayable in 720p, beautiful artifacts". The test console's
+   seen): "unplayable in 720p, beautiful artifacts". On the test console
+   (revision not known) 720p runs well, by the user's eye on a TV
+   (2026-11-13), as do 480p, 480i at 4:3 (the game lays out its own 4:3
+   picture; the port's letterbox code logs itself active but changes
+   nothing: to be removed or explained) and 1080i (the console scales a
+   720p or 480-line frame). The test console's
    revision is not known yet; v1.1 has the Conexant video encoder. Get the
    photo (or a description of the artifacts) and the console's revision;
    check the 720p mode and the CRTC line-length fix (`gw_crtc_pitch`) on a
